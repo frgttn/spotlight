@@ -12,10 +12,11 @@ use std::{
 };
 
 use gpui::{
-    App, Context, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding, ScrollStrategy,
-    SharedString, Subscription, UniformListScrollHandle, Window, actions, canvas, div, hsla,
-    prelude::*, px, rgb, rgba, uniform_list,
+    App, Context, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding, RenderImage,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, actions, canvas,
+    div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
 };
+use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
@@ -23,6 +24,7 @@ use spotlight_core::{
 };
 use spotlight_platform_win::{
     apps::{self, AppEntry},
+    icons::{self, Icon},
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     win,
 };
@@ -35,6 +37,8 @@ actions!(launcher, [SelectNext, SelectPrev, Confirm, Dismiss, Quit]);
 
 const CONTEXT: &str = "Launcher";
 const ROW_HEIGHT: f32 = 44.;
+/// Row icon size in logical pixels.
+const ICON_SIZE: f32 = 26.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
 /// Background over GPUI's `Blurred` window. GPUI's accent-policy blur barely
@@ -66,6 +70,8 @@ struct Item {
     id: Option<String>,
     title: SharedString,
     subtitle: SharedString,
+    /// `None` until extracted (or when there is none): a letter badge is drawn instead.
+    icon: Option<Arc<RenderImage>>,
     target: Target,
 }
 
@@ -133,6 +139,7 @@ impl Launcher {
                 id: None,
                 title: format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]).into(),
                 subtitle: "Synthetic".into(),
+                icon: None,
                 target: Target::Synthetic,
             })
             .collect();
@@ -165,12 +172,12 @@ impl Launcher {
             _subscriptions: subscriptions,
         };
         this.refilter("");
-        this.load_apps(cx);
+        this.load_apps(window.scale_factor(), cx);
         this
     }
 
     /// Discovers apps on a dedicated COM thread and prepends them to the items.
-    fn load_apps(&mut self, cx: &mut Context<Self>) {
+    fn load_apps(&mut self, window_scale: f32, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded(1);
         thread::spawn(move || {
             let started = Instant::now();
@@ -190,9 +197,11 @@ impl Launcher {
                             id: Some(item_id("apps", &app.launch_id)),
                             title: app.name.clone().into(),
                             subtitle: "Application".into(),
+                            icon: None,
                             target: Target::App(app),
                         });
                         this.items.splice(0..0, items);
+                        this.load_icons(window_scale, cx);
                     }
                     Err(err) => eprintln!("[spotlight] app discovery failed: {err}"),
                 }
@@ -207,6 +216,45 @@ impl Launcher {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Extracts app icons in the background; rows switch from badges to icons as they arrive.
+    /// Apps are at the front of `items` right after discovery, so an app's index
+    /// in the request is also its index in `items`.
+    fn load_icons(&mut self, window_scale: f32, cx: &mut Context<Self>) {
+        let launch_ids: Vec<String> = self
+            .items
+            .iter()
+            .map_while(|item| match &item.target {
+                Target::App(app) => Some(app.launch_id.clone()),
+                Target::Synthetic => None,
+            })
+            .collect();
+        // Sized for the monitor the window was created on; GPUI scales it if that changes.
+        let size = (ICON_SIZE * window_scale).ceil() as u32;
+        let (tx, rx) = async_channel::unbounded();
+        icons::spawn(launch_ids, size, tx);
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(first) = rx.recv().await {
+                // Apply whatever else has arrived too, so the list re-renders once per batch.
+                let batch: Vec<_> = std::iter::once(first)
+                    .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    .collect();
+                let updated = this.update(cx, |this, cx| {
+                    for (ix, icon) in batch {
+                        if let Some(item) = this.items.get_mut(ix) {
+                            item.icon = render_image(icon);
+                        }
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
         })
         .detach();
     }
@@ -293,6 +341,16 @@ impl Launcher {
         self.stats.shows += 1;
         self.stats.paint.borrow_mut().arm(pressed_at, probe);
         cx.notify();
+    }
+
+    /// Shows the window unless it is already up (tray click, second launch).
+    /// Unlike [`Self::toggle`], it never hides.
+    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible && win::is_visible(self.hwnd) {
+            win::focus(self.hwnd);
+        } else {
+            self.show(Instant::now(), window, cx);
+        }
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
@@ -390,9 +448,13 @@ impl Launcher {
                     this.selected = row;
                     this.confirm(&Confirm, window, cx);
                 }))
-                .child(
-                    div()
-                        .size(px(26.))
+                .child(match &item.icon {
+                    Some(icon) => img(icon.clone())
+                        .size(px(ICON_SIZE))
+                        .flex_none()
+                        .into_any_element(),
+                    None => div()
+                        .size(px(ICON_SIZE))
                         .flex_none()
                         .rounded(px(6.))
                         .bg(badge_color(&item.title))
@@ -400,8 +462,9 @@ impl Launcher {
                         .items_center()
                         .justify_center()
                         .text_size(px(13.))
-                        .child(initial),
-                )
+                        .child(initial)
+                        .into_any_element(),
+                })
                 .child(div().flex_1().truncate().child(item.title.clone()))
                 .child(
                     div()
@@ -504,7 +567,14 @@ impl Render for Launcher {
     }
 }
 
-/// A stable pastel colour per title, standing in for app icons until real ones are extracted.
+/// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
+/// `RgbaImage` type is only the buffer container here.
+fn render_image(icon: Icon) -> Option<Arc<RenderImage>> {
+    let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
+    Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+}
+
+/// A stable pastel colour per title, drawn while an icon loads or when there is none.
 fn badge_color(title: &str) -> Hsla {
     let mut hasher = DefaultHasher::new();
     title.hash(&mut hasher);

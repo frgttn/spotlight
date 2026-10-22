@@ -6,7 +6,12 @@
 //! - `SPOTLIGHT_SELFTEST=1` runs the scripted measurement in `selftest.rs` and quits.
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
 
+// A GUI-subsystem binary, so starting at login or from the Start menu opens no
+// console window. Logs still reach a terminal it was started from; see `main`.
+#![windows_subsystem = "windows"]
+
 mod selftest;
+mod tray;
 
 use std::{
     env,
@@ -18,20 +23,48 @@ use gpui::{
     App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowKind,
     WindowOptions, prelude::*, px, size,
 };
-use spotlight_platform_win::{hotkey, metrics};
+use spotlight_platform_win::{
+    hotkey,
+    instance::{self, Instance},
+    metrics, win,
+};
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, Quit},
     text_input,
 };
 
+use crate::tray::{Command, Tray};
+
 fn main() {
+    win::attach_parent_console();
+    let self_test = env::var_os("SPOTLIGHT_SELFTEST").is_some();
+
+    // Before anything else, so a second launch doesn't grab a fallback hotkey.
+    // The self-test runs alongside a normal instance, so it skips this.
+    let _instance_guard = if self_test {
+        None
+    } else {
+        match instance::acquire() {
+            Instance::Primary(guard) => Some(guard),
+            Instance::Secondary => {
+                if let Err(err) = instance::send(instance::SHOW) {
+                    eprintln!("[spotlight] already running, but could not reach it: {err}");
+                }
+                return;
+            }
+        }
+    };
+    let (messages_tx, messages_rx) = async_channel::unbounded::<String>();
+    if !self_test {
+        instance::listen(messages_tx);
+    }
+
     let synthetic = env::var("SPOTLIGHT_SYNTHETIC")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0usize);
     let show_on_start = env::var_os("SPOTLIGHT_SHOW_ON_START").is_some();
-    let self_test = env::var_os("SPOTLIGHT_SELFTEST").is_some();
     let store = open_store();
 
     let (presses_tx, presses_rx) = async_channel::unbounded::<Instant>();
@@ -69,7 +102,9 @@ fn main() {
                     app_id: Some("spotlight".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Launcher::new(hotkey_label, synthetic, store, window, cx)),
+                |window, cx| {
+                    cx.new(|cx| Launcher::new(hotkey_label.clone(), synthetic, store, window, cx))
+                },
             )
             .expect("failed to open the launcher window");
 
@@ -83,6 +118,41 @@ fn main() {
             }
         })
         .detach();
+
+        // Later launches of the executable (Start menu, a shortcut) open this instance.
+        cx.spawn(async move |cx| {
+            while let Ok(message) = messages_rx.recv().await {
+                if message.trim() == instance::SHOW {
+                    window
+                        .update(cx, |launcher, window, cx| launcher.open(window, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+
+        let (commands_tx, commands_rx) = async_channel::unbounded();
+        match Tray::create(&hotkey_label, commands_tx) {
+            // The task owns the tray, which keeps the icon alive for the app's lifetime.
+            Ok(tray) => cx
+                .spawn(async move |cx| {
+                    while let Ok(command) = commands_rx.recv().await {
+                        match command {
+                            Command::Open => {
+                                window
+                                    .update(cx, |launcher, window, cx| launcher.open(window, cx))
+                                    .ok();
+                            }
+                            Command::ToggleAutostart => tray.toggle_autostart(),
+                            Command::Quit => {
+                                cx.update(|cx| cx.quit()).ok();
+                            }
+                        }
+                    }
+                })
+                .detach(),
+            Err(err) => eprintln!("[spotlight] could not create the tray icon: {err}"),
+        }
 
         // Idle-memory target: log RAM periodically, including while hidden.
         cx.spawn(async move |cx| {

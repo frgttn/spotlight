@@ -12,8 +12,12 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
 - **Frecency:** apps you launch often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
 - **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+Backspace to clear the query, Ctrl+Q to quit.
 - **Text input** with IME support.
+- **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).
+- **Single instance:** launching Spotlight again (Start menu, a shortcut) opens the running instance instead of starting a second one.
+- **Tray icon:** left click opens the launcher; the menu has Open, Start at login and Quit.
+- **Start at login:** toggled from the tray, stored in the per-user `Run` registry key. Disabling it in Task Manager's Startup tab is respected.
 
-App icons are placeholders (coloured letter badges) for now.
+The binary uses the Windows GUI subsystem, so no console window opens. Logs still go to the terminal it was started from.
 
 ## Requirements
 
@@ -33,7 +37,7 @@ Then press **Alt+Space**.
 |---|---|
 | `SPOTLIGHT_SHOW_ON_START=1` | Show the window immediately |
 | `SPOTLIGHT_SYNTHETIC=10000` | Add 10,000 filler rows (list performance test) |
-| `SPOTLIGHT_SELFTEST=1` | Run the scripted measurement, print a summary, quit |
+| `SPOTLIGHT_SELFTEST=1` | Run the scripted measurement, print a summary, quit (skips the single-instance check, so it can run next to a normal instance) |
 | `SPOTLIGHT_DATA_DIR=<dir>` | Keep the database in `<dir>` instead of `%APPDATA%\spotlight` |
 
 The self-test flashes the window on screen for about 10 seconds, so don't type while it runs:
@@ -54,12 +58,12 @@ Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](
 
 | Path | What |
 |---|---|
-| `crates/app` | The `spotlight` binary: wiring, window lifecycle, self-test, GPUI baseline example |
+| `crates/app` | The `spotlight` binary: wiring, window lifecycle, tray icon, self-test, GPUI baseline example |
 | `crates/ui` | GPUI views: launcher (search field, result list, metrics footer) and text input |
 | `crates/core` | Domain types: item ids, frecency |
 | `crates/search` | Ranking: fuzzy score, prefix bonus, frecency |
 | `crates/store` | SQLite (`rusqlite`, bundled): settings and frecency, with schema migrations |
-| `crates/platform-win` | Windows code: hotkey thread, app discovery and launch, window placement, measurements |
+| `crates/platform-win` | Windows code: hotkey thread, single instance, app discovery, launch and icons, autostart, window placement, measurements |
 | `docs/` | Architecture plan and the UI framework decision |
 
 ## License

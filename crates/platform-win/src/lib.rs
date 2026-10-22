@@ -1,5 +1,5 @@
-//! Windows integration for Spotlight (hotkey, app discovery, window placement,
-//! measurements).
+//! Windows integration for Spotlight (hotkey, single instance, app discovery
+//! and icons, autostart, window placement, measurements).
 //!
 //! Nothing in here knows about a UI framework: window handles are passed as raw
 //! `isize` HWND values and events are delivered over `async_channel`.
@@ -8,6 +8,9 @@
 compile_error!("Spotlight is Windows-only");
 
 pub mod apps;
+pub mod autostart;
 pub mod hotkey;
+pub mod icons;
+pub mod instance;
 pub mod metrics;
 pub mod win;

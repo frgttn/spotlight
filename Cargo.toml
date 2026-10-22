@@ -20,10 +20,13 @@ spotlight-store = { path = "crates/store" }
 spotlight-ui = { path = "crates/ui" }
 async-channel = "2"
 gpui = "=0.2.2"
+# Only for its `Frame`/`RgbaImage` types in GPUI's image API; same version as gpui uses.
+image = { version = "0.25", default-features = false }
 nucleo-matcher = "0.3.1"
 raw-window-handle = "0.6"
 # `bundled` compiles SQLite from source, so there is no system library to install.
 rusqlite = { version = "0.40", features = ["bundled"] }
+tray-icon = "0.24"
 unicode-segmentation = "1"
 # Same major as gpui 0.2.2 uses, so there is only one copy of the bindings.
 windows = "0.61"
