@@ -1,7 +1,7 @@
 //! Raw Win32 window placement for the launcher window.
 //!
 //! UI frameworks generally have no "hide but keep everything alive" call, so the
-//! spikes take the HWND and drive visibility and placement directly.
+//! launcher takes the HWND and drives visibility and placement directly.
 
 use std::{ffi::c_void, mem::size_of};
 

@@ -1,0 +1,13 @@
+[package]
+name = "spotlight-store"
+description = "SQLite persistence for Spotlight: settings and frecency"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+spotlight-core.workspace = true

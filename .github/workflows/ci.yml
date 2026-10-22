@@ -13,7 +13,7 @@ env:
 
 jobs:
   check:
-    # The spike is Windows-only (Win32 + GPUI's DirectX backend).
+    # Spotlight is Windows-only (Win32 + GPUI's DirectX backend).
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

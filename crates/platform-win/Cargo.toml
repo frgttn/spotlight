@@ -1,6 +1,6 @@
 [package]
-name = "spike-common"
-description = "UI-independent Windows pieces of the launcher spike"
+name = "spotlight-platform-win"
+description = "Windows integration for Spotlight: hotkey, app discovery and launch, window placement, measurements"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,6 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
-nucleo-matcher.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true

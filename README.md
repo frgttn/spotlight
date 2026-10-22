@@ -2,19 +2,14 @@
 
 A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlight. Written in pure Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
-> **Status: early spike.** The repository currently contains the prototype used to validate the stack:
-> - global hotkey and a prewarmed window;
-> - fuzzy search over installed apps;
-> - launching apps;
-> - built-in latency and memory measurements.
->
-> The full app is planned in [docs/architecture.md](docs/architecture.md).
+> **Status: early.** The stack is validated and the code is split into the workspace planned in [docs/architecture.md](docs/architecture.md). So far: global hotkey, prewarmed window, fuzzy app search with frecency, launching apps, built-in latency and memory measurements.
 
 ## What works today
 
 - **Global hotkey:** Alt+Space, falling back to Ctrl+Shift+Space if another app already owns it.
 - **Window:** frameless, topmost, prewarmed, DPI-aware, opens on the monitor under the mouse. It hides on Esc or when it loses focus.
 - **Search:** fuzzy search ([nucleo](https://github.com/helix-editor/nucleo)) over all installed apps (Win32 and Microsoft Store/MSIX, via `shell:AppsFolder`).
+- **Frecency:** apps you launch often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
 - **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+Backspace to clear the query, Ctrl+Q to quit.
 - **Text input** with IME support.
 
@@ -29,27 +24,28 @@ App icons are placeholders (coloured letter badges) for now.
 ## Build and run
 
 ```bash
-cargo run -p spike-gpui --release
+cargo run --release
 ```
 
 Then press **Alt+Space**.
 
 | Environment variable | Effect |
 |---|---|
-| `SPIKE_SHOW_ON_START=1` | Show the window immediately |
-| `SPIKE_SYNTHETIC=10000` | Add 10,000 filler rows (list performance test) |
-| `SPIKE_SELFTEST=1` | Run the scripted measurement, print a summary, quit |
+| `SPOTLIGHT_SHOW_ON_START=1` | Show the window immediately |
+| `SPOTLIGHT_SYNTHETIC=10000` | Add 10,000 filler rows (list performance test) |
+| `SPOTLIGHT_SELFTEST=1` | Run the scripted measurement, print a summary, quit |
+| `SPOTLIGHT_DATA_DIR=<dir>` | Keep the database in `<dir>` instead of `%APPDATA%\spotlight` |
 
 The self-test flashes the window on screen for about 10 seconds, so don't type while it runs:
 
 ```bash
-SPIKE_SELFTEST=1 SPIKE_SYNTHETIC=10000 cargo run -p spike-gpui --release
+SPOTLIGHT_SELFTEST=1 SPOTLIGHT_SYNTHETIC=10000 cargo run --release
 ```
 
 GPUI's own memory floor (one window, one label):
 
 ```bash
-cargo run -p spike-gpui --example baseline --release
+cargo run -p spotlight --example baseline --release
 ```
 
 Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](docs/ui-framework-decision.md).
@@ -58,8 +54,12 @@ Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](
 
 | Path | What |
 |---|---|
-| `crates/spike-common` | UI-independent Windows code: hotkey thread, app discovery and launch, window placement, fuzzy search, measurements |
-| `spikes/gpui` | The GPUI launcher: text input, result list, metrics footer, self-test |
+| `crates/app` | The `spotlight` binary: wiring, window lifecycle, self-test, GPUI baseline example |
+| `crates/ui` | GPUI views: launcher (search field, result list, metrics footer) and text input |
+| `crates/core` | Domain types: item ids, frecency |
+| `crates/search` | Ranking: fuzzy score, prefix bonus, frecency |
+| `crates/store` | SQLite (`rusqlite`, bundled): settings and frecency, with schema migrations |
+| `crates/platform-win` | Windows code: hotkey thread, app discovery and launch, window placement, measurements |
 | `docs/` | Architecture plan and the UI framework decision |
 
 ## License
@@ -71,7 +71,7 @@ Licensed under either of
 
 at your option.
 
-`spikes/gpui/src/text_input.rs` is adapted from GPUI's `examples/input.rs` (Copyright Zed Industries, Inc., Apache-2.0).
+`crates/ui/src/text_input.rs` is adapted from GPUI's `examples/input.rs` (Copyright Zed Industries, Inc., Apache-2.0).
 
 Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 

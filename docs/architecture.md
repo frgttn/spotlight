@@ -171,8 +171,9 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
 
 ## 8. Roadmap
 
-0. ✅ **Spike** (this repository): hotkey, prewarmed window, fuzzy app search, launch, measurements. See [ui-framework-decision.md](ui-framework-decision.md).
-1. Workspace + `core`/`search`/`store` + apps, system, calc and web providers; settings window; tray; single instance.
+0. ✅ **Spike**: hotkey, prewarmed window, fuzzy app search, launch, measurements. See [ui-framework-decision.md](ui-framework-decision.md).
+1. ✅ Workspace (`app`, `ui`, `core`, `search`, `store`, `platform-win`), SQLite store, frecency ranking.
+   Still to do: the `Provider` trait and `providers/` (apps, system, calc, web); settings window; tray; single instance.
 2. Action panel (Ctrl+K), aliases, per-item hotkeys, frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
 4. Window management, file search.

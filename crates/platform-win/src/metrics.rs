@@ -1,4 +1,4 @@
-//! Measurements shared by the spikes: process memory, paint-latency probe, percentiles.
+//! Measurements: process memory, paint-latency probe, percentiles.
 
 use std::{
     mem::size_of,
@@ -72,11 +72,11 @@ impl PaintProbe {
         let elapsed = ms(started.elapsed());
         match probe {
             Probe::FirstShow => {
-                eprintln!("[spike] hotkey -> painted: {elapsed:.2} ms (first show)");
+                eprintln!("[spotlight] hotkey -> painted: {elapsed:.2} ms (first show)");
                 self.first_show_ms = Some(elapsed);
             }
             Probe::Show => {
-                eprintln!("[spike] hotkey -> painted: {elapsed:.2} ms");
+                eprintln!("[spotlight] hotkey -> painted: {elapsed:.2} ms");
                 self.last_show_ms = Some(elapsed);
                 self.show_samples.push(elapsed);
             }
@@ -113,7 +113,7 @@ impl Percentiles {
     }
 }
 
-/// What a self-test run prints, identical for both spikes.
+/// What a self-test run prints. The format matches the GPUI/Slint comparison runs.
 pub struct Summary {
     pub apps: usize,
     pub items: usize,
@@ -158,7 +158,7 @@ impl Summary {
     }
 }
 
-/// Self-test script shared by both spikes, so the numbers are comparable.
+/// Self-test script, unchanged since the GPUI/Slint comparison so the numbers stay comparable.
 pub mod selftest {
     pub const SHOW_CYCLES: usize = 15;
     pub const SHOWN_MS: u64 = 250;

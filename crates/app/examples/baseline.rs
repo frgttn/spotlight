@@ -8,7 +8,7 @@ use gpui::{
     rgb, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use spike_common::{metrics, win};
+use spotlight_platform_win::{metrics, win};
 
 struct Baseline;
 

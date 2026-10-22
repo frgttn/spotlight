@@ -1,14 +1,14 @@
-//! `SPIKE_SELFTEST=1`: drives the real show/hide and text-input paths, prints
+//! `SPOTLIGHT_SELFTEST=1`: drives the real show/hide and text-input paths, prints
 //! a summary and quits. It injects presses into the same channel the hotkey
 //! thread feeds, so it skips only the OS's hotkey dispatch and key-event delivery.
-//! The script itself lives in `spike_common::metrics::selftest` so both spikes run it.
+//! The script itself lives in `spotlight_platform_win::metrics::selftest`, unchanged
+//! since the GPUI/Slint comparison so the numbers stay comparable.
 
 use std::time::{Duration, Instant};
 
 use gpui::{AppContext, AsyncApp, Keystroke, WindowHandle};
-use spike_common::metrics::{self, selftest::*};
-
-use crate::launcher::Launcher;
+use spotlight_platform_win::metrics::{self, selftest::*};
+use spotlight_ui::launcher::Launcher;
 
 pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     let executor = cx.background_executor().clone();

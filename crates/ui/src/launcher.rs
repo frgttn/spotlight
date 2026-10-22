@@ -2,9 +2,11 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     rc::Rc,
+    sync::{Arc, Mutex},
     thread,
     time::Instant,
 };
@@ -15,12 +17,17 @@ use gpui::{
     prelude::*, px, rgb, rgba, uniform_list,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use spike_common::{
+use spotlight_core::{
+    frecency::{self, Frecency},
+    item_id,
+};
+use spotlight_platform_win::{
     apps::{self, AppEntry},
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    search::Searcher,
     win,
 };
+use spotlight_search::{Candidate, Searcher};
+use spotlight_store::Store;
 
 use crate::text_input::{self, TextInput};
 
@@ -50,17 +57,19 @@ pub fn bind_keys(cx: &mut App) {
 
 enum Target {
     App(AppEntry),
-    /// Filler rows for the 10k-item list test (`SPIKE_SYNTHETIC`).
+    /// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
     Synthetic,
 }
 
 struct Item {
+    /// Frecency key; `None` for items that aren't tracked (synthetic rows).
+    id: Option<String>,
     title: SharedString,
     subtitle: SharedString,
     target: Target,
 }
 
-/// Spike measurements, shown in the footer and logged to stderr.
+/// Measurements, shown in the footer and logged to stderr.
 #[derive(Default)]
 struct Stats {
     hotkey: SharedString,
@@ -82,6 +91,10 @@ pub struct Launcher {
     selected: usize,
     scroll: UniformListScrollHandle,
     searcher: Searcher,
+    /// In-memory copy of the store's frecency table, updated on every launch.
+    frecency: HashMap<String, Frecency>,
+    /// `None` when the database couldn't be opened; usage is then not remembered.
+    store: Option<Arc<Mutex<Store>>>,
     visible: bool,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
@@ -91,6 +104,7 @@ impl Launcher {
     pub fn new(
         hotkey: SharedString,
         synthetic: usize,
+        store: Option<Store>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -116,11 +130,22 @@ impl Launcher {
 
         let items = (0..synthetic)
             .map(|ix| Item {
+                id: None,
                 title: format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]).into(),
                 subtitle: "Synthetic".into(),
                 target: Target::Synthetic,
             })
             .collect();
+
+        let frecency = store
+            .as_ref()
+            .map(|store| {
+                store.frecency().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read frecency: {err}");
+                    HashMap::new()
+                })
+            })
+            .unwrap_or_default();
 
         let mut this = Self {
             hwnd,
@@ -130,6 +155,8 @@ impl Launcher {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             searcher: Searcher::default(),
+            frecency,
+            store: store.map(|store| Arc::new(Mutex::new(store))),
             visible: false,
             stats: Stats {
                 hotkey,
@@ -160,17 +187,18 @@ impl Launcher {
                     Ok(apps) => {
                         this.stats.apps = apps.len();
                         let items = apps.into_iter().map(|app| Item {
+                            id: Some(item_id("apps", &app.launch_id)),
                             title: app.name.clone().into(),
                             subtitle: "Application".into(),
                             target: Target::App(app),
                         });
                         this.items.splice(0..0, items);
                     }
-                    Err(err) => eprintln!("[spike] app discovery failed: {err}"),
+                    Err(err) => eprintln!("[spotlight] app discovery failed: {err}"),
                 }
                 this.stats.discover_ms = Some(ms(elapsed));
                 eprintln!(
-                    "[spike] discovered {} apps in {:.1} ms",
+                    "[spotlight] discovered {} apps in {:.1} ms",
                     this.stats.apps,
                     ms(elapsed)
                 );
@@ -190,9 +218,16 @@ impl Launcher {
     /// Re-runs the fuzzy filter and resets the selection. Returns the filter time in ms.
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
-        self.results = self
-            .searcher
-            .filter(query, self.items.iter().map(|item| item.title.as_ref()));
+        let now = frecency::now();
+        let candidates = self.items.iter().map(|item| Candidate {
+            title: item.title.as_ref(),
+            frecency: item
+                .id
+                .as_ref()
+                .and_then(|id| self.frecency.get(id))
+                .map_or(0., |used| used.score_at(now)),
+        });
+        self.results = self.searcher.filter(query, candidates);
         self.selected = 0;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         ms(started.elapsed())
@@ -285,12 +320,40 @@ impl Launcher {
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&ix) = self.results.get(self.selected)
-            && let Target::App(app) = &self.items[ix].target
-        {
-            app.launch();
+        if let Some(&ix) = self.results.get(self.selected) {
+            let item = &self.items[ix];
+            if let Target::App(app) = &item.target {
+                app.launch();
+            }
+            if let Some(id) = item.id.clone() {
+                self.record_visit(id, cx);
+            }
         }
         self.hide(cx);
+    }
+
+    /// Updates frecency in memory right away and in the database on a background thread.
+    fn record_visit(&mut self, id: String, cx: &mut Context<Self>) {
+        let now = frecency::now();
+        let used = self.frecency.entry(id.clone()).or_default();
+        *used = used.visit(now);
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|mut store| {
+                        store.record_visit(&id, now).map_err(|err| err.to_string())
+                    });
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save frecency for {id:?}: {err}");
+                }
+            })
+            .detach();
     }
 
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
@@ -441,7 +504,7 @@ impl Render for Launcher {
     }
 }
 
-/// A stable pastel colour per title, standing in for app icons in the spike.
+/// A stable pastel colour per title, standing in for app icons until real ones are extracted.
 fn badge_color(title: &str) -> Hsla {
     let mut hasher = DefaultHasher::new();
     title.hash(&mut hasher);

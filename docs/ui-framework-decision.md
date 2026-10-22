@@ -60,12 +60,12 @@ Comparison run, done before the window-size fix described below:
 - **Licence:** Apache-2.0. Slint is GPLv3, a royalty-free licence with attribution, or commercial.
 - **Text rendering** built for an editor.
 
-The trade-off is more UI code to write ourselves: text input and list rows. Our own widget set starts from `spikes/gpui/src/text_input.rs`.
+The trade-off is more UI code to write ourselves: text input and list rows. Our own widget set starts from `crates/ui/src/text_input.rs`.
 
 ## Findings worth keeping
 
 - **Window size with hidden creation.** With `show: false`, GPUI applies the window size in `activate()`. The spike shows the window through Win32, which bypasses that, so the size must be set explicitly with the monitor's DPI. Before the fix the window was 1920 × 1023; fixing it also cut idle RAM by ~30 MB.
-- **RAM floor.** A bare GPUI window with one label (`cargo run -p spike-gpui --example baseline --release`) uses ~71 MB private on the test machine. GPU driver and device overhead is the likely bulk (unverified).
+- **RAM floor.** A bare GPUI window with one label (`cargo run -p spotlight --example baseline --release`) uses ~71 MB private on the test machine. GPU driver and device overhead is the likely bulk (unverified).
 - **Background.** GPUI's `Blurred` mode (accent policy) barely blurs on Windows 11, so a dense tint is used. The DWM acrylic system backdrop rendered light grey and lost focus after a few seconds.
 - **Alt+Space** can be held by another app. The real app needs a hotkey picker.
 
