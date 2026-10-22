@@ -12,9 +12,10 @@ use std::{
 };
 
 use gpui::{
-    App, Context, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding, RenderImage,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, actions, canvas,
-    div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
+    App, Context, DispatchPhase, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding,
+    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -31,7 +32,11 @@ use spotlight_platform_win::{
 use spotlight_search::{Candidate, Searcher};
 use spotlight_store::Store;
 
-use crate::text_input::{self, TextInput};
+use crate::{
+    smooth_scroll::SmoothScroll,
+    text_input::{self, TextInput},
+    theme,
+};
 
 actions!(
     launcher,
@@ -40,15 +45,12 @@ actions!(
 
 const CONTEXT: &str = "Launcher";
 const ROW_HEIGHT: f32 = 44.;
+/// Space above the first and below the last row.
+const LIST_PADDING: f32 = 4.;
 /// Row icon size in logical pixels.
 const ICON_SIZE: f32 = 26.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
-/// Background over GPUI's `Blurred` window. GPUI's accent-policy blur barely
-/// blurs on Windows 11, so the tint has to hide what's behind on its own.
-/// (The DWM acrylic system backdrop was tried: light grey, and the window lost
-/// focus and hid itself after a few seconds.)
-const BACKGROUND_TINT: u32 = 0x1c1c1ef7;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -100,7 +102,7 @@ pub struct Launcher {
     /// Indices into `items`, best match first.
     results: Vec<usize>,
     selected: usize,
-    scroll: UniformListScrollHandle,
+    scroll: SmoothScroll,
     searcher: Searcher,
     /// In-memory copy of the store's frecency table, updated on every launch.
     frecency: HashMap<String, Frecency>,
@@ -116,6 +118,7 @@ impl Launcher {
         hotkey: SharedString,
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
+        smooth_scrolling: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -166,7 +169,12 @@ impl Launcher {
             items,
             results: Vec::new(),
             selected: 0,
-            scroll: UniformListScrollHandle::new(),
+            scroll: {
+                let mut scroll =
+                    SmoothScroll::new(UniformListScrollHandle::new(), ROW_HEIGHT, LIST_PADDING);
+                scroll.set_enabled(smooth_scrolling);
+                scroll
+            },
             searcher: Searcher::default(),
             frecency,
             store,
@@ -265,6 +273,11 @@ impl Launcher {
         .detach();
     }
 
+    pub fn set_smooth_scrolling(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.scroll.set_enabled(enabled);
+        cx.notify();
+    }
+
     /// Shown in the footer.
     pub fn set_hotkey_label(&mut self, label: SharedString, cx: &mut Context<Self>) {
         self.stats.hotkey = label;
@@ -289,7 +302,7 @@ impl Launcher {
         });
         self.results = self.searcher.filter(query, candidates);
         self.selected = 0;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll.reset();
         ms(started.elapsed())
     }
 
@@ -374,8 +387,7 @@ impl Launcher {
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
-            self.scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Bottom);
+            self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
@@ -383,8 +395,7 @@ impl Launcher {
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Top);
+            self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
@@ -510,7 +521,11 @@ impl Launcher {
 }
 
 impl Render for Launcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.scroll.tick() {
+            window.request_animation_frame();
+        }
+
         let results: gpui::AnyElement = if self.results.is_empty() {
             div()
                 .flex_1()
@@ -521,7 +536,7 @@ impl Render for Launcher {
                 .child("No results")
                 .into_any_element()
         } else {
-            uniform_list(
+            let list = uniform_list(
                 "results",
                 self.results.len(),
                 cx.processor(|this, range: Range<usize>, _window, cx| {
@@ -530,10 +545,51 @@ impl Render for Launcher {
                         .collect::<Vec<_>>()
                 }),
             )
-            .track_scroll(self.scroll.clone())
-            .flex_1()
-            .py_1()
-            .into_any_element()
+            .track_scroll(self.scroll.handle())
+            .size_full()
+            .py(px(LIST_PADDING));
+
+            // Wheel notches are taken before the list sees them (capture phase)
+            // and animated instead; everything else falls through to GPUI.
+            let this = cx.entity().downgrade();
+            let wheel = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture
+                            || !bounds.contains(&event.position)
+                            || !matches!(event.delta, ScrollDelta::Lines(_))
+                        {
+                            return;
+                        }
+                        let delta = event.delta.pixel_delta(window.line_height()).y;
+                        let handled = this
+                            .update(cx, |this, cx| {
+                                if !this.scroll.is_enabled() {
+                                    return false;
+                                }
+                                this.scroll.scroll_by(delta, this.results.len());
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
+
+            div()
+                .flex_1()
+                .relative()
+                .child(list)
+                .child(wheel)
+                .into_any_element()
         };
 
         let paint = self.stats.paint.clone();
@@ -547,7 +603,7 @@ impl Render for Launcher {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(BACKGROUND_TINT))
+            .bg(rgba(theme::BACKGROUND_TINT))
             .text_color(rgb(0xececec))
             .text_size(px(14.))
             .child(

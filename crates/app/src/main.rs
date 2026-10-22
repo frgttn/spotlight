@@ -26,8 +26,8 @@ use std::{
 };
 
 use gpui::{
-    App, Application, Bounds, SharedString, TitlebarOptions, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, prelude::*, px, size,
+    App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, prelude::*, px, size,
 };
 use spotlight_platform_win::{
     hotkey::{self, Hotkey},
@@ -45,12 +45,15 @@ use crate::tray::{Command, Tray};
 
 /// `settings` key holding the launcher hotkey, in `Hotkey`'s display form.
 const HOTKEY_SETTING: &str = "hotkey";
+/// `settings` key: `"true"` or `"false"`; missing means on.
+const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
     launcher: WindowHandle<Launcher>,
     hotkeys: hotkey::Service,
     hotkey: Cell<Option<Hotkey>>,
+    smooth_scrolling: Cell<bool>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -95,16 +98,19 @@ fn main() {
     let (store, data_path) = open_store();
     let store = store.map(|store| Arc::new(Mutex::new(store)));
 
-    let saved_hotkey = store
-        .as_ref()
-        .and_then(|store| store.lock().ok()?.setting(HOTKEY_SETTING).ok().flatten())
-        .and_then(|text| {
-            let hotkey = Hotkey::parse(&text);
-            if hotkey.is_none() {
-                eprintln!("[spotlight] ignoring unreadable saved hotkey {text:?}");
-            }
-            hotkey
-        });
+    let setting = |key: &str| {
+        store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
+    };
+    let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
+    let saved_hotkey = setting(HOTKEY_SETTING).and_then(|text| {
+        let hotkey = Hotkey::parse(&text);
+        if hotkey.is_none() {
+            eprintln!("[spotlight] ignoring unreadable saved hotkey {text:?}");
+        }
+        hotkey
+    });
     let (presses_tx, presses_rx) = async_channel::unbounded::<Instant>();
     let (hotkeys, registered) =
         hotkey::spawn(saved_hotkey, presses_tx.clone()).expect("failed to start the hotkey thread");
@@ -126,6 +132,7 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         text_input::bind_keys(cx);
         launcher::bind_keys(cx);
+        settings::bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let (width, height) = launcher::WINDOW_SIZE;
@@ -149,7 +156,16 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    cx.new(|cx| Launcher::new(label, synthetic, launcher_store, window, cx))
+                    cx.new(|cx| {
+                        Launcher::new(
+                            label,
+                            synthetic,
+                            launcher_store,
+                            smooth_scrolling,
+                            window,
+                            cx,
+                        )
+                    })
                 },
             )
             .expect("failed to open the launcher window");
@@ -173,6 +189,7 @@ fn main() {
             launcher: window,
             hotkeys: hotkeys.clone(),
             hotkey: Cell::new(hotkey),
+            smooth_scrolling: Cell::new(smooth_scrolling),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -278,11 +295,11 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
             size(px(width), px(height)),
             cx,
         ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("Spotlight Settings".into()),
-            ..Default::default()
-        }),
+        // Frameless: the view draws its own header with a drag area and close button.
+        titlebar: None,
         is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Blurred,
         app_id: Some("spotlight".into()),
         ..Default::default()
     };
@@ -292,6 +309,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
             Settings::new(
                 view_state.hotkeys.clone(),
                 view_state.hotkey.get(),
+                view_state.smooth_scrolling.get(),
                 view_state.data_path.clone(),
                 window,
                 cx,
@@ -323,24 +341,17 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             if let Some(tray) = &state.tray {
                 tray.set_hotkey(&label);
             }
-            if let Some(store) = state.store.clone() {
-                let text = hotkey.to_string();
-                cx.background_executor()
-                    .spawn(async move {
-                        let result = store
-                            .lock()
-                            .map_err(|_| "store lock poisoned".to_owned())
-                            .and_then(|store| {
-                                store
-                                    .set_setting(HOTKEY_SETTING, &text)
-                                    .map_err(|err| err.to_string())
-                            });
-                        if let Err(err) = result {
-                            eprintln!("[spotlight] could not save the hotkey: {err}");
-                        }
-                    })
-                    .detach();
-            }
+            save_setting(state, HOTKEY_SETTING, hotkey.to_string(), cx);
+        }
+        SettingsEvent::SmoothScrollingChanged(enabled) => {
+            state.smooth_scrolling.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_smooth_scrolling(*enabled, cx)
+                })
+                .ok();
+            save_setting(state, SMOOTH_SCROLLING_SETTING, enabled.to_string(), cx);
         }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
@@ -348,6 +359,29 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             }
         }
     }
+}
+
+/// Writes a setting on a background thread; without a database it is kept
+/// for this run only.
+fn save_setting(state: &AppState, key: &'static str, value: String, cx: &mut App) {
+    let Some(store) = state.store.clone() else {
+        return;
+    };
+    cx.background_executor()
+        .spawn(async move {
+            let result = store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_owned())
+                .and_then(|store| {
+                    store
+                        .set_setting(key, &value)
+                        .map_err(|err| err.to_string())
+                });
+            if let Err(err) = result {
+                eprintln!("[spotlight] could not save setting {key:?}: {err}");
+            }
+        })
+        .detach();
 }
 
 fn hotkey_label(hotkey: Option<Hotkey>) -> SharedString {

@@ -3,4 +3,6 @@
 
 pub mod launcher;
 pub mod settings;
+pub mod smooth_scroll;
 pub mod text_input;
+pub mod theme;

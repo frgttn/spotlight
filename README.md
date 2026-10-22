@@ -15,8 +15,9 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
 - **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).
 - **Single instance:** launching Spotlight again (Start menu, a shortcut) opens the running instance instead of starting a second one.
 - **Tray icon:** left click opens the launcher; the menu has Open, Settings, Start at login and Quit.
-- **Settings window** (Ctrl+, in the launcher, the tray menu, or `spotlight.exe --settings`):
+- **Settings window** (Ctrl+, in the launcher, the tray menu, or `spotlight.exe --settings`), frameless like the launcher: drag it by the header, close it with ✕ or Esc.
   - *Launcher hotkey:* click the field and press a combination. While recording, a low-level keyboard hook catches the keys, so a combination another app already owns is caught too and reported as taken; the old hotkey then stays. The choice is saved in the database.
+  - *Smooth scrolling:* the result list animates to its new position when you move the selection or turn the mouse wheel (touchpad scrolling is already smooth and is left alone). On by default.
   - *Start at login:* stored in the per-user `Run` registry key. Disabling it in Task Manager's Startup tab is respected. Also in the tray menu.
 
 The binary uses the Windows GUI subsystem, so no console window opens. Logs still go to the terminal it was started from.
