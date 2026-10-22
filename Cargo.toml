@@ -8,6 +8,7 @@ version = "0.0.0"
 # Let chains (`if let … && …`) need 1.88.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/frgttn/spotlight"
 publish = false
 
 [workspace.dependencies]
