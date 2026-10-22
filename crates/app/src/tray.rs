@@ -1,4 +1,4 @@
-//! Notification-area icon: open the launcher, toggle start at login, quit.
+//! Notification-area icon: open the launcher or settings, toggle start at login, quit.
 //!
 //! `tray-icon` creates a hidden window on the calling thread, so this must run
 //! on GPUI's main thread, whose message loop then dispatches the tray messages.
@@ -11,12 +11,13 @@ use tray_icon::{
 
 pub enum Command {
     Open,
+    Settings,
     ToggleAutostart,
     Quit,
 }
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
     autostart: CheckMenuItem,
 }
 
@@ -24,11 +25,13 @@ impl Tray {
     /// Shows the tray icon. Menu picks and left clicks arrive on `commands`.
     pub fn create(hotkey: &str, commands: async_channel::Sender<Command>) -> Result<Self, String> {
         let open = MenuItem::new("Open Spotlight", true, None);
+        let settings = MenuItem::new("Settings…", true, None);
         let autostart = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         menu.append_items(&[
             &open,
+            &settings,
             &PredefinedMenuItem::separator(),
             &autostart,
             &PredefinedMenuItem::separator(),
@@ -36,8 +39,9 @@ impl Tray {
         ])
         .map_err(|err| err.to_string())?;
 
-        let ids: [(MenuId, fn() -> Command); 3] = [
+        let ids: [(MenuId, fn() -> Command); 4] = [
             (open.id().clone(), || Command::Open),
+            (settings.id().clone(), || Command::Settings),
             (autostart.id().clone(), || Command::ToggleAutostart),
             (quit.id().clone(), || Command::Quit),
         ];
@@ -60,15 +64,16 @@ impl Tray {
 
         let icon = TrayIconBuilder::new()
             .with_icon(icon()?)
-            .with_tooltip(format!("Spotlight ({hotkey})"))
+            .with_tooltip(tooltip(hotkey))
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .build()
             .map_err(|err| err.to_string())?;
-        Ok(Self {
-            _icon: icon,
-            autostart,
-        })
+        Ok(Self { icon, autostart })
+    }
+
+    pub fn set_hotkey(&self, hotkey: &str) {
+        let _ = self.icon.set_tooltip(Some(tooltip(hotkey)));
     }
 
     /// Flips start at login and shows the resulting state, which stays the old
@@ -77,8 +82,17 @@ impl Tray {
         if let Err(err) = autostart::set_enabled(!autostart::is_enabled()) {
             eprintln!("[tray] could not change start at login: {err}");
         }
+        self.sync_autostart();
+    }
+
+    /// Updates the check mark after start at login changed elsewhere (the settings window).
+    pub fn sync_autostart(&self) {
         self.autostart.set_checked(autostart::is_enabled());
     }
+}
+
+fn tooltip(hotkey: &str) -> String {
+    format!("Spotlight ({hotkey})")
 }
 
 /// A white magnifier on a blue disc, drawn at 32 px with antialiased edges.

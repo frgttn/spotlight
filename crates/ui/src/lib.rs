@@ -2,4 +2,5 @@
 //! touches nothing else.
 
 pub mod launcher;
+pub mod settings;
 pub mod text_input;

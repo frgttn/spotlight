@@ -145,7 +145,7 @@ Script commands are a simple, language-agnostic way to extend the launcher.
 
 | Need | API |
 |---|---|
-| Global hotkey | `RegisterHotKey` first; a `WH_KEYBOARD_LL` hook later for Win-key combos and snippet expansion. A hotkey picker plus a clear message when the combination is already taken |
+| Global hotkey | `RegisterHotKey`, changeable at run time. The settings recorder installs a `WH_KEYBOARD_LL` hook while recording, so it sees combinations other apps own and can say they're taken. Later the same hook for Win-key combos and snippet expansion |
 | Reliable focus when showing | `SetForegroundWindow` right after `WM_HOTKEY`; `AttachThreadInput` fallback |
 | Hide on blur | GPUI window activation events |
 | Rounded corners | `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE)` |
@@ -173,7 +173,8 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
 
 0. ✅ **Spike**: hotkey, prewarmed window, fuzzy app search, launch, measurements. See [ui-framework-decision.md](ui-framework-decision.md).
 1. ✅ Workspace (`app`, `ui`, `core`, `search`, `store`, `platform-win`), SQLite store, frecency ranking, app icons, tray, single instance, start at login.
-   Still to do: the `Provider` trait and `providers/` (apps, system, calc, web); settings window; hotkey picker; icon disk cache.
+   Settings window with a hotkey recorder (conflicts reported) and start at login.
+   Still to do: the `Provider` trait and `providers/` (apps, system, calc, web); searchable settings; icon disk cache.
 2. Action panel (Ctrl+K), aliases, per-item hotkeys, frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
 4. Window management, file search.

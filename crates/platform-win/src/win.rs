@@ -8,7 +8,10 @@ use std::{ffi::c_void, mem::size_of};
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::{
-        Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
+        Dwm::{
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DwmSetWindowAttribute,
+        },
         Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
     },
     System::Console::{ATTACH_PARENT_PROCESS, AttachConsole},
@@ -34,6 +37,19 @@ pub fn round_corners(raw: isize) {
             hwnd(raw),
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &preference as *const _ as *const c_void,
+            size_of::<i32>() as u32,
+        );
+    }
+}
+
+/// Draws the system title bar dark, to match a dark window body.
+pub fn dark_title_bar(raw: isize) {
+    unsafe {
+        let enabled: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd(raw),
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &enabled as *const _ as *const c_void,
             size_of::<i32>() as u32,
         );
     }

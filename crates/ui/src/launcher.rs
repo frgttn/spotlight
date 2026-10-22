@@ -33,7 +33,10 @@ use spotlight_store::Store;
 
 use crate::text_input::{self, TextInput};
 
-actions!(launcher, [SelectNext, SelectPrev, Confirm, Dismiss, Quit]);
+actions!(
+    launcher,
+    [SelectNext, SelectPrev, Confirm, Dismiss, Quit, OpenSettings]
+);
 
 const CONTEXT: &str = "Launcher";
 const ROW_HEIGHT: f32 = 44.;
@@ -56,6 +59,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
+        // Not handled here: it bubbles up to the app, which owns the settings window.
+        KeyBinding::new("ctrl-,", OpenSettings, Some(CONTEXT)),
     ]);
 }
 
@@ -110,7 +115,7 @@ impl Launcher {
     pub fn new(
         hotkey: SharedString,
         synthetic: usize,
-        store: Option<Store>,
+        store: Option<Arc<Mutex<Store>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -146,6 +151,7 @@ impl Launcher {
 
         let frecency = store
             .as_ref()
+            .and_then(|store| store.lock().ok())
             .map(|store| {
                 store.frecency().unwrap_or_else(|err| {
                     eprintln!("[spotlight] could not read frecency: {err}");
@@ -163,7 +169,7 @@ impl Launcher {
             scroll: UniformListScrollHandle::new(),
             searcher: Searcher::default(),
             frecency,
-            store: store.map(|store| Arc::new(Mutex::new(store))),
+            store,
             visible: false,
             stats: Stats {
                 hotkey,
@@ -257,6 +263,12 @@ impl Launcher {
             }
         })
         .detach();
+    }
+
+    /// Shown in the footer.
+    pub fn set_hotkey_label(&mut self, label: SharedString, cx: &mut Context<Self>) {
+        self.stats.hotkey = label;
+        cx.notify();
     }
 
     pub fn query(&self, cx: &App) -> String {

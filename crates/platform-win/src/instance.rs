@@ -1,6 +1,6 @@
 //! Single instance: a named mutex decides which process is the primary one, and
-//! a named pipe lets later launches hand it a message (for now only [`SHOW`];
-//! deeplinks will use the same pipe).
+//! a named pipe lets later launches hand it a message ([`SHOW`] or
+//! [`SETTINGS`]; deeplinks will use the same pipe).
 //!
 //! Both names are per user and per Windows session, so two users on one
 //! machine (or one user in two RDP sessions) each get their own launcher.
@@ -33,6 +33,8 @@ use windows::{
 
 /// Asks the primary instance to show its launcher window.
 pub const SHOW: &str = "show";
+/// Asks the primary instance to open its settings window.
+pub const SETTINGS: &str = "settings";
 /// Longer messages are cut off; this is plenty for a command or a deeplink.
 const MAX_MESSAGE: usize = 4096;
 

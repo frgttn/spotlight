@@ -6,16 +6,18 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
 
 ## What works today
 
-- **Global hotkey:** Alt+Space, falling back to Ctrl+Shift+Space if another app already owns it.
+- **Global hotkey:** Alt+Space by default, falling back to Ctrl+Shift+Space if another app already owns it. Change it in Settings.
 - **Window:** frameless, topmost, prewarmed, DPI-aware, opens on the monitor under the mouse. It hides on Esc or when it loses focus.
 - **Search:** fuzzy search ([nucleo](https://github.com/helix-editor/nucleo)) over all installed apps (Win32 and Microsoft Store/MSIX, via `shell:AppsFolder`).
 - **Frecency:** apps you launch often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
-- **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+Backspace to clear the query, Ctrl+Q to quit.
+- **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+Backspace to clear the query, Ctrl+, for settings, Ctrl+Q to quit.
 - **Text input** with IME support.
 - **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).
 - **Single instance:** launching Spotlight again (Start menu, a shortcut) opens the running instance instead of starting a second one.
-- **Tray icon:** left click opens the launcher; the menu has Open, Start at login and Quit.
-- **Start at login:** toggled from the tray, stored in the per-user `Run` registry key. Disabling it in Task Manager's Startup tab is respected.
+- **Tray icon:** left click opens the launcher; the menu has Open, Settings, Start at login and Quit.
+- **Settings window** (Ctrl+, in the launcher, the tray menu, or `spotlight.exe --settings`):
+  - *Launcher hotkey:* click the field and press a combination. While recording, a low-level keyboard hook catches the keys, so a combination another app already owns is caught too and reported as taken; the old hotkey then stays. The choice is saved in the database.
+  - *Start at login:* stored in the per-user `Run` registry key. Disabling it in Task Manager's Startup tab is respected. Also in the tray menu.
 
 The binary uses the Windows GUI subsystem, so no console window opens. Logs still go to the terminal it was started from.
 
@@ -31,7 +33,7 @@ The binary uses the Windows GUI subsystem, so no console window opens. Logs stil
 cargo run --release
 ```
 
-Then press **Alt+Space**.
+Then press **Alt+Space** (or the hotkey you set).
 
 | Environment variable | Effect |
 |---|---|
@@ -59,7 +61,7 @@ Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](
 | Path | What |
 |---|---|
 | `crates/app` | The `spotlight` binary: wiring, window lifecycle, tray icon, self-test, GPUI baseline example |
-| `crates/ui` | GPUI views: launcher (search field, result list, metrics footer) and text input |
+| `crates/ui` | GPUI views: launcher (search field, result list, metrics footer), settings and text input |
 | `crates/core` | Domain types: item ids, frecency |
 | `crates/search` | Ranking: fuzzy score, prefix bonus, frecency |
 | `crates/store` | SQLite (`rusqlite`, bundled): settings and frecency, with schema migrations |
