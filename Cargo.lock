@@ -5537,6 +5537,7 @@ dependencies = [
  "async-channel 2.5.0",
  "gpui",
  "raw-window-handle",
+ "spotlight-core",
  "spotlight-platform-win",
  "spotlight-providers",
  "spotlight-store",

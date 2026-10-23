@@ -8,7 +8,7 @@ pub mod web;
 
 use std::sync::Arc;
 
-use spotlight_core::provider::Provider;
+use spotlight_core::{provider::Provider, web::SearchEngine};
 
 /// Symbols from Segoe Fluent Icons (Windows 11), at the same code points in
 /// Segoe MDL2 Assets (Windows 10).
@@ -33,12 +33,15 @@ mod glyph {
     pub const USB: char = '\u{E88E}';
 }
 
-/// Every built-in provider, in the order their answers and catalogs are listed.
-pub fn all() -> Vec<Arc<dyn Provider>> {
-    vec![
+/// Every built-in provider, in the order their answers and catalogs are
+/// listed, and the web provider again, to change its search engine later.
+pub fn all(engine: SearchEngine) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
+    let web = Arc::new(web::Web::new(engine));
+    let providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(apps::Apps),
         Arc::new(system::System),
         Arc::new(calc::Calculator),
-        Arc::new(web::Web),
-    ]
+        web.clone(),
+    ];
+    (providers, web)
 }

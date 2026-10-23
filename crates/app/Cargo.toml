@@ -12,6 +12,7 @@ publish.workspace = true
 async-channel.workspace = true
 gpui.workspace = true
 raw-window-handle.workspace = true
+spotlight-core.workspace = true
 spotlight-platform-win.workspace = true
 spotlight-providers.workspace = true
 spotlight-store.workspace = true

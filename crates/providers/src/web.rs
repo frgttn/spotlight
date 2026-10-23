@@ -1,16 +1,17 @@
 //! Opening URLs typed into the search field, and web search as the fallback.
 
+use std::sync::RwLock;
+
 use spotlight_core::{
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
+    web::SearchEngine,
 };
 
 use crate::glyph;
 
 pub const ID: &str = "web";
-
-const SEARCH_URL: &str = "https://www.google.com/search?q=";
 
 /// Top-level domains recognised without a scheme. A list rather than "any
 /// letters", so file names (`notes.md`, `main.rs`, `setup.exe`) don't look
@@ -24,7 +25,31 @@ const TLDS: &[&str] = &[
     "sg", "in", "id", "br", "mx", "ar", "cl", "za",
 ];
 
-pub struct Web;
+pub struct Web {
+    /// Changed from the settings window while the app runs.
+    engine: RwLock<SearchEngine>,
+}
+
+impl Web {
+    pub fn new(engine: SearchEngine) -> Self {
+        Self {
+            engine: RwLock::new(engine),
+        }
+    }
+
+    pub fn set_engine(&self, engine: SearchEngine) {
+        if let Ok(mut current) = self.engine.write() {
+            *current = engine;
+        }
+    }
+
+    fn engine(&self) -> SearchEngine {
+        self.engine
+            .read()
+            .map(|engine| engine.clone())
+            .unwrap_or_default()
+    }
+}
 
 impl Provider for Web {
     fn id(&self) -> &'static str {
@@ -45,17 +70,17 @@ impl Provider for Web {
     }
 
     fn fallbacks(&self, query: &str) -> Vec<SearchItem> {
+        let engine = self.engine();
+        let url = engine.url(query);
         vec![
             SearchItem::new(
                 item_id(ID, "search"),
-                format!("Search Google for “{query}”"),
+                format!("Search {} for “{query}”", engine.name()),
             )
             .subtitle("Web Search")
             .icon(Icon::Glyph(glyph::SEARCH))
-            .action(
-                "Search in Browser",
-                Command::OpenUrl(format!("{SEARCH_URL}{}", encode_query(query))),
-            ),
+            .action("Search in Browser", Command::OpenUrl(url.clone()))
+            .action("Copy Search URL", Command::Copy(url)),
         ]
     }
 }
@@ -112,21 +137,6 @@ fn is_ipv4(host: &str) -> bool {
             .all(|part| !part.is_empty() && part.len() <= 3 && part.parse::<u8>().is_ok())
 }
 
-/// Percent-encodes `query` for a URL query string (spaces become `+`).
-pub fn encode_query(query: &str) -> String {
-    let mut encoded = String::with_capacity(query.len());
-    for byte in query.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            b' ' => encoded.push('+'),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,21 +184,24 @@ mod tests {
     }
 
     #[test]
-    fn encodes_search_queries() {
-        assert_eq!(encode_query("rust gpui"), "rust+gpui");
-        assert_eq!(encode_query("a&b=c?"), "a%26b%3Dc%3F");
+    fn falls_back_to_web_search() {
+        let web = Web::new(SearchEngine::default());
+        let items = web.fallbacks("rust gpui");
         assert_eq!(
-            encode_query("привет"),
-            "%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82"
+            items[0].actions[0].command,
+            Command::OpenUrl("https://www.google.com/search?q=rust+gpui".into())
         );
     }
 
     #[test]
-    fn falls_back_to_web_search() {
-        let items = Web.fallbacks("rust gpui");
+    fn uses_the_chosen_engine() {
+        let web = Web::new(SearchEngine::default());
+        web.set_engine(SearchEngine::from_setting("duckduckgo").unwrap());
+        let items = web.fallbacks("rust");
+        assert_eq!(items[0].title, "Search DuckDuckGo for “rust”");
         assert_eq!(
             items[0].actions[0].command,
-            Command::OpenUrl("https://www.google.com/search?q=rust+gpui".into())
+            Command::OpenUrl("https://duckduckgo.com/?q=rust".into())
         );
     }
 }

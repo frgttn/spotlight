@@ -29,11 +29,13 @@ use gpui::{
     App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions, prelude::*, px, size,
 };
+use spotlight_core::web::SearchEngine;
 use spotlight_platform_win::{
     hotkey::{self, Hotkey},
     instance::{self, Instance},
     metrics, win,
 };
+use spotlight_providers::web::Web;
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
@@ -47,6 +49,8 @@ use crate::tray::{Command, Tray};
 const HOTKEY_SETTING: &str = "hotkey";
 /// `settings` key: `"true"` or `"false"`; missing means on.
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
+/// `settings` key: `SearchEngine`'s setting form; missing means Google.
+const SEARCH_ENGINE_SETTING: &str = "search_engine";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
@@ -54,6 +58,9 @@ struct AppState {
     hotkeys: hotkey::Service,
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
+    search_engine: RefCell<SearchEngine>,
+    /// The web provider, to switch its search engine.
+    web: Arc<Web>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -104,6 +111,15 @@ fn main() {
             .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
+    let search_engine = setting(SEARCH_ENGINE_SETTING)
+        .and_then(|text| {
+            let engine = SearchEngine::from_setting(&text);
+            if engine.is_none() {
+                eprintln!("[spotlight] ignoring unknown search engine {text:?}");
+            }
+            engine
+        })
+        .unwrap_or_default();
     let saved_hotkey = setting(HOTKEY_SETTING).and_then(|text| {
         let hotkey = Hotkey::parse(&text);
         if hotkey.is_none() {
@@ -141,6 +157,7 @@ fn main() {
         let launcher_store = store.clone();
         let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
+        let (providers, web) = spotlight_providers::all(search_engine.clone());
         let window = cx
             .open_window(
                 WindowOptions {
@@ -162,7 +179,7 @@ fn main() {
                         Launcher::new(
                             label,
                             launcher_hotkeys,
-                            spotlight_providers::all(),
+                            providers,
                             synthetic,
                             launcher_store,
                             smooth_scrolling,
@@ -206,6 +223,8 @@ fn main() {
             hotkeys: hotkeys.clone(),
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
+            search_engine: RefCell::new(search_engine.clone()),
+            web,
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -326,6 +345,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkeys.clone(),
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
+                view_state.search_engine.borrow().clone(),
                 view_state.data_path.clone(),
                 shortcut_source(view_state.launcher),
                 window,
@@ -359,6 +379,11 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 tray.set_hotkey(&label);
             }
             save_setting(state, HOTKEY_SETTING, hotkey.to_string(), cx);
+        }
+        SettingsEvent::SearchEngineChanged(engine) => {
+            state.web.set_engine(engine.clone());
+            *state.search_engine.borrow_mut() = engine.clone();
+            save_setting(state, SEARCH_ENGINE_SETTING, engine.to_setting(), cx);
         }
         SettingsEvent::SmoothScrollingChanged(enabled) => {
             state.smooth_scrolling.set(*enabled);
