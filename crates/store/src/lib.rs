@@ -1,4 +1,5 @@
-//! SQLite persistence: settings and frecency.
+//! SQLite persistence: settings, frecency, aliases, item hotkeys and the
+//! calculator history.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -13,7 +14,8 @@ pub type Result<T> = rusqlite::Result<T>;
 
 /// Schema changes, applied in order. `PRAGMA user_version` records how many
 /// have run, so only append to this list; never edit an entry that shipped.
-const MIGRATIONS: &[&str] = &["CREATE TABLE settings (
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
@@ -22,7 +24,36 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE settings (
         score     REAL NOT NULL,
         last_used INTEGER NOT NULL,
         count     INTEGER NOT NULL
-    );"];
+    );",
+    "CREATE TABLE aliases (
+        item_id TEXT PRIMARY KEY,
+        alias   TEXT NOT NULL
+    );
+    CREATE TABLE item_hotkeys (
+        item_id TEXT PRIMARY KEY,
+        hotkey  TEXT NOT NULL
+    );",
+    "CREATE TABLE calculations (
+        id         INTEGER PRIMARY KEY,
+        expression TEXT NOT NULL,
+        answer     TEXT NOT NULL,
+        used_at    INTEGER NOT NULL
+    );
+    CREATE INDEX calculations_used_at ON calculations (used_at);",
+];
+
+/// How many calculations the history keeps; older ones go.
+const CALCULATIONS_KEPT: i64 = 200;
+
+/// A calculation the user used, for the calculator history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calculation {
+    pub id: i64,
+    pub expression: String,
+    pub answer: String,
+    /// Unix seconds.
+    pub used_at: i64,
+}
 
 pub struct Store {
     conn: Connection,
@@ -121,6 +152,111 @@ impl Store {
         tx.commit()?;
         Ok(next)
     }
+
+    /// Item id → alias.
+    pub fn aliases(&self) -> Result<HashMap<String, String>> {
+        self.pairs("SELECT item_id, alias FROM aliases")
+    }
+
+    /// Sets or (with `None`) removes the alias of `item_id`.
+    pub fn set_alias(&self, item_id: &str, alias: Option<&str>) -> Result<()> {
+        self.set_pair("aliases", "alias", item_id, alias)
+    }
+
+    /// Item id → hotkey, in `Hotkey`'s display form.
+    pub fn item_hotkeys(&self) -> Result<HashMap<String, String>> {
+        self.pairs("SELECT item_id, hotkey FROM item_hotkeys")
+    }
+
+    /// Sets or (with `None`) removes the hotkey of `item_id`.
+    pub fn set_item_hotkey(&self, item_id: &str, hotkey: Option<&str>) -> Result<()> {
+        self.set_pair("item_hotkeys", "hotkey", item_id, hotkey)
+    }
+
+    fn pairs(&self, sql: &str) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    }
+
+    /// `table` and `column` are constants from this file, never user input.
+    fn set_pair(
+        &self,
+        table: &str,
+        column: &str,
+        item_id: &str,
+        value: Option<&str>,
+    ) -> Result<()> {
+        match value {
+            Some(value) => self.conn.execute(
+                &format!(
+                    "INSERT INTO {table} (item_id, {column}) VALUES (?1, ?2)
+                     ON CONFLICT (item_id) DO UPDATE SET {column} = excluded.{column}"
+                ),
+                params![item_id, value],
+            )?,
+            None => self.conn.execute(
+                &format!("DELETE FROM {table} WHERE item_id = ?1"),
+                [item_id],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Adds a calculation to the history, or moves it to the top if the same
+    /// expression is already there, and trims the history to its limit.
+    pub fn add_calculation(&mut self, expression: &str, answer: &str, now: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM calculations WHERE expression = ?1",
+            [expression],
+        )?;
+        tx.execute(
+            "INSERT INTO calculations (expression, answer, used_at) VALUES (?1, ?2, ?3)",
+            params![expression, answer, now],
+        )?;
+        tx.execute(
+            "DELETE FROM calculations WHERE id NOT IN
+                (SELECT id FROM calculations ORDER BY used_at DESC, id DESC LIMIT ?1)",
+            [CALCULATIONS_KEPT],
+        )?;
+        tx.commit()
+    }
+
+    /// The calculator history, most recent first.
+    pub fn calculations(&self) -> Result<Vec<Calculation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, expression, answer, used_at FROM calculations
+             ORDER BY used_at DESC, id DESC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(Calculation {
+                id: row.get(0)?,
+                expression: row.get(1)?,
+                answer: row.get(2)?,
+                used_at: row.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    pub fn delete_calculation(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM calculations WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn clear_calculations(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM calculations", [])?;
+        Ok(())
+    }
+
+    /// Forgets every use of `item_id`.
+    pub fn forget(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM frecency WHERE item_id = ?1", [item_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +273,70 @@ mod tests {
             store.setting("hotkey").unwrap().as_deref(),
             Some("ctrl+space")
         );
+    }
+
+    #[test]
+    fn aliases_and_item_hotkeys_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_alias("apps:code", Some("vs")).unwrap();
+        store.set_alias("apps:code", Some("code")).unwrap();
+        store.set_alias("system:lock", Some("l")).unwrap();
+        store.set_alias("system:lock", None).unwrap();
+        assert_eq!(
+            store.aliases().unwrap(),
+            HashMap::from([("apps:code".to_owned(), "code".to_owned())])
+        );
+
+        store
+            .set_item_hotkey("system:lock", Some("Ctrl+Alt+L"))
+            .unwrap();
+        assert_eq!(store.item_hotkeys().unwrap()["system:lock"], "Ctrl+Alt+L");
+        store.set_item_hotkey("system:lock", None).unwrap();
+        assert!(store.item_hotkeys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn calculator_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.add_calculation("1+1", "2", 10).unwrap();
+        store.add_calculation("2*3", "6", 20).unwrap();
+        // Used again: moves to the top instead of appearing twice.
+        store.add_calculation("1+1", "2", 30).unwrap();
+        let history = store.calculations().unwrap();
+        let expressions: Vec<_> = history.iter().map(|c| c.expression.as_str()).collect();
+        assert_eq!(expressions, ["1+1", "2*3"]);
+
+        store.delete_calculation(history[1].id).unwrap();
+        assert_eq!(store.calculations().unwrap().len(), 1);
+        store.clear_calculations().unwrap();
+        assert!(store.calculations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn calculator_history_is_capped() {
+        let mut store = Store::open_in_memory().unwrap();
+        for ix in 0..CALCULATIONS_KEPT + 5 {
+            store
+                .add_calculation(&format!("{ix}+0"), &ix.to_string(), ix)
+                .unwrap();
+        }
+        let history = store.calculations().unwrap();
+        assert_eq!(history.len() as i64, CALCULATIONS_KEPT);
+        assert_eq!(
+            history[0].expression,
+            format!("{}+0", CALCULATIONS_KEPT + 4)
+        );
+    }
+
+    #[test]
+    fn forget_removes_one_item() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.record_visit("apps:a", 1).unwrap();
+        store.record_visit("apps:b", 1).unwrap();
+        store.forget("apps:a").unwrap();
+        store.forget("apps:never-used").unwrap();
+        let left: Vec<_> = store.frecency().unwrap().into_keys().collect();
+        assert_eq!(left, ["apps:b"]);
     }
 
     #[test]

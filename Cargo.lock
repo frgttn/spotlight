@@ -1731,6 +1731,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fend-core"
+version = "1.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bf10938a7681e32b5b7d82ada720a04837f120e671c1e653309053e92c9e1e2"
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4441,6 +4447,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "pulp"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5529,9 +5546,12 @@ name = "spotlight"
 version = "0.0.0"
 dependencies = [
  "async-channel 2.5.0",
+ "embed-resource",
  "gpui",
  "raw-window-handle",
+ "spotlight-core",
  "spotlight-platform-win",
+ "spotlight-providers",
  "spotlight-store",
  "spotlight-ui",
  "tray-icon",
@@ -5546,7 +5566,18 @@ name = "spotlight-platform-win"
 version = "0.0.0"
 dependencies = [
  "async-channel 2.5.0",
+ "spotlight-core",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "spotlight-providers"
+version = "0.0.0"
+dependencies = [
+ "fend-core",
+ "serde_json",
+ "spotlight-core",
+ "spotlight-platform-win",
 ]
 
 [[package]]
@@ -5554,6 +5585,7 @@ name = "spotlight-search"
 version = "0.0.0"
 dependencies = [
  "nucleo-matcher",
+ "spotlight-core",
 ]
 
 [[package]]
@@ -5571,6 +5603,7 @@ dependencies = [
  "async-channel 2.5.0",
  "gpui",
  "image",
+ "pulldown-cmark",
  "raw-window-handle",
  "spotlight-core",
  "spotlight-platform-win",

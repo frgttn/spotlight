@@ -23,13 +23,12 @@ pub struct Icon {
     pub bgra: Vec<u8>,
 }
 
-/// Extracts the icon of an `AppsFolder` item (an [`AppEntry::launch_id`]),
-/// `size` pixels square. Blocking and COM-heavy: call it from a thread that
-/// initialised COM as an STA.
-///
-/// [`AppEntry::launch_id`]: crate::apps::AppEntry::launch_id
-pub fn app_icon(launch_id: &str, size: u32) -> Result<Icon> {
-    let path = HSTRING::from(format!("shell:AppsFolder\\{launch_id}"));
+/// Extracts the icon of a shell item, `size` pixels square. `parsing_name`
+/// is a file path, an absolute parsing name (`::{…}`), or
+/// `shell:AppsFolder\\<launch id>` for an app. Blocking and COM-heavy: call it
+/// from a thread that initialised COM as an STA.
+pub fn shell_icon(parsing_name: &str, size: u32) -> Result<Icon> {
+    let path = HSTRING::from(parsing_name);
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&path, None)?;
         let bitmap = factory.GetImage(
@@ -45,21 +44,22 @@ pub fn app_icon(launch_id: &str, size: u32) -> Result<Icon> {
     }
 }
 
-/// Extracts icons for `launch_ids` on a dedicated COM thread and sends each one
-/// with its index in `launch_ids`. Items whose icon can't be extracted are skipped.
-pub fn spawn(launch_ids: Vec<String>, size: u32, icons: async_channel::Sender<(usize, Icon)>) {
+/// Extracts icons for `parsing_names` (see [`shell_icon`]) on a dedicated COM
+/// thread and sends each one with its index in `parsing_names`. Items whose
+/// icon can't be extracted are skipped.
+pub fn spawn(parsing_names: Vec<String>, size: u32, icons: async_channel::Sender<(usize, Icon)>) {
     let spawned = thread::Builder::new().name("icons".into()).spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         }
-        for (ix, launch_id) in launch_ids.iter().enumerate() {
-            match app_icon(launch_id, size) {
+        for (ix, parsing_name) in parsing_names.iter().enumerate() {
+            match shell_icon(parsing_name, size) {
                 Ok(icon) => {
                     if icons.send_blocking((ix, icon)).is_err() {
                         return;
                     }
                 }
-                Err(err) => eprintln!("[icons] no icon for {launch_id:?}: {err}"),
+                Err(err) => eprintln!("[icons] no icon for {parsing_name:?}: {err}"),
             }
         }
     });

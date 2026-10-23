@@ -15,17 +15,23 @@ publish = false
 [workspace.dependencies]
 spotlight-core = { path = "crates/core" }
 spotlight-platform-win = { path = "crates/platform-win" }
+spotlight-providers = { path = "crates/providers" }
 spotlight-search = { path = "crates/search" }
 spotlight-store = { path = "crates/store" }
 spotlight-ui = { path = "crates/ui" }
 async-channel = "2"
+# Calculator: units, arbitrary precision, no dependencies of its own.
+fend-core = "1.5.9"
 gpui = "=0.2.2"
 # Only for its `Frame`/`RgbaImage` types in GPUI's image API; same version as gpui uses.
 image = { version = "0.25", default-features = false }
 nucleo-matcher = "0.3.1"
+# Markdown in detail views; no HTML output needed.
+pulldown-cmark = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
 # `bundled` compiles SQLite from source, so there is no system library to install.
 rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
 tray-icon = "0.24"
 unicode-segmentation = "1"
 # Same major as gpui 0.2.2 uses, so there is only one copy of the bindings.

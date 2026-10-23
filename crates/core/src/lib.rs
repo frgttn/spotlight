@@ -1,6 +1,10 @@
 //! Domain types shared by every Spotlight crate. No platform or UI code here.
 
 pub mod frecency;
+pub mod item;
+pub mod provider;
+pub mod view;
+pub mod web;
 
 /// Stable identity of a search result, `"{provider}:{instance}"`.
 /// Frecency and (later) aliases and hotkeys are keyed by it, so it must not

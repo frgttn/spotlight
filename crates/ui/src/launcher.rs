@@ -1,37 +1,47 @@
-//! The launcher view: search field, result list, metrics footer.
+//! The launcher view: search field, result list, metrics footer, and the
+//! views opened on top of it (see `views`).
+
+mod views;
 
 use std::{
     cell::RefCell,
     collections::HashMap,
+    env,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    App, Context, DispatchPhase, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding,
-    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
-    UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
-    uniform_list,
+    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
+    FocusHandle, Focusable, Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla,
+    img, prelude::*, px, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
+    item::{Command, Icon, SearchItem},
     item_id,
+    provider::Provider,
+    view::{ListView, View},
 };
 use spotlight_platform_win::{
-    apps::{self, AppEntry},
-    icons::{self, Icon},
+    commands,
+    hotkey::{self, Hotkey, Recorded, SetError},
+    icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     win,
 };
-use spotlight_search::{Candidate, Searcher};
-use spotlight_store::Store;
+use spotlight_search::{Candidate, RootSearch, Row, Searcher};
+use spotlight_store::{Calculation, Store};
 
+use self::views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen};
 use crate::{
     smooth_scroll::SmoothScroll,
     text_input::{self, TextInput},
@@ -40,7 +50,21 @@ use crate::{
 
 actions!(
     launcher,
-    [SelectNext, SelectPrev, Confirm, Dismiss, Quit, OpenSettings]
+    [
+        SelectNext,
+        SelectPrev,
+        Confirm,
+        SecondaryAction,
+        ToggleActions,
+        FocusNextField,
+        FocusPrevField,
+        NextChoice,
+        PrevChoice,
+        ToggleChoice,
+        Dismiss,
+        Quit,
+        OpenSettings
+    ]
 );
 
 const CONTEXT: &str = "Launcher";
@@ -49,8 +73,18 @@ const ROW_HEIGHT: f32 = 44.;
 const LIST_PADDING: f32 = 4.;
 /// Row icon size in logical pixels.
 const ICON_SIZE: f32 = 26.;
+/// Icons are extracted at the grid's tile size, so tiles are sharp too.
+const ICON_EXTRACT_SIZE: f32 = 44.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+/// The apps provider's id; its catalog load time is the "apps" figure in the
+/// footer and the self-test summary.
+const APPS_PROVIDER: &str = "apps";
+/// How long a footer toast stays.
+const TOAST_DURATION: Duration = Duration::from_millis(2500);
+/// HUD size in logical pixels, and how long it stays.
+const HUD_SIZE: (f32, f32) = (240., 48.);
+const HUD_DURATION: Duration = Duration::from_millis(1500);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -59,27 +93,103 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
         KeyBinding::new("ctrl-p", SelectPrev, Some(CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+        KeyBinding::new("ctrl-enter", SecondaryAction, Some(CONTEXT)),
+        KeyBinding::new("ctrl-k", ToggleActions, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
+        KeyBinding::new("tab", FocusNextField, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPrevField, Some(CONTEXT)),
+        // Only on a focused checkbox or dropdown, so Space still types elsewhere.
+        KeyBinding::new("right", NextChoice, Some(CHOICE_CONTEXT)),
+        KeyBinding::new("left", PrevChoice, Some(CHOICE_CONTEXT)),
+        KeyBinding::new("space", ToggleChoice, Some(CHOICE_CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
         // Not handled here: it bubbles up to the app, which owns the settings window.
         KeyBinding::new("ctrl-,", OpenSettings, Some(CONTEXT)),
     ]);
 }
 
-enum Target {
-    App(AppEntry),
-    /// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
-    Synthetic,
+/// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
+struct Synthetic(usize);
+
+impl Provider for Synthetic {
+    fn id(&self) -> &'static str {
+        "synthetic"
+    }
+
+    fn catalog(&self) -> Vec<SearchItem> {
+        (0..self.0)
+            .map(|ix| {
+                SearchItem::new(
+                    item_id("synthetic", &ix.to_string()),
+                    format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]),
+                )
+                .subtitle("Synthetic")
+            })
+            .collect()
+    }
 }
 
-struct Item {
-    /// Frecency key; `None` for items that aren't tracked (synthetic rows).
-    id: Option<String>,
-    title: SharedString,
-    subtitle: SharedString,
-    /// `None` until extracted (or when there is none): a letter badge is drawn instead.
-    icon: Option<Arc<RenderImage>>,
-    target: Target,
+/// One line in the action panel: an action of the item, or one the launcher
+/// adds to every catalog item (ranking, alias, hotkey).
+#[derive(Clone)]
+struct Entry {
+    title: String,
+    kind: EntryKind,
+}
+
+#[derive(Clone)]
+enum EntryKind {
+    Command(Command),
+    ResetRanking,
+    EditAlias,
+    RemoveAlias,
+    RecordHotkey,
+    RemoveHotkey,
+    /// A calculator history entry, by its id in the store.
+    DeleteCalculation(i64),
+    ClearCalculations,
+}
+
+impl Entry {
+    fn needs_confirmation(&self) -> bool {
+        match &self.kind {
+            EntryKind::Command(command) => command.needs_confirmation(),
+            EntryKind::ClearCalculations => true,
+            _ => false,
+        }
+    }
+}
+
+/// The calculator's answer row; using it adds the calculation to the history.
+const CALC_ANSWER_ID: &str = "calc:answer";
+/// Item ids of history rows: this, then the calculation's id in the store.
+const HISTORY_ITEM: &str = "calc-history:";
+const SEARCH_PLACEHOLDER: &str = "Search apps and commands, or calculate…";
+
+/// An item with an alias or a hotkey, as the settings window lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shortcut {
+    pub item_id: String,
+    pub title: String,
+    pub alias: Option<String>,
+    pub hotkey: Option<Hotkey>,
+}
+
+/// A small card over the window for setting an item's alias or hotkey.
+enum Editor {
+    Alias {
+        item_id: String,
+        title: String,
+        input: Entity<TextInput>,
+    },
+    Hotkey {
+        item_id: String,
+        title: String,
+        /// Why the last combination wasn't taken.
+        message: Option<SharedString>,
+        /// Receives what the recorder hook sees.
+        _recording: Task<()>,
+    },
 }
 
 /// Measurements, shown in the footer and logged to stderr.
@@ -98,24 +208,57 @@ struct Stats {
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
-    items: Vec<Item>,
-    /// Indices into `items`, best match first.
-    results: Vec<usize>,
+    search: RootSearch,
+    /// Catalogs still loading.
+    loading: usize,
+    results: Vec<Row>,
     selected: usize,
+    /// The action panel (Ctrl+K) is open, with this action selected.
+    panel: Option<usize>,
+    /// Set by a first Enter on an action that asks for confirmation (restart,
+    /// shut down): that item's id and the action's index. Moving the selection
+    /// or typing clears it.
+    confirming: Option<(String, usize)>,
+    /// A short message in the footer, for actions that keep the window open.
+    toast: Option<SharedString>,
+    /// Bumped on every toast, so an older toast's timer doesn't clear a newer one.
+    toast_generation: usize,
+    /// While set, the (otherwise hidden) window is the HUD: a small message at
+    /// the bottom of the screen, shown without focus. A second window would
+    /// cost ~30 MB of GPU state for something on screen 1.5 s at a time.
+    hud: Option<SharedString>,
+    hud_generation: usize,
     scroll: SmoothScroll,
-    searcher: Searcher,
+    /// Extracted shell icons by item id. Items without one show a badge.
+    icons: HashMap<String, Arc<RenderImage>>,
     /// In-memory copy of the store's frecency table, updated on every launch.
     frecency: HashMap<String, Frecency>,
     /// `None` when the database couldn't be opened; usage is then not remembered.
     store: Option<Arc<Mutex<Store>>>,
+    /// Item id → the user's alias for it.
+    aliases: HashMap<String, String>,
+    /// Item id → its registered hotkey.
+    item_hotkeys: HashMap<String, Hotkey>,
+    hotkeys: hotkey::Service,
+    editor: Option<Editor>,
+    /// Views opened from root search, the top one showing; empty in root search.
+    screens: Vec<Screen>,
+    /// Holds the keyboard in views without a search field (details, forms).
+    focus: FocusHandle,
+    grid_scroll: UniformListScrollHandle,
+    /// Ranks the rows of a list opened from root search.
+    list_searcher: Searcher,
     visible: bool,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Launcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hotkey: SharedString,
+        hotkeys: hotkey::Service,
+        mut providers: Vec<Arc<dyn Provider>>,
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
         smooth_scrolling: bool,
@@ -128,7 +271,7 @@ impl Launcher {
         };
         win::round_corners(hwnd);
 
-        let input = cx.new(|cx| TextInput::new("Search apps…", cx));
+        let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,
@@ -142,15 +285,9 @@ impl Launcher {
             }),
         ];
 
-        let items = (0..synthetic)
-            .map(|ix| Item {
-                id: None,
-                title: format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]).into(),
-                subtitle: "Synthetic".into(),
-                icon: None,
-                target: Target::Synthetic,
-            })
-            .collect();
+        if synthetic > 0 {
+            providers.push(Arc::new(Synthetic(synthetic)));
+        }
 
         let frecency = store
             .as_ref()
@@ -162,22 +299,67 @@ impl Launcher {
                 })
             })
             .unwrap_or_default();
+        let (aliases, saved_hotkeys) = store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| {
+                let aliases = store.aliases().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read aliases: {err}");
+                    HashMap::new()
+                });
+                let hotkeys = store.item_hotkeys().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read item hotkeys: {err}");
+                    HashMap::new()
+                });
+                (aliases, hotkeys)
+            })
+            .unwrap_or_default();
+        // Registered now, so they work before the window is ever shown. One
+        // another app has taken since stays saved but inactive for this run.
+        let item_hotkeys = saved_hotkeys
+            .into_iter()
+            .filter_map(|(id, text)| {
+                let hotkey = Hotkey::parse(&text)?;
+                match hotkeys.set_item(&id, Some(hotkey)) {
+                    Ok(()) => Some((id, hotkey)),
+                    Err(err) => {
+                        eprintln!("[spotlight] hotkey {hotkey} for {id:?}: {err}");
+                        None
+                    }
+                }
+            })
+            .collect();
 
         let mut this = Self {
             hwnd,
             input,
-            items,
+            loading: providers.len(),
+            search: RootSearch::new(providers),
             results: Vec::new(),
             selected: 0,
+            panel: None,
+            confirming: None,
+            toast: None,
+            toast_generation: 0,
+            hud: None,
+            hud_generation: 0,
             scroll: {
                 let mut scroll =
                     SmoothScroll::new(UniformListScrollHandle::new(), ROW_HEIGHT, LIST_PADDING);
                 scroll.set_enabled(smooth_scrolling);
                 scroll
             },
-            searcher: Searcher::default(),
+            icons: HashMap::new(),
             frecency,
             store,
+            aliases,
+            item_hotkeys,
+            hotkeys,
+            editor: None,
+            screens: Vec::new(),
+            focus: cx.focus_handle(),
+            grid_scroll: UniformListScrollHandle::new(),
+            list_searcher: Searcher::default(),
             visible: false,
             stats: Stats {
                 hotkey,
@@ -186,70 +368,102 @@ impl Launcher {
             _subscriptions: subscriptions,
         };
         this.refilter("");
-        this.load_apps(window.scale_factor(), cx);
+        this.load_catalogs(window.scale_factor(), cx);
         this
     }
 
-    /// Discovers apps on a dedicated COM thread and prepends them to the items.
-    fn load_apps(&mut self, window_scale: f32, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded(1);
-        thread::spawn(move || {
-            let started = Instant::now();
-            let result = apps::discover();
-            let _ = tx.send_blocking((result, started.elapsed()));
-        });
+    /// Loads every provider's catalog on its own thread (app discovery takes
+    /// ~200 ms of COM calls) and merges each one into the search as it arrives.
+    fn load_catalogs(&mut self, window_scale: f32, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        for (ix, provider) in self.search.providers().iter().enumerate() {
+            let provider = provider.clone();
+            let tx = tx.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("catalog-{}", provider.id()))
+                .spawn(move || {
+                    let started = Instant::now();
+                    let items = provider.catalog();
+                    let _ = tx.send_blocking((ix, items, started.elapsed()));
+                });
+            if let Err(err) = spawned {
+                eprintln!("[spotlight] could not start a catalog thread: {err}");
+                self.loading -= 1;
+            }
+        }
 
         cx.spawn(async move |this, cx| {
-            let Ok((result, elapsed)) = rx.recv().await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(apps) => {
-                        this.stats.apps = apps.len();
-                        let items = apps.into_iter().map(|app| Item {
-                            id: Some(item_id("apps", &app.launch_id)),
-                            title: app.name.clone().into(),
-                            subtitle: "Application".into(),
-                            icon: None,
-                            target: Target::App(app),
-                        });
-                        this.items.splice(0..0, items);
-                        this.load_icons(window_scale, cx);
-                    }
-                    Err(err) => eprintln!("[spotlight] app discovery failed: {err}"),
+            while let Ok((ix, items, elapsed)) = rx.recv().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.catalog_loaded(ix, items, elapsed, window_scale, cx)
+                });
+                if updated.is_err() {
+                    return;
                 }
-                this.stats.discover_ms = Some(ms(elapsed));
-                eprintln!(
-                    "[spotlight] discovered {} apps in {:.1} ms",
-                    this.stats.apps,
-                    ms(elapsed)
-                );
-                let query = this.query(cx);
-                this.refilter(&query);
-                cx.notify();
-            })
-            .ok();
+            }
         })
         .detach();
     }
 
-    /// Extracts app icons in the background; rows switch from badges to icons as they arrive.
-    /// Apps are at the front of `items` right after discovery, so an app's index
-    /// in the request is also its index in `items`.
-    fn load_icons(&mut self, window_scale: f32, cx: &mut Context<Self>) {
-        let launch_ids: Vec<String> = self
-            .items
+    fn catalog_loaded(
+        &mut self,
+        provider: usize,
+        items: Vec<SearchItem>,
+        elapsed: Duration,
+        window_scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.search.providers()[provider].id();
+        eprintln!(
+            "[spotlight] {id}: {} items in {:.1} ms",
+            items.len(),
+            ms(elapsed)
+        );
+        if id == APPS_PROVIDER {
+            self.stats.apps = items.len();
+            self.stats.discover_ms = Some(ms(elapsed));
+        }
+        let shell_icons: Vec<(String, String)> = items
             .iter()
-            .map_while(|item| match &item.target {
-                Target::App(app) => Some(app.launch_id.clone()),
-                Target::Synthetic => None,
-            })
+            .filter_map(|item| Some((item.id.clone(), shell_name(&item.icon)?)))
             .collect();
+
+        self.search.set_catalog(provider, items);
+        self.loading = self.loading.saturating_sub(1);
+        // Catalog indices moved, so the rows are rebuilt (and the selection resets).
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.load_icons(shell_icons, window_scale, cx);
+        cx.notify();
+    }
+
+    /// Extracts shell icons in the background; rows switch from badges to icons
+    /// as they arrive. `items` holds (item id, shell parsing name) pairs; each
+    /// distinct icon is extracted once (every Settings page has the same one).
+    fn load_icons(
+        &mut self,
+        items: Vec<(String, String)>,
+        window_scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut ids: Vec<Vec<String>> = Vec::new();
+        for (id, name) in items {
+            match names.iter().position(|known| *known == name) {
+                Some(ix) => ids[ix].push(id),
+                None => {
+                    names.push(name);
+                    ids.push(vec![id]);
+                }
+            }
+        }
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
-        let size = (ICON_SIZE * window_scale).ceil() as u32;
+        let size = (ICON_EXTRACT_SIZE * window_scale).ceil() as u32;
         let (tx, rx) = async_channel::unbounded();
-        icons::spawn(launch_ids, size, tx);
+        icons::spawn(names, size, tx);
 
         cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
@@ -259,8 +473,10 @@ impl Launcher {
                     .collect();
                 let updated = this.update(cx, |this, cx| {
                     for (ix, icon) in batch {
-                        if let Some(item) = this.items.get_mut(ix) {
-                            item.icon = render_image(icon);
+                        if let Some(image) = render_image(icon) {
+                            for id in &ids[ix] {
+                                this.icons.insert(id.clone(), image.clone());
+                            }
                         }
                     }
                     cx.notify();
@@ -288,22 +504,107 @@ impl Launcher {
         self.input.read(cx).text().to_owned()
     }
 
-    /// Re-runs the fuzzy filter and resets the selection. Returns the filter time in ms.
+    /// Re-runs the search (root search, or the open list's) and resets the
+    /// selection. Returns the search time in ms.
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
-        let candidates = self.items.iter().map(|item| Candidate {
-            title: item.title.as_ref(),
-            frecency: item
-                .id
-                .as_ref()
-                .and_then(|id| self.frecency.get(id))
-                .map_or(0., |used| used.score_at(now)),
-        });
-        self.results = self.searcher.filter(query, candidates);
+        let Self {
+            screens,
+            list_searcher,
+            search,
+            frecency,
+            aliases,
+            ..
+        } = self;
+        self.results = match screens.last() {
+            None => search.search(
+                query,
+                |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
+                aliases,
+            ),
+            Some(Screen::List { view, .. }) => {
+                let candidates = view.items.iter().map(|item| Candidate {
+                    title: &item.title,
+                    keywords: &item.keywords,
+                    alias: None,
+                    frecency: 0.,
+                });
+                list_searcher
+                    .filter(query, candidates)
+                    .into_iter()
+                    .map(|ix| Row::Computed(view.items[ix].clone()))
+                    .collect()
+            }
+            Some(_) => Vec::new(),
+        };
         self.selected = 0;
+        self.panel = None;
+        self.confirming = None;
         self.scroll.reset();
         ms(started.elapsed())
+    }
+
+    /// The item's actions, then the ones the launcher adds to catalog items.
+    /// Computed rows (calculator, web) change with the query, so they can't
+    /// keep an alias, a hotkey or a ranking.
+    fn actions_for(&self, row: &Row) -> Vec<Entry> {
+        let item = self.item(row);
+        let mut entries: Vec<Entry> = item
+            .actions
+            .iter()
+            .map(|action| Entry {
+                title: action.title.clone(),
+                kind: EntryKind::Command(action.command.clone()),
+            })
+            .collect();
+        if let Some(id) = item
+            .id
+            .strip_prefix(HISTORY_ITEM)
+            .and_then(|id| id.parse().ok())
+        {
+            entries.push(Entry {
+                title: "Delete Entry".into(),
+                kind: EntryKind::DeleteCalculation(id),
+            });
+            entries.push(Entry {
+                title: "Clear History".into(),
+                kind: EntryKind::ClearCalculations,
+            });
+            return entries;
+        }
+        if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
+            return entries;
+        }
+        let mut add = |title: &str, kind| {
+            entries.push(Entry {
+                title: title.to_owned(),
+                kind,
+            })
+        };
+        if self.aliases.contains_key(&item.id) {
+            add("Change Alias…", EntryKind::EditAlias);
+            add("Remove Alias", EntryKind::RemoveAlias);
+        } else {
+            add("Set Alias…", EntryKind::EditAlias);
+        }
+        if self.item_hotkeys.contains_key(&item.id) {
+            add("Change Hotkey…", EntryKind::RecordHotkey);
+            add("Remove Hotkey", EntryKind::RemoveHotkey);
+        } else {
+            add("Set Hotkey…", EntryKind::RecordHotkey);
+        }
+        if self.frecency.contains_key(&item.id) {
+            add("Reset Ranking", EntryKind::ResetRanking);
+        }
+        entries
+    }
+
+    fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
+        match row {
+            Row::Catalog(ix) => &self.search.catalog()[*ix],
+            Row::Computed(item) => item,
+        }
     }
 
     fn query_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -317,21 +618,70 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
+    /// Types into the field that has the keyboard: the alias editor's while it's open.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| {
+        let input = match &self.editor {
+            Some(Editor::Alias { input, .. }) => input.clone(),
+            _ => self.input.clone(),
+        };
+        input.update(cx, |input, cx| {
             input.replace_text_in_range(None, text, window, cx)
         });
     }
 
+    /// The action selected in the open panel. For the self-test.
+    pub fn panel_selected(&self) -> Option<String> {
+        let selected = self.panel?;
+        self.selected_actions()
+            .into_iter()
+            .nth(selected)
+            .map(|entry| entry.title)
+    }
+
+    /// Whether the alias editor is open. For the self-test.
+    pub fn editing_alias(&self) -> bool {
+        matches!(self.editor, Some(Editor::Alias { .. }))
+    }
+
+    /// Item id → alias. For the self-test.
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+
+    /// Every catalog, apps included, has loaded.
     pub fn apps_loaded(&self) -> bool {
-        self.stats.discover_ms.is_some()
+        self.loading == 0
+    }
+
+    /// Action titles in the open action panel, or `None` when it's closed.
+    /// For the self-test.
+    pub fn panel_actions(&self) -> Option<Vec<String>> {
+        self.panel?;
+        Some(
+            self.selected_actions()
+                .into_iter()
+                .map(|action| action.title)
+                .collect(),
+        )
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Titles of the current results, top first. For the self-test.
+    pub fn result_titles(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .map(|row| self.item(row).title.clone())
+            .collect()
     }
 
     pub fn summary(&self) -> Summary {
         let paint = self.stats.paint.borrow();
         Summary {
             apps: self.stats.apps,
-            items: self.items.len(),
+            items: self.search.catalog().len(),
             discover_ms: self.stats.discover_ms,
             first_show_ms: paint.first_show_ms,
             show: Percentiles::of(&paint.show_samples),
@@ -350,6 +700,14 @@ impl Launcher {
     }
 
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        self.hud = None;
+        if !self.screens.is_empty() {
+            self.screens.clear();
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(SEARCH_PLACEHOLDER, cx);
+                input.set_pass_horizontal_arrows(false);
+            });
+        }
         self.input.update(cx, |input, cx| input.clear(cx));
         self.stats.filter_ms = Some(self.refilter(""));
         // Explicit size: with `show: false` GPUI defers its own placement to
@@ -379,38 +737,635 @@ impl Launcher {
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.close_editor(None, cx);
         win::hide(self.hwnd);
         self.visible = false;
         cx.notify();
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = self.panel {
+            let count = self.selected_actions().len();
+            self.panel = Some((action + 1).min(count.saturating_sub(1)));
+            cx.notify();
+            return;
+        }
+        if self.in_grid() {
+            return self.grid_move(GRID_COLUMNS as isize, cx);
+        }
+        if matches!(self.screens.last(), Some(Screen::Detail { .. })) {
+            return self.detail_scroll(true, cx);
+        }
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
+            self.confirming = None;
             self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = self.panel {
+            self.panel = Some(action.saturating_sub(1));
+            cx.notify();
+            return;
+        }
+        if self.in_grid() {
+            return self.grid_move(-(GRID_COLUMNS as isize), cx);
+        }
+        if matches!(self.screens.last(), Some(Screen::Detail { .. })) {
+            return self.detail_scroll(false, cx);
+        }
         if self.selected > 0 {
             self.selected -= 1;
+            self.confirming = None;
             self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
 
-    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&ix) = self.results.get(self.selected) {
-            let item = &self.items[ix];
-            if let Target::App(app) = &item.target {
-                app.launch();
+    /// The actions Enter, Ctrl+Enter and the panel offer: the selected row's,
+    /// or a detail view's own.
+    fn selected_actions(&self) -> Vec<Entry> {
+        if let Some(Screen::Detail { view, .. }) = self.screens.last() {
+            return view
+                .actions
+                .iter()
+                .map(|action| Entry {
+                    title: action.title.clone(),
+                    kind: EntryKind::Command(action.command.clone()),
+                })
+                .collect();
+        }
+        self.results
+            .get(self.selected)
+            .map(|row| self.actions_for(row))
+            .unwrap_or_default()
+    }
+
+    // ←/→ that the search field passes on in a grid.
+    fn grid_left(&mut self, _: &text_input::Left, _: &mut Window, cx: &mut Context<Self>) {
+        self.grid_move(-1, cx);
+    }
+
+    fn grid_right(&mut self, _: &text_input::Right, _: &mut Window, cx: &mut Context<Self>) {
+        self.grid_move(1, cx);
+    }
+
+    fn focus_next_field(
+        &mut self,
+        _: &FocusNextField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_field(true, window, cx);
+    }
+
+    fn focus_prev_field(
+        &mut self,
+        _: &FocusPrevField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_field(false, window, cx);
+    }
+
+    fn next_choice(&mut self, _: &NextChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(1, window, cx);
+    }
+
+    fn prev_choice(&mut self, _: &PrevChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(-1, window, cx);
+    }
+
+    fn toggle_choice(&mut self, _: &ToggleChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(1, window, cx);
+    }
+
+    /// Enter: saves the alias being edited, or runs the action picked in the
+    /// panel, the one waiting for a second Enter, or the primary action.
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.editor {
+            Some(Editor::Alias { .. }) => return self.save_alias(window, cx),
+            // The recorder hook takes every key; Enter can't arrive, but just in case.
+            Some(Editor::Hotkey { .. }) => return,
+            None => {}
+        }
+        match self.screens.last() {
+            Some(Screen::Form(_)) if self.panel.is_none() => return self.submit_form(window, cx),
+            Some(Screen::Detail { .. }) => {
+                let action = self.panel.unwrap_or(0);
+                return self.run_action(action, window, cx);
             }
-            if let Some(id) = item.id.clone() {
-                self.record_visit(id, cx);
+            _ => {}
+        }
+        let waiting = self
+            .confirming
+            .as_ref()
+            .filter(|(id, _)| {
+                self.results
+                    .get(self.selected)
+                    .is_some_and(|row| &self.item(row).id == id)
+            })
+            .map(|&(_, action)| action);
+        let action = self.panel.or(waiting).unwrap_or(0);
+        if self.selected_actions().is_empty() {
+            self.hide(cx);
+        } else {
+            self.run_action(action, window, cx);
+        }
+    }
+
+    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…).
+    fn secondary_action(
+        &mut self,
+        _: &SecondaryAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel.is_none() && self.editor.is_none() {
+            self.run_action(1, window, cx);
+        }
+    }
+
+    fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            return;
+        }
+        self.panel = match self.panel {
+            Some(_) => None,
+            None if !self.selected_actions().is_empty() => Some(0),
+            None => None,
+        };
+        self.confirming = None;
+        cx.notify();
+    }
+
+    /// Runs action `ix` of the selected item. Commands then hide the window;
+    /// the launcher's own entries (alias, hotkey, ranking) keep it open.
+    fn run_action(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A detail view's actions belong to the view, not to a row.
+        if let Some(Screen::Detail { view, .. }) = self.screens.last() {
+            let Some(action) = view.actions.get(ix).cloned() else {
+                return;
+            };
+            let key = (view.title.clone(), ix);
+            self.panel = None;
+            if action.command.needs_confirmation() && self.confirming.as_ref() != Some(&key) {
+                self.confirming = Some(key);
+                cx.notify();
+                return;
             }
+            self.confirming = None;
+            return self.perform(&action.command, window, cx);
+        }
+        let Some(row) = self.results.get(self.selected).cloned() else {
+            return;
+        };
+        let Some(entry) = self.actions_for(&row).into_iter().nth(ix) else {
+            return;
+        };
+        let item = self.item(&row);
+        let (id, title) = (item.id.clone(), item.title.clone());
+        self.panel = None;
+        if entry.needs_confirmation() && self.confirming.as_ref() != Some(&(id.clone(), ix)) {
+            self.confirming = Some((id, ix));
+            cx.notify();
+            return;
+        }
+        self.confirming = None;
+
+        let command = match entry.kind {
+            EntryKind::Command(command) => command,
+            EntryKind::ResetRanking => {
+                // The point is to see the item drop back.
+                self.reset_ranking(&id, cx);
+                self.show_toast(format!("Ranking reset for {title}").into(), cx);
+                return;
+            }
+            EntryKind::EditAlias => return self.open_alias_editor(id, title, window, cx),
+            EntryKind::RemoveAlias => {
+                self.set_alias(&id, None, cx);
+                self.show_toast(format!("Alias removed from {title}").into(), cx);
+                return;
+            }
+            EntryKind::RecordHotkey => return self.open_hotkey_editor(id, title, cx),
+            EntryKind::RemoveHotkey => {
+                if let Err(err) = self.hotkeys.set_item(&id, None) {
+                    eprintln!("[spotlight] could not remove the hotkey of {id:?}: {err}");
+                }
+                self.hotkey_assigned(&id, None, cx);
+                self.show_toast(format!("Hotkey removed from {title}").into(), cx);
+                return;
+            }
+            EntryKind::DeleteCalculation(calculation) => {
+                return self.delete_calculation(calculation, cx);
+            }
+            EntryKind::ClearCalculations => return self.clear_calculations(cx),
+        };
+        // Using an answer keeps it; using a history entry moves it to the top.
+        if id == CALC_ANSWER_ID {
+            let expression = self.query(cx).trim().to_owned();
+            self.remember_calculation(expression, title, cx);
+        } else if let Some((expression, answer)) = self.history_entry(&id) {
+            self.remember_calculation(expression, answer, cx);
+        }
+        // Only catalog items are ranked, so only their use is worth
+        // remembering, also when they're used from a list (Browse Apps).
+        let ranked = matches!(row, Row::Catalog(_))
+            || self.search.catalog().iter().any(|item| item.id == id);
+        if ranked {
+            self.record_visit(id, cx);
+        }
+        self.perform(&command, window, cx);
+    }
+
+    /// Opens a view, or carries out the command and hides the window.
+    fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::PushView(view) => self.push_view((**view).clone(), window, cx),
+            Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
+            command => self.run_command(command, cx),
+        }
+    }
+
+    /// Carries out `command`, hides the window, and shows a HUD where the
+    /// result would otherwise be invisible.
+    fn run_command(&mut self, command: &Command, cx: &mut Context<Self>) {
+        let mut hud: Option<SharedString> = None;
+        match command {
+            Command::Copy(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                hud = Some("Copied to Clipboard".into());
+            }
+            command => self.run_in_background(command.clone(), cx),
         }
         self.hide(cx);
+        if let Some(text) = hud {
+            self.show_hud(text, cx);
+        }
+    }
+
+    /// Runs a command in the background and shows what it reports
+    /// ("Bluetooth Off", "Volume 40%", or why it failed) in the HUD, unless
+    /// the launcher has been opened again meanwhile.
+    fn run_in_background(&mut self, command: Command, cx: &mut Context<Self>) {
+        let outcome = commands::spawn(command);
+        cx.spawn(async move |this, cx| {
+            let Ok(outcome) = outcome.recv().await else {
+                return;
+            };
+            let text = match outcome {
+                Ok(Some(text)) | Err(text) => text,
+                Ok(None) => return,
+            };
+            this.update(cx, |this, cx| {
+                if !this.visible {
+                    this.show_hud(text.into(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An item hotkey was pressed: runs that item's primary action without
+    /// showing the launcher. One that asks for confirmation (Shut Down) opens
+    /// the launcher on just that item instead, waiting for Enter.
+    pub fn run_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.search.catalog().iter().position(|item| item.id == id) else {
+            eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)");
+            return;
+        };
+        let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {
+            return;
+        };
+        if action.command.needs_confirmation() {
+            self.show(Instant::now(), window, cx);
+            self.results = vec![Row::Catalog(ix)];
+            self.confirming = Some((id.to_owned(), 0));
+            cx.notify();
+            return;
+        }
+        self.run_command(&action.command, cx);
+        self.record_visit(id.to_owned(), cx);
+    }
+
+    fn open_alias_editor(
+        &mut self,
+        item_id: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.aliases.get(&item_id).cloned().unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Short name, e.g. vs", cx);
+            input.set_text(current, cx);
+            input
+        });
+        window.focus(&input.focus_handle(cx));
+        self.editor = Some(Editor::Alias {
+            item_id,
+            title,
+            input,
+        });
+        cx.notify();
+    }
+
+    /// Saves the alias being edited (an empty one removes it) and closes the editor.
+    fn save_alias(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Editor::Alias {
+            item_id,
+            title,
+            input,
+        }) = &self.editor
+        else {
+            return;
+        };
+        let (item_id, title) = (item_id.clone(), title.clone());
+        let alias = input.read(cx).text().to_owned();
+        let message = match self.assign_alias(&item_id, &alias, cx) {
+            Some(alias) => format!("Type “{alias}” to find {title}"),
+            None => format!("Alias removed from {title}"),
+        };
+        self.close_editor(Some(window), cx);
+        self.show_toast(message.into(), cx);
+    }
+
+    /// Gives `item_id` the alias `alias` (trimmed; empty removes it) and saves
+    /// it. One alias, one item: whoever had it loses it. Returns the alias set.
+    pub fn assign_alias(
+        &mut self,
+        item_id: &str,
+        alias: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            self.set_alias(item_id, None, cx);
+            cx.notify();
+            return None;
+        }
+        let taken: Vec<String> = self
+            .aliases
+            .iter()
+            .filter(|(other, existing)| *other != item_id && existing.eq_ignore_ascii_case(alias))
+            .map(|(other, _)| other.clone())
+            .collect();
+        for other in taken {
+            self.set_alias(&other, None, cx);
+        }
+        self.set_alias(item_id, Some(alias.to_owned()), cx);
+        cx.notify();
+        Some(alias.to_owned())
+    }
+
+    /// Records that `item_id`'s hotkey is now `hotkey` (already registered, or
+    /// unregistered for `None`, with the hotkey service) and saves it.
+    pub fn hotkey_assigned(
+        &mut self,
+        item_id: &str,
+        hotkey: Option<Hotkey>,
+        cx: &mut Context<Self>,
+    ) {
+        match hotkey {
+            Some(hotkey) => self.item_hotkeys.insert(item_id.to_owned(), hotkey),
+            None => self.item_hotkeys.remove(item_id),
+        };
+        self.persist_hotkey(item_id, hotkey, cx);
+        cx.notify();
+    }
+
+    /// Every item that has an alias or a hotkey, by title. For the settings window.
+    pub fn shortcuts(&self) -> Vec<Shortcut> {
+        let mut ids: Vec<&String> = self
+            .aliases
+            .keys()
+            .chain(self.item_hotkeys.keys())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut shortcuts: Vec<Shortcut> = ids
+            .into_iter()
+            .map(|id| Shortcut {
+                item_id: id.clone(),
+                // Items that haven't loaded (or no longer exist) show their id.
+                title: self
+                    .search
+                    .catalog()
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map_or_else(|| id.clone(), |item| item.title.clone()),
+                alias: self.aliases.get(id).cloned(),
+                hotkey: self.item_hotkeys.get(id).copied(),
+            })
+            .collect();
+        shortcuts.sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
+        shortcuts
+    }
+
+    fn set_alias(&mut self, item_id: &str, alias: Option<String>, cx: &mut Context<Self>) {
+        match &alias {
+            Some(alias) => self.aliases.insert(item_id.to_owned(), alias.clone()),
+            None => self.aliases.remove(item_id),
+        };
+        let item_id = item_id.to_owned();
+        self.persist(cx, move |store| store.set_alias(&item_id, alias.as_deref()));
+    }
+
+    fn open_hotkey_editor(&mut self, item_id: String, title: String, cx: &mut Context<Self>) {
+        let recording = self.record_hotkey(cx);
+        self.editor = Some(Editor::Hotkey {
+            item_id,
+            title,
+            message: None,
+            _recording: recording,
+        });
+        cx.notify();
+    }
+
+    /// Starts the recorder hook and feeds what it sees to [`Self::recorded`].
+    /// While it runs no other app gets key presses, so it ends on Esc, on a
+    /// combination that's taken, and when the window hides.
+    fn record_hotkey(&self, cx: &mut Context<Self>) -> Task<()> {
+        let (tx, rx) = async_channel::unbounded();
+        self.hotkeys.record(tx);
+        cx.spawn(async move |this, cx| {
+            while let Ok(recorded) = rx.recv().await {
+                let keep = this.update(cx, |this, cx| this.recorded(recorded, cx));
+                if !keep.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// One key press from the recorder. Returns whether to keep recording.
+    fn recorded(&mut self, recorded: Recorded, cx: &mut Context<Self>) -> bool {
+        let Some(Editor::Hotkey {
+            item_id,
+            title,
+            message,
+            ..
+        }) = &mut self.editor
+        else {
+            return false;
+        };
+        let hotkey = match recorded {
+            Recorded::Cancel => {
+                self.close_editor(None, cx);
+                return false;
+            }
+            Recorded::NeedsModifier => {
+                *message = Some("Add Ctrl, Alt, Shift or Win to the key.".into());
+                cx.notify();
+                return true;
+            }
+            Recorded::Hotkey(hotkey) => hotkey,
+        };
+        let (item_id, title) = (item_id.clone(), title.clone());
+        // `set_item` ends recording, whatever the outcome.
+        match self.hotkeys.set_item(&item_id, Some(hotkey)) {
+            Ok(()) => {
+                self.hotkey_assigned(&item_id, Some(hotkey), cx);
+                self.editor = None;
+                self.show_toast(format!("{hotkey} now runs {title}").into(), cx);
+                false
+            }
+            Err(err) => {
+                let text = match err {
+                    SetError::InUse => format!("{hotkey} is already taken. Try another."),
+                    SetError::Other(err) => format!("Couldn't use {hotkey}: {err}"),
+                };
+                // Listen again for the next try; this task's loop ends.
+                let recording = self.record_hotkey(cx);
+                if let Some(Editor::Hotkey {
+                    message,
+                    _recording,
+                    ..
+                }) = &mut self.editor
+                {
+                    *message = Some(text.into());
+                    *_recording = recording;
+                }
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Closes the alias or hotkey editor, ending recording, and gives the
+    /// search field the keyboard again when there's a `window` to focus.
+    fn close_editor(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        match self.editor.take() {
+            Some(Editor::Hotkey { .. }) => self.hotkeys.resume(),
+            Some(Editor::Alias { .. }) => {}
+            None => return,
+        }
+        if let Some(window) = window {
+            window.focus(&self.input.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    fn persist_hotkey(&self, item_id: &str, hotkey: Option<Hotkey>, cx: &mut Context<Self>) {
+        let item_id = item_id.to_owned();
+        let text = hotkey.map(|hotkey| hotkey.to_string());
+        self.persist(cx, move |store| {
+            store.set_item_hotkey(&item_id, text.as_deref())
+        });
+    }
+
+    /// Runs a database write on a background thread; without a database the
+    /// change lasts for this run only.
+    fn persist(
+        &self,
+        cx: &mut Context<Self>,
+        write: impl FnOnce(&Store) -> spotlight_store::Result<()> + Send + 'static,
+    ) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|store| write(&store).map_err(|err| err.to_string()));
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save: {err}");
+                }
+            })
+            .detach();
+    }
+
+    /// Turns the hidden window into the HUD for a moment. Showing the launcher
+    /// (hotkey, tray) ends it early.
+    pub fn show_hud(&mut self, text: SharedString, cx: &mut Context<Self>) {
+        self.hud = Some(text);
+        self.hud_generation += 1;
+        let generation = self.hud_generation;
+        win::show_without_focus_near_bottom(self.hwnd, HUD_SIZE);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HUD_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.hud_generation == generation && this.hud.take().is_some() {
+                    win::hide(this.hwnd);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_ranking(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.frecency.remove(id);
+        let query = self.query(cx);
+        self.refilter(&query);
+        // Keep the same item selected where it now ranks.
+        if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
+            self.selected = row;
+            self.scroll.reveal(row, self.results.len());
+        }
+        cx.notify();
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = id.to_owned();
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|store| store.forget(&id).map_err(|err| err.to_string()));
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not reset the ranking of {id:?}: {err}");
+                }
+            })
+            .detach();
+    }
+
+    fn show_toast(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.toast = Some(message);
+        self.toast_generation += 1;
+        let generation = self.toast_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.toast_generation == generation {
+                    this.toast = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Updates frecency in memory right away and in the database on a background thread.
@@ -437,21 +1392,123 @@ impl Launcher {
             .detach();
     }
 
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        self.hide(cx);
+    /// Esc closes the alias editor or the action panel first, then goes back
+    /// from an opened list to root search, then hides the window.
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            self.close_editor(Some(window), cx);
+        } else if self.panel.take().is_some() {
+            cx.notify();
+        } else if !self.screens.is_empty() {
+            self.pop_screen(window, cx);
+        } else {
+            self.hide(cx);
+        }
+    }
+
+    fn open_calculator_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let calculations = self
+            .store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| {
+                store.calculations().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read the calculator history: {err}");
+                    Vec::new()
+                })
+            })
+            .unwrap_or_default();
+        let now = frecency::now();
+        let list = ListView {
+            title: "Calculator History".into(),
+            placeholder: Some("Search calculator history…".into()),
+            items: calculations
+                .iter()
+                .map(|calculation| history_item(calculation, now))
+                .collect(),
+            empty: Some("No calculations yet. Copy a calculator answer to keep it here.".into()),
+        };
+        self.push_view(View::List(list), window, cx);
+    }
+
+    /// The expression and answer behind a row of the history list.
+    fn history_entry(&self, item_id: &str) -> Option<(String, String)> {
+        if !item_id.starts_with(HISTORY_ITEM) {
+            return None;
+        }
+        let item = self.list_items()?.iter().find(|item| item.id == item_id)?;
+        match item.keywords.as_slice() {
+            [expression, answer] => Some((expression.clone(), answer.clone())),
+            _ => None,
+        }
+    }
+
+    /// Saves a calculation the user used to the history (on a background thread).
+    fn remember_calculation(&self, expression: String, answer: String, cx: &mut Context<Self>) {
+        if expression.is_empty() {
+            return;
+        }
+        let now = frecency::now();
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|mut store| {
+                        store
+                            .add_calculation(&expression, &answer, now)
+                            .map_err(|err| err.to_string())
+                    });
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save the calculation: {err}");
+                }
+            })
+            .detach();
+    }
+
+    fn delete_calculation(&mut self, id: i64, cx: &mut Context<Self>) {
+        let item_id = format!("{HISTORY_ITEM}{id}");
+        if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+            view.items.retain(|item| item.id != item_id);
+        }
+        self.persist(cx, move |store| store.delete_calculation(id));
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.show_toast("Entry deleted".into(), cx);
+    }
+
+    fn clear_calculations(&mut self, cx: &mut Context<Self>) {
+        if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+            view.items.clear();
+        }
+        self.persist(cx, |store| store.clear_calculations());
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.show_toast("Calculator history cleared".into(), cx);
+    }
+
+    /// The open view's title; `None` in root search.
+    pub fn screen_title(&self) -> Option<String> {
+        self.screens.last().map(|screen| screen.title().to_owned())
     }
 
     fn render_row(&self, row: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let item = &self.items[self.results[row]];
-        let initial: SharedString = item
-            .title
-            .chars()
-            .next()
-            .map(|ch| ch.to_uppercase().collect::<String>())
-            .unwrap_or_default()
-            .into();
-
+        let item = self.item(&self.results[row]);
         let selected = row == self.selected;
+        let confirming = selected
+            && self
+                .confirming
+                .as_ref()
+                .is_some_and(|(id, _)| id == &item.id);
+        let subtitle: SharedString = if confirming {
+            "Press Enter again to confirm".into()
+        } else {
+            item.subtitle.clone().unwrap_or_default().into()
+        };
+
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
         div().id(row).w_full().h(px(ROW_HEIGHT)).px_2().child(
@@ -468,35 +1525,270 @@ impl Launcher {
                     row.hover(|style| style.bg(rgba(0xffffff0f)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.selected = row;
+                    if this.selected != row {
+                        this.selected = row;
+                        this.confirming = None;
+                    }
+                    this.panel = None;
                     this.confirm(&Confirm, window, cx);
                 }))
-                .child(match &item.icon {
-                    Some(icon) => img(icon.clone())
-                        .size(px(ICON_SIZE))
-                        .flex_none()
-                        .into_any_element(),
-                    None => div()
-                        .size(px(ICON_SIZE))
-                        .flex_none()
-                        .rounded(px(6.))
-                        .bg(badge_color(&item.title))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.))
-                        .child(initial)
-                        .into_any_element(),
+                .child(self.render_icon(item))
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(SharedString::from(item.title.clone())),
+                )
+                .when_some(self.aliases.get(&item.id), |row, alias| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px(px(6.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(rgba(theme::SURFACE_BORDER))
+                            .text_size(px(11.))
+                            .text_color(rgba(theme::TEXT_MUTED))
+                            .child(SharedString::from(alias.clone())),
+                    )
                 })
-                .child(div().flex_1().truncate().child(item.title.clone()))
+                .when_some(self.item_hotkeys.get(&item.id), |row, hotkey| {
+                    row.child(keycaps(&hotkey_keys(*hotkey)))
+                })
                 .child(
                     div()
                         .flex_none()
                         .text_size(px(12.))
-                        .text_color(rgba(0xffffff70))
-                        .child(item.subtitle.clone()),
+                        .text_color(if confirming {
+                            rgba(theme::ERROR)
+                        } else {
+                            rgba(0xffffff70)
+                        })
+                        .child(subtitle),
                 ),
         )
+    }
+
+    fn render_icon(&self, item: &SearchItem) -> AnyElement {
+        self.render_icon_sized(item, ICON_SIZE)
+    }
+
+    /// The item's icon, glyph or letter badge, `size` logical pixels square.
+    fn render_icon_sized(&self, item: &SearchItem, size: f32) -> AnyElement {
+        if let Some(icon) = self.icons.get(&item.id) {
+            return img(icon.clone())
+                .size(px(size))
+                .flex_none()
+                .into_any_element();
+        }
+        let scale = size / ICON_SIZE;
+        let badge = div()
+            .size(px(size))
+            .flex_none()
+            .rounded(px(6. * scale))
+            .flex()
+            .items_center()
+            .justify_center();
+        match item.icon {
+            Icon::Glyph(glyph) => badge
+                .bg(rgba(0xffffff1a))
+                .font_family(icon_font())
+                .text_size(px(15. * scale))
+                .child(SharedString::from(glyph.to_string()))
+                .into_any_element(),
+            // Plain items, and apps whose icon hasn't arrived or doesn't exist.
+            Icon::App(_) | Icon::Shell(_) | Icon::None => {
+                let initial: SharedString = item
+                    .title
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_uppercase().collect::<String>())
+                    .unwrap_or_default()
+                    .into();
+                badge
+                    .bg(badge_color(&item.title))
+                    .text_size(px(13. * scale))
+                    .child(initial)
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// The Ctrl+K panel: the selected item's actions, above the footer's right end.
+    fn render_panel(&self, selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .results
+            .get(self.selected)
+            .map(|row| SharedString::from(self.item(row).title.clone()))
+            .unwrap_or_default();
+        let rows = self
+            .selected_actions()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, action)| {
+                let shortcut = match ix {
+                    0 => Some("Enter"),
+                    1 => Some("Ctrl Enter"),
+                    _ => None,
+                };
+                div()
+                    .id(ix)
+                    .h(px(32.))
+                    .px_2()
+                    .mx_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .when(ix == selected, |row| row.bg(rgba(0xffffff1f)))
+                    .when(ix != selected, |row| {
+                        row.hover(|style| style.bg(rgba(0xffffff0f)))
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(action.title)),
+                    )
+                    .children(shortcut.map(keycaps))
+            });
+        div()
+            .absolute()
+            .right(px(10.))
+            .bottom(px(38.))
+            .w(px(300.))
+            .py_1()
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgba(theme::SURFACE_BORDER))
+            .bg(rgba(theme::PANEL))
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .truncate()
+                    .child(title),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// The alias or hotkey editor: a card above the footer.
+    fn render_editor(&self, editor: &Editor) -> AnyElement {
+        let (heading, body, note, hint): (String, AnyElement, Option<SharedString>, &str) =
+            match editor {
+                Editor::Alias { title, input, .. } => (
+                    format!("Alias for {title}"),
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(rgba(theme::ACCENT))
+                        .bg(rgba(theme::SURFACE))
+                        .child(input.clone())
+                        .into_any_element(),
+                    None,
+                    "Enter saves (empty removes it) · Esc cancels",
+                ),
+                Editor::Hotkey { title, message, .. } => (
+                    format!("Hotkey for {title}"),
+                    div()
+                        .py_1()
+                        .text_size(px(15.))
+                        .child("Press a key combination…")
+                        .into_any_element(),
+                    message.clone(),
+                    "It works everywhere, even with the launcher closed · Esc cancels",
+                ),
+            };
+        div()
+            .absolute()
+            .left(px(10.))
+            .right(px(10.))
+            .bottom(px(38.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgba(theme::SURFACE_BORDER))
+            .bg(rgba(theme::PANEL))
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .truncate()
+                    .child(SharedString::from(heading)),
+            )
+            .child(body)
+            .when_some(note, |card, note| {
+                card.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgba(theme::ERROR))
+                        .child(note),
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_FAINT))
+                    .child(hint),
+            )
+            .into_any_element()
+    }
+
+    /// Right side of the footer: what Enter does, and how to see the rest.
+    fn footer_hints(&self) -> impl IntoElement {
+        let primary = match self.screens.last() {
+            Some(Screen::Form(form)) => Some(SharedString::from(form.view.submit_title.clone())),
+            _ => self
+                .selected_actions()
+                .into_iter()
+                .next()
+                .map(|action| SharedString::from(action.title)),
+        };
+        let has_actions = !self.selected_actions().is_empty();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .when_some(primary, |hints, primary| {
+                hints
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_color(rgba(theme::TEXT)).child(primary))
+                            .child(keycaps("Enter")),
+                    )
+                    .when(has_actions, |hints| {
+                        hints.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child("Actions")
+                                .child(keycaps("Ctrl K")),
+                        )
+                    })
+            })
     }
 
     /// Paint-probe values here lag one frame (they are recorded while painting).
@@ -508,7 +1800,7 @@ impl Launcher {
             "{hotkey} · {results}/{items} items · apps {discover} ms · hotkey→paint first {first} / last {last} ms · filter {filter} ms · key→paint {key} ms · RAM ws {ws:.0} MB / private {private:.0} MB",
             hotkey = self.stats.hotkey,
             results = self.results.len(),
-            items = self.items.len(),
+            items = self.search.catalog().len(),
             discover = fmt(self.stats.discover_ms),
             first = fmt(paint.first_show_ms),
             last = fmt(paint.last_show_ms),
@@ -522,18 +1814,48 @@ impl Launcher {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(text) = &self.hud {
+            // An explicit size from the top left, not `size_full`: GPUI can
+            // still think the window has the launcher's size when the HUD's
+            // first frame is laid out, which would centre the text off screen.
+            let (width, height) = HUD_SIZE;
+            return div()
+                .w(px(width))
+                .h(px(height))
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_4()
+                .bg(rgba(theme::HUD_TINT))
+                .border_1()
+                .border_color(rgba(theme::SURFACE_BORDER))
+                .rounded(px(8.))
+                .text_color(rgba(theme::TEXT))
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_center()
+                .child(div().truncate().child(text.clone()))
+                .into_any_element();
+        }
         if self.scroll.tick() {
             window.request_animation_frame();
         }
 
-        let results: gpui::AnyElement = if self.results.is_empty() {
+        let results: AnyElement = if let Some(body) = self.render_screen_body(window, cx) {
+            body
+        } else if self.results.is_empty() {
             div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_color(rgba(0xffffff60))
-                .child("No results")
+                .child(match self.screens.last() {
+                    Some(Screen::List { view, .. }) if view.items.is_empty() => {
+                        SharedString::from(view.empty.clone().unwrap_or("Nothing here".into()))
+                    }
+                    _ => "No results".into(),
+                })
                 .into_any_element()
         } else {
             let list = uniform_list(
@@ -599,7 +1921,17 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_action))
+            .on_action(cx.listener(Self::toggle_actions))
+            .on_action(cx.listener(Self::grid_left))
+            .on_action(cx.listener(Self::grid_right))
+            .on_action(cx.listener(Self::focus_next_field))
+            .on_action(cx.listener(Self::focus_prev_field))
+            .on_action(cx.listener(Self::next_choice))
+            .on_action(cx.listener(Self::prev_choice))
+            .on_action(cx.listener(Self::toggle_choice))
             .on_action(cx.listener(Self::dismiss))
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
@@ -610,34 +1942,174 @@ impl Render for Launcher {
                 div()
                     .px_4()
                     .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_size(px(20.))
                     .line_height(px(28.))
-                    .child(self.input.clone()),
+                    .map(|row| match self.screens.last() {
+                        // Views without a search field show their title there.
+                        Some(screen) if !screen.has_search() => row
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(screen.title().to_owned())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(px(11.))
+                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .child(keycaps("Esc"))
+                                    .child("back"),
+                            ),
+                        screen => row
+                            .when_some(screen, |row, screen| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .px_2()
+                                        .rounded(px(5.))
+                                        .bg(rgba(theme::SURFACE_HOVER))
+                                        .text_size(px(12.))
+                                        .line_height(px(22.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .child(SharedString::from(screen.title().to_owned())),
+                                )
+                            })
+                            .child(div().flex_1().min_w_0().child(self.input.clone())),
+                    }),
             )
             .child(div().h(px(1.)).bg(rgba(0xffffff14)))
             .child(results)
             .child(
                 div()
+                    .h(px(30.))
                     .px_4()
-                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_4()
                     .bg(rgba(0x00000033))
                     .text_size(px(11.))
                     .text_color(rgba(0xffffff80))
-                    .truncate()
-                    .child(self.footer()),
+                    .child(match &self.toast {
+                        Some(toast) => div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgba(theme::SUCCESS))
+                            .child(toast.clone()),
+                        None => div().flex_1().min_w_0().truncate().child(self.footer()),
+                    })
+                    .child(self.footer_hints()),
             )
+            .when_some(self.panel, |root, selected| {
+                root.child(self.render_panel(selected, cx))
+            })
+            .when_some(self.editor.as_ref(), |root, editor| {
+                root.child(self.render_editor(editor))
+            })
             // Last child, so it paints after everything else in the frame.
             .child(
                 canvas(|_, _, _| {}, move |_, _, _, _| paint.borrow_mut().painted())
                     .absolute()
                     .size_full(),
             )
+            .into_any_element()
     }
+}
+
+/// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
+/// contain `+` (the plus key displays as `=`, the same key).
+fn hotkey_keys(hotkey: Hotkey) -> String {
+    hotkey.to_string().replace('+', " ")
+}
+
+/// A row of the calculator history: `expression = answer`, found by either.
+fn history_item(calculation: &Calculation, now: i64) -> SearchItem {
+    let Calculation {
+        id,
+        expression,
+        answer,
+        used_at,
+    } = calculation;
+    let mut item = SearchItem::new(
+        format!("{HISTORY_ITEM}{id}"),
+        format!("{expression} = {answer}"),
+    )
+    .subtitle(days_ago(*used_at, now))
+    // The calculator glyph, as on the calculator's own rows.
+    .icon(Icon::Glyph('\u{E8EF}'))
+    .action("Copy Answer", Command::Copy(answer.clone()))
+    .action(
+        "Copy Calculation",
+        Command::Copy(format!("{expression} = {answer}")),
+    );
+    item.keywords = vec![expression.clone(), answer.clone()];
+    item
+}
+
+/// "Today", "Yesterday", "5 days ago", by calendar days in UTC.
+fn days_ago(then: i64, now: i64) -> String {
+    const DAY: i64 = 24 * 3600;
+    match now.div_euclid(DAY) - then.div_euclid(DAY) {
+        ..=0 => "Today".into(),
+        1 => "Yesterday".into(),
+        days => format!("{days} days ago"),
+    }
+}
+
+/// Key caps for a shortcut such as `"Ctrl K"`, one per key.
+fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
+    let keys: Vec<SharedString> = shortcut
+        .split(' ')
+        .map(|key| SharedString::from(key.to_owned()))
+        .collect();
+    div()
+        .flex()
+        .gap(px(3.))
+        .children(keys.into_iter().map(|key| {
+            div()
+                .px(px(5.))
+                .rounded(px(4.))
+                .bg(rgba(theme::SURFACE_HOVER))
+                .text_size(px(10.))
+                .text_color(rgba(theme::TEXT_MUTED))
+                .child(key)
+        }))
+}
+
+/// What to extract the icon from, for icons that come from the shell.
+fn shell_name(icon: &Icon) -> Option<String> {
+    match icon {
+        Icon::App(launch_id) => Some(format!("shell:AppsFolder\\{launch_id}")),
+        Icon::Shell(name) => Some(name.clone()),
+        Icon::Glyph(_) | Icon::None => None,
+    }
+}
+
+/// Windows 11's icon font, or its Windows 10 predecessor (same code points).
+fn icon_font() -> &'static str {
+    static FONT: OnceLock<&'static str> = OnceLock::new();
+    FONT.get_or_init(|| {
+        let windows =
+            env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        if windows.join(r"Fonts\SegoeIcons.ttf").exists() {
+            "Segoe Fluent Icons"
+        } else {
+            "Segoe MDL2 Assets"
+        }
+    })
 }
 
 /// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
 /// `RgbaImage` type is only the buffer container here.
-fn render_image(icon: Icon) -> Option<Arc<RenderImage>> {
+fn render_image(icon: icons::Icon) -> Option<Arc<RenderImage>> {
     let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }
@@ -662,3 +2134,43 @@ const FILLER: &[&str] = &[
     "image viewer",
     "journal",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn says_how_long_ago() {
+        const DAY: i64 = 24 * 3600;
+        let now = 100 * DAY + 3600;
+        assert_eq!(days_ago(now - 60, now), "Today");
+        assert_eq!(days_ago(now - DAY, now), "Yesterday");
+        assert_eq!(days_ago(now - 5 * DAY, now), "5 days ago");
+        assert_eq!(days_ago(now + 60, now), "Today");
+    }
+
+    #[test]
+    fn history_rows_are_found_by_expression_or_answer() {
+        let item = history_item(
+            &Calculation {
+                id: 7,
+                expression: "100 usd to eur".into(),
+                answer: "92.10 EUR".into(),
+                used_at: 0,
+            },
+            0,
+        );
+        assert_eq!(item.id, "calc-history:7");
+        assert_eq!(item.title, "100 usd to eur = 92.10 EUR");
+        assert_eq!(item.keywords, ["100 usd to eur", "92.10 EUR"]);
+        assert_eq!(item.actions[0].command, Command::Copy("92.10 EUR".into()));
+    }
+
+    #[test]
+    fn hotkeys_split_into_key_caps() {
+        let caps = |text| hotkey_keys(Hotkey::parse(text).unwrap());
+        assert_eq!(caps("Ctrl+Alt+K"), "Ctrl Alt K");
+        assert_eq!(caps("Win+F12"), "Win F12");
+        assert_eq!(caps("Ctrl++"), "Ctrl =");
+    }
+}

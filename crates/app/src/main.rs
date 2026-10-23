@@ -19,7 +19,7 @@ mod tray;
 use std::{
     cell::{Cell, RefCell},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -29,15 +29,17 @@ use gpui::{
     App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions, prelude::*, px, size,
 };
+use spotlight_core::web::SearchEngine;
 use spotlight_platform_win::{
     hotkey::{self, Hotkey},
     instance::{self, Instance},
     metrics, win,
 };
+use spotlight_providers::web::Web;
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
-    settings::{self, Settings, SettingsEvent},
+    settings::{self, Settings, SettingsEvent, ShortcutSource},
     text_input,
 };
 
@@ -47,6 +49,8 @@ use crate::tray::{Command, Tray};
 const HOTKEY_SETTING: &str = "hotkey";
 /// `settings` key: `"true"` or `"false"`; missing means on.
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
+/// `settings` key: `SearchEngine`'s setting form; missing means Google.
+const SEARCH_ENGINE_SETTING: &str = "search_engine";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
@@ -54,6 +58,9 @@ struct AppState {
     hotkeys: hotkey::Service,
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
+    search_engine: RefCell<SearchEngine>,
+    /// The web provider, to switch its search engine.
+    web: Arc<Web>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -95,7 +102,8 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0usize);
     let show_on_start = env::var_os("SPOTLIGHT_SHOW_ON_START").is_some();
-    let (store, data_path) = open_store();
+    let data_dir = data_dir();
+    let (store, data_path) = open_store(data_dir.as_deref());
     let store = store.map(|store| Arc::new(Mutex::new(store)));
 
     let setting = |key: &str| {
@@ -104,6 +112,15 @@ fn main() {
             .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
+    let search_engine = setting(SEARCH_ENGINE_SETTING)
+        .and_then(|text| {
+            let engine = SearchEngine::from_setting(&text);
+            if engine.is_none() {
+                eprintln!("[spotlight] ignoring unknown search engine {text:?}");
+            }
+            engine
+        })
+        .unwrap_or_default();
     let saved_hotkey = setting(HOTKEY_SETTING).and_then(|text| {
         let hotkey = Hotkey::parse(&text);
         if hotkey.is_none() {
@@ -112,8 +129,9 @@ fn main() {
         hotkey
     });
     let (presses_tx, presses_rx) = async_channel::unbounded::<Instant>();
-    let (hotkeys, registered) =
-        hotkey::spawn(saved_hotkey, presses_tx.clone()).expect("failed to start the hotkey thread");
+    let (item_presses_tx, item_presses_rx) = async_channel::unbounded::<String>();
+    let (hotkeys, registered) = hotkey::spawn(saved_hotkey, presses_tx.clone(), item_presses_tx)
+        .expect("failed to start the hotkey thread");
     let hotkey = match registered {
         Ok(hotkey) => {
             if saved_hotkey.is_some_and(|saved| saved != hotkey) {
@@ -138,7 +156,9 @@ fn main() {
         let (width, height) = launcher::WINDOW_SIZE;
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let launcher_store = store.clone();
+        let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
+        let (providers, web) = spotlight_providers::all(search_engine.clone(), data_dir.clone());
         let window = cx
             .open_window(
                 WindowOptions {
@@ -159,6 +179,8 @@ fn main() {
                     cx.new(|cx| {
                         Launcher::new(
                             label,
+                            launcher_hotkeys,
+                            providers,
                             synthetic,
                             launcher_store,
                             smooth_scrolling,
@@ -181,6 +203,18 @@ fn main() {
         })
         .detach();
 
+        // Item hotkeys run their item's primary action.
+        cx.spawn(async move |cx| {
+            while let Ok(item_id) = item_presses_rx.recv().await {
+                window
+                    .update(cx, |launcher, window, cx| {
+                        launcher.run_by_id(&item_id, window, cx)
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+
         let (commands_tx, commands_rx) = async_channel::unbounded();
         let tray = Tray::create(&hotkey_label, commands_tx)
             .inspect_err(|err| eprintln!("[spotlight] could not create the tray icon: {err}"))
@@ -190,6 +224,8 @@ fn main() {
             hotkeys: hotkeys.clone(),
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
+            search_engine: RefCell::new(search_engine.clone()),
+            web,
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -310,7 +346,9 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkeys.clone(),
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
+                view_state.search_engine.borrow().clone(),
                 view_state.data_path.clone(),
+                shortcut_source(view_state.launcher),
                 window,
                 cx,
             )
@@ -343,6 +381,11 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             }
             save_setting(state, HOTKEY_SETTING, hotkey.to_string(), cx);
         }
+        SettingsEvent::SearchEngineChanged(engine) => {
+            state.web.set_engine(engine.clone());
+            *state.search_engine.borrow_mut() = engine.clone();
+            save_setting(state, SEARCH_ENGINE_SETTING, engine.to_setting(), cx);
+        }
         SettingsEvent::SmoothScrollingChanged(enabled) => {
             state.smooth_scrolling.set(*enabled);
             state
@@ -358,7 +401,34 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 tray.sync_autostart();
             }
         }
+        // The launcher owns aliases and item hotkeys and saves them.
+        SettingsEvent::AliasChanged { item_id, alias } => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.assign_alias(item_id, alias.as_deref().unwrap_or_default(), cx);
+                })
+                .ok();
+        }
+        SettingsEvent::ItemHotkeyChanged { item_id, hotkey } => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.hotkey_assigned(item_id, *hotkey, cx)
+                })
+                .ok();
+        }
     }
+}
+
+/// How the settings window reads the launcher's aliases and item hotkeys.
+fn shortcut_source(launcher: WindowHandle<Launcher>) -> ShortcutSource {
+    Rc::new(move |cx: &App| {
+        launcher
+            .read(cx)
+            .map(|launcher| launcher.shortcuts())
+            .unwrap_or_default()
+    })
 }
 
 /// Writes a setting on a background thread; without a database it is kept
@@ -388,14 +458,18 @@ fn hotkey_label(hotkey: Option<Hotkey>) -> SharedString {
     hotkey.map_or("no hotkey".into(), |hotkey| hotkey.to_string().into())
 }
 
-/// `%APPDATA%\spotlight\spotlight.db`, or `SPOTLIGHT_DATA_DIR`. Without a
-/// database the launcher still works; it just doesn't remember usage or settings.
-/// Also returns the path for display.
-fn open_store() -> (Option<Store>, SharedString) {
-    let Some(dir) = env::var_os("SPOTLIGHT_DATA_DIR")
+/// `%APPDATA%\spotlight`, or `SPOTLIGHT_DATA_DIR`: the database and caches.
+fn data_dir() -> Option<PathBuf> {
+    env::var_os("SPOTLIGHT_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("spotlight")))
-    else {
+}
+
+/// `spotlight.db` in the data folder ([`data_dir`]). Without a database the
+/// launcher still works; it just doesn't remember usage or settings.
+/// Also returns the path for display.
+fn open_store(dir: Option<&Path>) -> (Option<Store>, SharedString) {
+    let Some(dir) = dir else {
         return (None, "unavailable (APPDATA is not set)".into());
     };
     let path = dir.join("spotlight.db");

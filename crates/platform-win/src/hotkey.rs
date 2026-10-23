@@ -1,4 +1,5 @@
-//! System-wide hotkey via `RegisterHotKey` on a dedicated message-loop thread.
+//! System-wide hotkeys via `RegisterHotKey` on a dedicated message-loop thread:
+//! the launcher's own, plus any number of item hotkeys that run one command.
 //!
 //! Registering against no window makes Windows post `WM_HOTKEY` to the
 //! registering thread's queue, so the hotkey doesn't depend on how the UI
@@ -7,7 +8,7 @@
 //! thread that registered it, and a low-level hook runs on the thread that
 //! installed it.
 
-use std::{cell::RefCell, fmt, sync::mpsc, thread, time::Instant};
+use std::{cell::RefCell, collections::HashMap, fmt, sync::mpsc, thread, time::Instant};
 
 use windows::Win32::{
     Foundation::{ERROR_HOTKEY_ALREADY_REGISTERED, GetLastError, LPARAM, LRESULT, WPARAM},
@@ -153,6 +154,7 @@ pub enum Recorded {
 
 enum Request {
     Set(Hotkey, mpsc::Sender<Result<(), SetError>>),
+    SetItem(String, Option<Hotkey>, mpsc::Sender<Result<(), SetError>>),
     Record(async_channel::Sender<Recorded>),
     Resume,
 }
@@ -171,6 +173,17 @@ impl Service {
     pub fn set(&self, hotkey: Hotkey) -> Result<(), SetError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(Request::Set(hotkey, reply_tx));
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| Err(SetError::Other("the hotkey thread has stopped".into())))
+    }
+
+    /// Gives the item `item_id` the hotkey `hotkey`, or takes its hotkey away
+    /// (`None`), and ends recording. On failure the item keeps its previous
+    /// hotkey. The launcher's own hotkey counts as taken.
+    pub fn set_item(&self, item_id: &str, hotkey: Option<Hotkey>) -> Result<(), SetError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send(Request::SetItem(item_id.to_owned(), hotkey, reply_tx));
         reply_rx
             .recv()
             .unwrap_or_else(|_| Err(SetError::Other("the hotkey thread has stopped".into())))
@@ -210,8 +223,10 @@ impl Service {
 
 const WM_REQUEST: u32 = WM_APP + 1;
 
-/// Starts the hotkey thread. Each press sends the instant `WM_HOTKEY` was
-/// dequeued, which is the start point for the hotkey-to-visible measurement.
+/// Starts the hotkey thread. Each press of the launcher hotkey sends the
+/// instant `WM_HOTKEY` was dequeued (the start point for the hotkey-to-visible
+/// measurement) on `presses`; each press of an item hotkey sends that item's
+/// id on `item_presses`.
 ///
 /// Tries `preferred` first, then [`Hotkey::DEFAULTS`]. Returns the service and
 /// the hotkey that got registered, or an error naming what was tried (usually
@@ -219,6 +234,7 @@ const WM_REQUEST: u32 = WM_APP + 1;
 pub fn spawn(
     preferred: Option<Hotkey>,
     presses: async_channel::Sender<Instant>,
+    item_presses: async_channel::Sender<String>,
 ) -> Result<(Service, Result<Hotkey, String>), String> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (requests_tx, requests_rx) = mpsc::channel::<Request>();
@@ -245,7 +261,16 @@ pub fn spawn(
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 match msg.message {
                     WM_HOTKEY => {
-                        if presses.send_blocking(Instant::now()).is_err() {
+                        let pressed_at = Instant::now();
+                        let id = msg.wParam.0 as i32;
+                        let sent = if id <= LAUNCHER_IDS {
+                            presses.send_blocking(pressed_at).is_ok()
+                        } else if let Some(item) = registrar.item_for(id) {
+                            item_presses.send_blocking(item.to_owned()).is_ok()
+                        } else {
+                            true
+                        };
+                        if !sent {
                             break;
                         }
                     }
@@ -273,6 +298,9 @@ pub fn spawn(
     ))
 }
 
+/// The launcher hotkey alternates between ids 1 and 2; item hotkeys get ids above.
+const LAUNCHER_IDS: i32 = 2;
+
 /// State owned by the hotkey thread.
 #[derive(Default)]
 struct Registrar {
@@ -281,6 +309,10 @@ struct Registrar {
     id: i32,
     /// While recording the hotkey is unregistered and this hook is installed.
     hook: Option<HHOOK>,
+    /// Item id → (hotkey id, hotkey).
+    items: HashMap<String, (i32, Hotkey)>,
+    /// Last hotkey id handed to an item.
+    last_item_id: i32,
 }
 
 thread_local! {
@@ -320,6 +352,11 @@ impl Registrar {
                 self.resume();
                 let _ = reply.send(result);
             }
+            Request::SetItem(item, hotkey, reply) => {
+                let result = self.set_item(item, hotkey);
+                self.resume();
+                let _ = reply.send(result);
+            }
             Request::Record(recorded) => {
                 RECORDER.with(|recorder| *recorder.borrow_mut() = Some(recorded));
                 if self.hook.is_none() {
@@ -338,6 +375,49 @@ impl Registrar {
             }
             Request::Resume => self.resume(),
         }
+    }
+
+    fn item_for(&self, id: i32) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|(_, (item_id, _))| *item_id == id)
+            .map(|(item, _)| item.as_str())
+    }
+
+    fn set_item(&mut self, item: String, hotkey: Option<Hotkey>) -> Result<(), SetError> {
+        let previous = self.items.get(&item).copied();
+        let Some(hotkey) = hotkey else {
+            if let Some((id, _)) = self.items.remove(&item) {
+                unsafe {
+                    let _ = UnregisterHotKey(None, id);
+                }
+            }
+            return Ok(());
+        };
+        if previous.is_some_and(|(_, old)| old == hotkey) {
+            return Ok(());
+        }
+        // While recording the launcher hotkey isn't registered, so Windows
+        // wouldn't object to taking it; it would then be lost on resume.
+        if self.current == Some(hotkey) {
+            return Err(SetError::InUse);
+        }
+        let id = self.last_item_id.max(LAUNCHER_IDS) + 1;
+        unsafe {
+            if RegisterHotKey(None, id, hotkey.modifiers(), hotkey.vk as u32).is_err() {
+                return Err(if GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED {
+                    SetError::InUse
+                } else {
+                    SetError::Other(windows::core::Error::from_win32().message())
+                });
+            }
+            if let Some((old_id, _)) = previous {
+                let _ = UnregisterHotKey(None, old_id);
+            }
+        }
+        self.last_item_id = id;
+        self.items.insert(item, (id, hotkey));
+        Ok(())
     }
 
     /// Ends recording, if any, and puts the current hotkey back.

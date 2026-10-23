@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-core"
-description = "Domain types shared by every Spotlight crate: item ids, frecency"
+description = "Domain types shared by every Spotlight crate: search items, actions, the Provider trait, frecency"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

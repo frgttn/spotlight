@@ -5,6 +5,8 @@
 /// (The DWM acrylic system backdrop was tried: light grey, and the window lost
 /// focus and hid itself after a few seconds.)
 pub const BACKGROUND_TINT: u32 = 0x1c1c1ef7;
+/// The HUD toast: the same dark tint, but see-through enough to read as glass.
+pub const HUD_TINT: u32 = 0x1c1c1ed2;
 pub const TEXT: u32 = 0xecececff;
 pub const TEXT_MUTED: u32 = 0xffffff80;
 pub const TEXT_FAINT: u32 = 0xffffff60;
@@ -13,6 +15,8 @@ pub const HAIRLINE: u32 = 0xffffff14;
 pub const SURFACE: u32 = 0xffffff0a;
 pub const SURFACE_HOVER: u32 = 0xffffff1a;
 pub const SURFACE_BORDER: u32 = 0xffffff14;
+/// Popovers over the window (the action panel): opaque, so the list doesn't show through.
+pub const PANEL: u32 = 0x2a2a2eff;
 pub const ACCENT: u32 = 0x4f7cffff;
 pub const ACCENT_SOFT: u32 = 0x4f7cff2e;
 pub const SUCCESS: u32 = 0x7fd4a0ff;
