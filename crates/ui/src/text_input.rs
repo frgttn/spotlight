@@ -1,8 +1,9 @@
 //! Single-line text input with IME support.
 //!
 //! Adapted from gpui 0.2.2 `examples/input.rs` (Apache-2.0, Zed Industries).
-//! Changes: Windows key bindings (incl. Ctrl+Backspace), launcher styling, a text
-//! inset for the caret, a change event, a fixed `character_index_for_point`, no demo app.
+//! Changes: the usual Windows editing keys (word-wise movement, selection and
+//! deletion with Ctrl), double and triple click, launcher styling, a text inset
+//! for the caret, a change event, a fixed `character_index_for_point`, no demo app.
 
 use std::ops::Range;
 
@@ -19,15 +20,22 @@ actions!(
     text_input,
     [
         Backspace,
-        DeleteToStart,
+        DeleteWordLeft,
         Delete,
+        DeleteWordRight,
         Left,
         Right,
+        WordLeft,
+        WordRight,
         SelectLeft,
         SelectRight,
+        SelectWordLeft,
+        SelectWordRight,
         SelectAll,
         Home,
         End,
+        SelectToHome,
+        SelectToEnd,
         Paste,
         Cut,
         Copy,
@@ -44,18 +52,33 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         // Binding it also stops Windows' Ctrl+Backspace DEL (0x7F) char from being typed.
-        KeyBinding::new("ctrl-backspace", DeleteToStart, Some(CONTEXT)),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
+        KeyBinding::new("ctrl-delete", DeleteWordRight, Some(CONTEXT)),
         KeyBinding::new("left", Left, Some(CONTEXT)),
         KeyBinding::new("right", Right, Some(CONTEXT)),
+        KeyBinding::new("ctrl-left", WordLeft, Some(CONTEXT)),
+        KeyBinding::new("ctrl-right", WordRight, Some(CONTEXT)),
         KeyBinding::new("shift-left", SelectLeft, Some(CONTEXT)),
         KeyBinding::new("shift-right", SelectRight, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-left", SelectWordLeft, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-right", SelectWordRight, Some(CONTEXT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
         KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-insert", Copy, Some(CONTEXT)),
         KeyBinding::new("ctrl-x", Cut, Some(CONTEXT)),
+        KeyBinding::new("shift-delete", Cut, Some(CONTEXT)),
+        // One line, so "start/end of document" (Ctrl) is the same place as start/end of line.
         KeyBinding::new("home", Home, Some(CONTEXT)),
+        KeyBinding::new("ctrl-home", Home, Some(CONTEXT)),
         KeyBinding::new("end", End, Some(CONTEXT)),
+        KeyBinding::new("ctrl-end", End, Some(CONTEXT)),
+        KeyBinding::new("shift-home", SelectToHome, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-home", SelectToHome, Some(CONTEXT)),
+        KeyBinding::new("shift-end", SelectToEnd, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-end", SelectToEnd, Some(CONTEXT)),
     ]);
 }
 
@@ -121,6 +144,41 @@ impl TextInput {
         }
     }
 
+    /// As in a Windows edit box, a selection collapses to the side it's moved from.
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.start
+        };
+        self.move_to(previous_word_start(&self.content, from), cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.end
+        };
+        self.move_to(next_word_start(&self.content, from), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(previous_word_start(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(next_word_start(&self.content, self.cursor_offset()), cx);
+    }
+
+    fn select_to_home(&mut self, _: &SelectToHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
@@ -149,12 +207,30 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
-    /// Deletes the selection, or everything before the cursor (the whole query
-    /// in the usual case where the cursor is at the end).
-    fn delete_to_start(&mut self, _: &DeleteToStart, window: &mut Window, cx: &mut Context<Self>) {
+    /// Deletes the selection, or the word before the cursor.
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_range.is_empty() {
-            self.selected_range = 0..self.cursor_offset();
-            self.selection_reversed = false;
+            let cursor = self.cursor_offset();
+            self.selected_range = previous_word_start(&self.content, cursor)..cursor;
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    /// Deletes the selection, or up to the start of the next word.
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            self.selected_range = cursor..next_word_start(&self.content, cursor);
         }
         self.replace_text_in_range(None, "", window, cx)
     }
@@ -167,6 +243,22 @@ impl TextInput {
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match event.click_count {
+            2 => {
+                self.selected_range =
+                    word_at(&self.content, self.index_for_mouse_position(event.position));
+                self.selection_reversed = false;
+                cx.notify();
+                return;
+            }
+            3.. => {
+                self.selected_range = 0..self.content.len();
+                self.selection_reversed = false;
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         self.is_selecting = true;
 
         if event.modifiers.shift {
@@ -211,6 +303,7 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
         cx.notify()
     }
 
@@ -305,6 +398,44 @@ impl TextInput {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
     }
+}
+
+/// Word segments of `text` by Unicode rules (UAX #29): (start, end, is whitespace).
+/// Punctuation forms segments of its own; `foo.bar` stays one word.
+fn segments(text: &str) -> impl DoubleEndedIterator<Item = (usize, usize, bool)> + '_ {
+    text.split_word_bound_indices()
+        .map(|(start, word)| (start, start + word.len(), word.trim().is_empty()))
+}
+
+/// Ctrl+Left: back over spaces, then to the start of the word before them.
+fn previous_word_start(text: &str, offset: usize) -> usize {
+    segments(text)
+        .rev()
+        .filter(|&(start, _, _)| start < offset)
+        .find(|&(_, _, space)| !space)
+        .map_or(0, |(start, _, _)| start)
+}
+
+/// Ctrl+Right, the Windows way: past the rest of the current word and the
+/// spaces after it, to the start of the next word.
+fn next_word_start(text: &str, offset: usize) -> usize {
+    let mut ahead = segments(text)
+        .filter(|&(_, end, _)| end > offset)
+        .peekable();
+    // Skip the word the cursor is in (or at the start of), if any.
+    ahead.next_if(|&(_, _, space)| !space);
+    ahead
+        .find(|&(_, _, space)| !space)
+        .map_or(text.len(), |(start, _, _)| start)
+}
+
+/// The word (or run of spaces) under `offset`, for double-click. Past the end
+/// of the text, the last one.
+fn word_at(text: &str, offset: usize) -> Range<usize> {
+    segments(text)
+        .find(|&(start, end, _)| start <= offset && offset < end)
+        .or_else(|| segments(text).next_back())
+        .map_or(0..0, |(start, end, _)| start..end)
 }
 
 impl EntityInputHandler for TextInput {
@@ -620,15 +751,22 @@ impl Render for TextInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete_to_start))
+            .on_action(cx.listener(Self::delete_word_left))
             .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_to_home))
+            .on_action(cx.listener(Self::select_to_end))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
@@ -643,5 +781,53 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_left_goes_to_word_starts() {
+        let text = "visual studio  code";
+        assert_eq!(previous_word_start(text, text.len()), 15);
+        assert_eq!(previous_word_start(text, 15), 7);
+        assert_eq!(previous_word_start(text, 9), 7);
+        assert_eq!(previous_word_start(text, 7), 0);
+        assert_eq!(previous_word_start(text, 0), 0);
+        assert_eq!(previous_word_start("   ", 3), 0);
+    }
+
+    #[test]
+    fn ctrl_right_goes_past_word_and_spaces() {
+        let text = "visual studio  code";
+        assert_eq!(next_word_start(text, 0), 7);
+        assert_eq!(next_word_start(text, 3), 7);
+        assert_eq!(next_word_start(text, 6), 7);
+        assert_eq!(next_word_start(text, 7), 15);
+        assert_eq!(next_word_start(text, 15), text.len());
+        assert_eq!(next_word_start(text, text.len()), text.len());
+    }
+
+    #[test]
+    fn punctuation_and_non_latin_words() {
+        let text = "привет, мир 1+2";
+        assert_eq!(next_word_start(text, 0), "привет".len());
+        assert_eq!(
+            previous_word_start(text, text.len()),
+            "привет, мир 1+".len()
+        );
+        assert_eq!(word_at(text, 2), 0.."привет".len());
+        assert_eq!(previous_word_start("github.com", 10), 0);
+    }
+
+    #[test]
+    fn double_click_picks_the_word_under_the_pointer() {
+        let text = "visual studio";
+        assert_eq!(word_at(text, 9), 7..13);
+        assert_eq!(word_at(text, 6), 6..7);
+        assert_eq!(word_at(text, 99), 7..13);
+        assert_eq!(word_at("", 0), 0..0);
     }
 }

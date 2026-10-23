@@ -65,9 +65,34 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     let after = window
         .update(cx, |launcher, _, cx| launcher.query(cx))
         .unwrap_or_default();
+    // It deletes one word: the query typed above ends in " code".
     eprintln!(
         "[selftest] ctrl+backspace: {before:?} -> {after:?} (handled: {handled}) {}",
-        if after.is_empty() && !before.is_empty() {
+        if !before.is_empty() && before.strip_suffix("code") == Some(after.as_str()) {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // Ctrl+Left moves to the start of the previous word: "visual |studio ".
+    let word_left = Keystroke::parse("ctrl-left").expect("valid keystroke");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_keystroke(word_left, cx)
+    })
+    .ok();
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("X", window, cx)
+        })
+        .ok();
+    sleep(SETTLE_MS).await;
+    let edited = window
+        .update(cx, |launcher, _, cx| launcher.query(cx))
+        .unwrap_or_default();
+    eprintln!(
+        "[selftest] ctrl+left: {after:?} -> {edited:?} {}",
+        if edited == "visual Xstudio " {
             "OK"
         } else {
             "FAIL"
@@ -75,6 +100,12 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     );
 
     // Root search end to end: the calculator's answer is the first row.
+    // Ctrl+A first, so the typed text replaces the query.
+    let select_all = Keystroke::parse("ctrl-a").expect("valid keystroke");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_keystroke(select_all, cx)
+    })
+    .ok();
     window
         .update(cx, |launcher, window, cx| {
             launcher.type_text("12*12", window, cx)
