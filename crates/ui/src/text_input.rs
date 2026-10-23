@@ -95,6 +95,8 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// ←/→ go to the parent view instead of moving the cursor (a grid uses them).
+    pass_horizontal_arrows: bool,
 }
 
 impl EventEmitter<Changed> for TextInput {}
@@ -111,6 +113,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            pass_horizontal_arrows: false,
         }
     }
 
@@ -126,6 +129,11 @@ impl TextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         cx.notify();
+    }
+
+    /// Lets ←/→ (without modifiers) through to the views around the field.
+    pub fn set_pass_horizontal_arrows(&mut self, pass: bool) {
+        self.pass_horizontal_arrows = pass;
     }
 
     /// The grey text shown while the field is empty.
@@ -149,6 +157,9 @@ impl TextInput {
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pass_horizontal_arrows {
+            return cx.propagate();
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
@@ -157,6 +168,9 @@ impl TextInput {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pass_horizontal_arrows {
+            return cx.propagate();
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {

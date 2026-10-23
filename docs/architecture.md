@@ -85,6 +85,14 @@ pub enum View {                  // declarative, serializable (serde): reused fo
 }
 ```
 
+**As built** (`core::view`): `View::{List, Grid, Detail, Form}`. Actions open them with
+`Command::PushView(view)`; the launcher keeps a stack of them over root search, and Esc pops one.
+List and Grid filter their items with the search field; Detail renders markdown
+(`pulldown-cmark`) with a metadata column; a Form's submit command has `{field}` placeholders
+that `FormView::fill` replaces (dropdown values first and raw, so one can pick a URL template;
+text values percent-encoded inside URLs). serde derives come with script commands, the first
+outside source of views.
+
 **Ranking v1** adds three parts:
 - the `nucleo` fuzzy score over title, keywords and aliases;
 - a frecency score (visit count with exponential time decay, stored in SQLite);
@@ -179,7 +187,7 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
    The providers live in one `providers` crate (modules, not one crate each) until one needs heavy dependencies of its own.
    `Provider` is synchronous for now: catalogs load on background threads and per-keystroke answers are bounded (the calculator gives up after 30 ms). Async with cancellation comes with providers that do IO (files, plugins).
    Actions are data (`Command`: launch app, open URL, copy, system command) that the app runs, rather than a `Provider::run` callback, so scripts and plugins can only ask for this safe set.
-2. Root search core, part 2: action panel (Ctrl+K), view stack (List / Detail / Form, Esc goes back), HUD and toasts, aliases, per-item hotkeys, more sources (Settings pages, Control Panel, game launchers), frecency tuning.
+2. Root search core, part 2: ✅ action panel (Ctrl+K), ✅ view stack (List / Grid / Detail / Form, Esc goes back), ✅ HUD and toasts, ✅ aliases and per-item hotkeys, ✅ calculator currencies and history; still to do: more sources (Settings pages, Control Panel, game launchers), frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
 4. Window management, file search.
 5. Script commands.

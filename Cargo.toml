@@ -26,6 +26,8 @@ gpui = "=0.2.2"
 # Only for its `Frame`/`RgbaImage` types in GPUI's image API; same version as gpui uses.
 image = { version = "0.25", default-features = false }
 nucleo-matcher = "0.3.1"
+# Markdown in detail views; no HTML output needed.
+pulldown-cmark = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
 # `bundled` compiles SQLite from source, so there is no system library to install.
 rusqlite = { version = "0.40", features = ["bundled"] }

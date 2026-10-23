@@ -4,8 +4,11 @@ use spotlight_core::{
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
+    view::{DetailView, ListView, View},
 };
 use spotlight_platform_win::apps;
+
+use crate::glyph;
 
 pub const ID: &str = "apps";
 
@@ -25,8 +28,25 @@ impl Provider for Apps {
                 return Vec::new();
             }
         };
-        apps.into_iter().map(item).collect()
+        let mut items: Vec<SearchItem> = apps.into_iter().map(item).collect();
+        items.push(browse(&items));
+        items
     }
+}
+
+/// "Browse Apps": every app as a tile with a large icon.
+fn browse(apps: &[SearchItem]) -> SearchItem {
+    let grid = View::Grid(ListView {
+        title: "Apps".into(),
+        placeholder: Some("Search apps…".into()),
+        items: apps.to_vec(),
+        empty: Some("No apps found".into()),
+    });
+    SearchItem::new(item_id(ID, "browse"), "Browse Apps")
+        .subtitle("Applications")
+        .keywords(&["all apps", "app grid"])
+        .icon(Icon::Glyph(glyph::APPS))
+        .action("Browse Apps", Command::PushView(Box::new(grid)))
 }
 
 /// Where Windows lists installed apps with their Uninstall buttons.
@@ -37,7 +57,7 @@ fn item(app: apps::AppEntry) -> SearchItem {
     let mut item = SearchItem::new(item_id(ID, &app.launch_id), app.name)
         .subtitle("Application")
         .icon(Icon::App(app.launch_id.clone()))
-        .action("Open", Command::LaunchApp(app.launch_id));
+        .action("Open", Command::LaunchApp(app.launch_id.clone()));
     if let Some(path) = app.path {
         if can_elevate(&path) {
             item = item.action("Run as Administrator", Command::RunAsAdmin(path.clone()));
@@ -46,7 +66,47 @@ fn item(app: apps::AppEntry) -> SearchItem {
             .action("Show in Explorer", Command::ShowInFolder(path.clone()))
             .action("Copy Path", Command::Copy(path));
     }
-    item.action("Uninstall…", Command::OpenUrl(INSTALLED_APPS.to_owned()))
+    let item = item.action("Uninstall…", Command::OpenUrl(INSTALLED_APPS.to_owned()));
+    let details = details(&item, &app.launch_id);
+    item.action("Show Details", Command::PushView(Box::new(details)))
+}
+
+/// What there is to know about an app, with the same actions as its row.
+fn details(item: &SearchItem, launch_id: &str) -> View {
+    let path = item
+        .actions
+        .iter()
+        .find_map(|action| match &action.command {
+            Command::ShowInFolder(path) => Some(path.clone()),
+            _ => None,
+        });
+    let (kind, markdown) = match &path {
+        Some(_) => (
+            "Desktop app",
+            "A classic Windows program. **Enter** opens it; **Ctrl+K** has the rest: \
+             run it as administrator, show it in Explorer, copy its path.",
+        ),
+        None if launch_id.contains('!') => (
+            "Microsoft Store app",
+            "A packaged app from the Microsoft Store or Windows itself. **Enter** opens it; \
+             uninstall it from *Installed apps* in Settings.",
+        ),
+        None => (
+            "App",
+            "Registered by name only, so there is no file to show. **Enter** opens it.",
+        ),
+    };
+    let mut metadata = vec![("Kind".to_owned(), kind.to_owned())];
+    if let Some(path) = path {
+        metadata.push(("Location".to_owned(), path));
+    }
+    metadata.push(("App ID".to_owned(), launch_id.to_owned()));
+    View::Detail(DetailView {
+        title: item.title.clone(),
+        markdown: markdown.to_owned(),
+        metadata,
+        actions: item.actions.clone(),
+    })
 }
 
 /// Files the shell's "runas" verb can start elevated.
@@ -82,7 +142,8 @@ mod tests {
                 "Run as Administrator",
                 "Show in Explorer",
                 "Copy Path",
-                "Uninstall…"
+                "Uninstall…",
+                "Show Details"
             ]
         );
     }
@@ -94,7 +155,7 @@ mod tests {
             launch_id: "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".into(),
             path: None,
         };
-        assert_eq!(titles(&item(app)), ["Open", "Uninstall…"]);
+        assert_eq!(titles(&item(app)), ["Open", "Uninstall…", "Show Details"]);
     }
 
     #[test]

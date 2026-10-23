@@ -6,7 +6,8 @@ use spotlight_core::{
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
-    web::SearchEngine,
+    view::{Field, FieldKind, FormView, View},
+    web::{PRESETS, SearchEngine},
 };
 
 use crate::glyph;
@@ -54,6 +55,51 @@ impl Web {
 impl Provider for Web {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    /// "Search the Web…": a form to search with any engine, not only the
+    /// one chosen in Settings (listed first, as it was at startup).
+    fn catalog(&self) -> Vec<SearchItem> {
+        let current = self.engine();
+        let mut engines = vec![(current.name(), current.template().to_owned())];
+        engines.extend(
+            PRESETS
+                .iter()
+                .filter(|preset| SearchEngine::Preset(preset) != current)
+                .map(|preset| (preset.name.to_owned(), preset.template.to_owned())),
+        );
+        let form = View::Form(FormView {
+            title: "Search the Web".into(),
+            fields: vec![
+                Field {
+                    id: "query".into(),
+                    label: "Search for".into(),
+                    kind: FieldKind::Text {
+                        placeholder: "What to look up".into(),
+                        default: String::new(),
+                        required: true,
+                    },
+                },
+                Field {
+                    id: "engine".into(),
+                    label: "With".into(),
+                    kind: FieldKind::Dropdown {
+                        options: engines,
+                        default: 0,
+                    },
+                },
+            ],
+            submit_title: "Search".into(),
+            // The engine's template, then the query in its {query}.
+            submit: Command::OpenUrl("{engine}".into()),
+        });
+        vec![
+            SearchItem::new(item_id(ID, "search-form"), "Search the Web…")
+                .subtitle("Web Search")
+                .keywords(&["google", "search engine"])
+                .icon(Icon::Glyph(glyph::FORM))
+                .action("Open Form", Command::PushView(Box::new(form))),
+        ]
     }
 
     fn answers(&self, query: &str) -> Vec<SearchItem> {
@@ -203,5 +249,22 @@ mod tests {
             items[0].actions[0].command,
             Command::OpenUrl("https://duckduckgo.com/?q=rust".into())
         );
+    }
+
+    #[test]
+    fn search_form_offers_every_engine_once() {
+        let web = Web::new(SearchEngine::from_setting("bing").unwrap());
+        let items = web.catalog();
+        let Command::PushView(view) = &items[0].actions[0].command else {
+            panic!("not a view");
+        };
+        let View::Form(form) = view.as_ref() else {
+            panic!("not a form");
+        };
+        let FieldKind::Dropdown { options, .. } = &form.fields[1].kind else {
+            panic!("not a dropdown");
+        };
+        assert_eq!(options[0].0, "Bing");
+        assert_eq!(options.len(), PRESETS.len());
     }
 }

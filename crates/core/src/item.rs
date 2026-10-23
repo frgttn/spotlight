@@ -3,6 +3,8 @@
 //! Everything here is plain data, so the same types can later come from script
 //! commands and WASM plugins.
 
+use crate::view::View;
+
 /// One row in a result list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchItem {
@@ -92,6 +94,8 @@ pub enum Command {
     Copy(String),
     /// Shows the calculations the user used, in a list of their own.
     OpenCalculatorHistory,
+    /// Opens a view on top of the current one; Esc comes back.
+    PushView(Box<View>),
     System(SystemCommand),
 }
 

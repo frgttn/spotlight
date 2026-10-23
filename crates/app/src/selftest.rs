@@ -7,6 +7,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext, AsyncApp, Keystroke, WindowHandle};
+use spotlight_core::view::FieldValue;
 use spotlight_platform_win::metrics::{self, selftest::*};
 use spotlight_ui::launcher::Launcher;
 
@@ -170,6 +171,21 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
             "FAIL"
         }
     );
+
+    for (name, outcome) in [
+        ("grid", grid_round_trip(window, cx).await),
+        ("detail", detail_round_trip(window, cx).await),
+        ("form", form_round_trip(window, cx).await),
+    ] {
+        eprintln!(
+            "[selftest] {name} view: {outcome} {}",
+            if outcome.ends_with("back to search") {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+    }
 
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
@@ -345,7 +361,7 @@ async fn history_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
             (launcher.screen_title(), launcher.query(cx))
         })
         .ok();
-    if opened != Some((Some("Calculator History"), String::new())) {
+    if opened != Some((Some("Calculator History".to_owned()), String::new())) {
         return format!("didn't open ({opened:?})");
     }
     press(window, "escape", cx);
@@ -359,4 +375,146 @@ async fn history_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         return format!("opened, but Esc gave {back:?}");
     }
     "opened, back to search".into()
+}
+
+/// Searches for `query` and, only if `title` is the first row, runs it with
+/// Enter (the rows used here open views). Returns why not otherwise.
+async fn open_from_search(
+    window: WindowHandle<Launcher>,
+    query: &str,
+    title: &str,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let executor = cx.background_executor().clone();
+    press(window, "ctrl-a", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text(query, window, cx)
+        })
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let first = window
+        .update(cx, |launcher, _, _| {
+            launcher.result_titles().into_iter().next()
+        })
+        .ok()
+        .flatten();
+    if first.as_deref() != Some(title) {
+        return Err(format!("{title:?} not the first row ({first:?})"));
+    }
+    press(window, "enter", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    Ok(())
+}
+
+/// Esc, then checks that root search is back and the window still open.
+async fn back_to_search(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> Result<(), String> {
+    press(window, "escape", cx);
+    cx.background_executor()
+        .timer(Duration::from_millis(SETTLE_MS))
+        .await;
+    let back = window
+        .update(cx, |launcher, _, _| {
+            (launcher.screen_title(), launcher.is_visible())
+        })
+        .ok();
+    if back == Some((None, true)) {
+        Ok(())
+    } else {
+        Err(format!("Esc gave {back:?}"))
+    }
+}
+
+/// Browse Apps: a grid; → moves one tile, ↓ one row. Enter isn't pressed
+/// there, it would launch an app.
+async fn grid_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    if let Err(why) = open_from_search(window, "browse apps", "Browse Apps", cx).await {
+        return why;
+    }
+    let read = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| {
+                (
+                    launcher.screen_title(),
+                    launcher.result_titles().len(),
+                    launcher.selected_index(),
+                )
+            })
+            .ok()
+    };
+    let opened = read(cx);
+    let Some((Some(title), tiles, 0)) = opened.clone() else {
+        return format!("didn't open ({opened:?})");
+    };
+    if title != "Apps" || tiles < 7 {
+        return format!("opened {title:?} with {tiles} tiles");
+    }
+    press(window, "right", cx);
+    let after_right = read(cx).map(|(_, _, selected)| selected);
+    press(window, "down", cx);
+    let after_down = read(cx).map(|(_, _, selected)| selected);
+    if (after_right, after_down) != (Some(1), Some(6)) {
+        return format!("→ then ↓ selected {after_right:?}, {after_down:?}");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => format!("{tiles} tiles, → and ↓ move, back to search"),
+        Err(why) => why,
+    }
+}
+
+async fn detail_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    if let Err(why) = open_from_search(window, "keyboard shortcuts", "Keyboard Shortcuts", cx).await
+    {
+        return why;
+    }
+    let title = window
+        .update(cx, |launcher, _, _| launcher.screen_title())
+        .ok()
+        .flatten();
+    if title.as_deref() != Some("Keyboard Shortcuts") {
+        return format!("didn't open ({title:?})");
+    }
+    press(window, "down", cx);
+    match back_to_search(window, cx).await {
+        Ok(()) => "opened, scrolled, back to search".into(),
+        Err(why) => why,
+    }
+}
+
+/// Search the Web: Enter with an empty query is refused, Tab and → change
+/// the engine. The query stays empty, so no browser opens.
+async fn form_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    if let Err(why) = open_from_search(window, "search the web", "Search the Web…", cx).await {
+        return why;
+    }
+    let state = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| launcher.form_state(cx))
+            .ok()
+            .flatten()
+    };
+    let Some((values, None)) = state(cx) else {
+        return format!("didn't open ({:?})", state(cx));
+    };
+    if values.first() != Some(&FieldValue::Text(String::new())) {
+        return format!("unexpected fields {values:?}");
+    }
+    press(window, "enter", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let refused = state(cx).and_then(|(_, error)| error);
+    if refused.as_deref() != Some("Search for is required") {
+        return format!("empty query not refused ({refused:?})");
+    }
+    press(window, "tab", cx);
+    press(window, "right", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let engine = state(cx).and_then(|(values, _)| values.get(1).cloned());
+    if engine != Some(FieldValue::Dropdown(1)) {
+        return format!("refused empty, but Tab → gave {engine:?}");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => "refused empty, Tab → changed engine, back to search".into(),
+        Err(why) => why,
+    }
 }

@@ -4,6 +4,7 @@
 pub mod apps;
 pub mod calc;
 pub mod rates;
+pub mod spotlight;
 pub mod system;
 pub mod web;
 
@@ -32,6 +33,9 @@ mod glyph {
     pub const DISPLAY: char = '\u{E7F4}';
     pub const NIGHT_LIGHT: char = '\u{EA80}';
     pub const USB: char = '\u{E88E}';
+    pub const APPS: char = '\u{E71D}';
+    pub const KEYBOARD: char = '\u{E765}';
+    pub const FORM: char = '\u{E70F}';
 }
 
 /// Every built-in provider, in the order their answers and catalogs are
@@ -48,6 +52,7 @@ pub fn all(
         Arc::new(system::System),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir))),
         web.clone(),
+        Arc::new(spotlight::Spotlight),
     ];
     (providers, web)
 }

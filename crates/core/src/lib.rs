@@ -3,6 +3,7 @@
 pub mod frecency;
 pub mod item;
 pub mod provider;
+pub mod view;
 pub mod web;
 
 /// Stable identity of a search result, `"{provider}:{instance}"`.

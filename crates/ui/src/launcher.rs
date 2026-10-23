@@ -1,4 +1,7 @@
-//! The launcher view: search field, result list, metrics footer.
+//! The launcher view: search field, result list, metrics footer, and the
+//! views opened on top of it (see `views`).
+
+mod views;
 
 use std::{
     cell::RefCell,
@@ -14,10 +17,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler, Focusable,
-    Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
-    uniform_list,
+    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
+    FocusHandle, Focusable, Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla,
+    img, prelude::*, px, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -26,6 +29,7 @@ use spotlight_core::{
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
+    view::{ListView, View},
 };
 use spotlight_platform_win::{
     commands,
@@ -37,6 +41,7 @@ use spotlight_platform_win::{
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{Calculation, Store};
 
+use self::views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen};
 use crate::{
     smooth_scroll::SmoothScroll,
     text_input::{self, TextInput},
@@ -51,6 +56,11 @@ actions!(
         Confirm,
         SecondaryAction,
         ToggleActions,
+        FocusNextField,
+        FocusPrevField,
+        NextChoice,
+        PrevChoice,
+        ToggleChoice,
         Dismiss,
         Quit,
         OpenSettings
@@ -63,6 +73,8 @@ const ROW_HEIGHT: f32 = 44.;
 const LIST_PADDING: f32 = 4.;
 /// Row icon size in logical pixels.
 const ICON_SIZE: f32 = 26.;
+/// Icons are extracted at the grid's tile size, so tiles are sharp too.
+const ICON_EXTRACT_SIZE: f32 = 44.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
 /// The apps provider's id; its catalog load time is the "apps" figure in the
@@ -84,6 +96,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-enter", SecondaryAction, Some(CONTEXT)),
         KeyBinding::new("ctrl-k", ToggleActions, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
+        KeyBinding::new("tab", FocusNextField, Some(CONTEXT)),
+        KeyBinding::new("shift-tab", FocusPrevField, Some(CONTEXT)),
+        // Only on a focused checkbox or dropdown, so Space still types elsewhere.
+        KeyBinding::new("right", NextChoice, Some(CHOICE_CONTEXT)),
+        KeyBinding::new("left", PrevChoice, Some(CHOICE_CONTEXT)),
+        KeyBinding::new("space", ToggleChoice, Some(CHOICE_CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
         // Not handled here: it bubbles up to the app, which owns the settings window.
         KeyBinding::new("ctrl-,", OpenSettings, Some(CONTEXT)),
@@ -140,14 +158,6 @@ impl Entry {
             _ => false,
         }
     }
-}
-
-/// What the result list shows: root search, or a list opened from it.
-/// Esc goes back to root search.
-enum Screen {
-    Root,
-    /// Most recent first.
-    CalculatorHistory(Vec<Calculation>),
 }
 
 /// The calculator's answer row; using it adds the calculation to the history.
@@ -231,7 +241,11 @@ pub struct Launcher {
     item_hotkeys: HashMap<String, Hotkey>,
     hotkeys: hotkey::Service,
     editor: Option<Editor>,
-    screen: Screen,
+    /// Views opened from root search, the top one showing; empty in root search.
+    screens: Vec<Screen>,
+    /// Holds the keyboard in views without a search field (details, forms).
+    focus: FocusHandle,
+    grid_scroll: UniformListScrollHandle,
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
     visible: bool,
@@ -342,7 +356,9 @@ impl Launcher {
             item_hotkeys,
             hotkeys,
             editor: None,
-            screen: Screen::Root,
+            screens: Vec::new(),
+            focus: cx.focus_handle(),
+            grid_scroll: UniformListScrollHandle::new(),
             list_searcher: Searcher::default(),
             visible: false,
             stats: Stats {
@@ -437,7 +453,7 @@ impl Launcher {
         }
         let (ids, launch_ids): (Vec<String>, Vec<String>) = items.into_iter().unzip();
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
-        let size = (ICON_SIZE * window_scale).ceil() as u32;
+        let size = (ICON_EXTRACT_SIZE * window_scale).ceil() as u32;
         let (tx, rx) = async_channel::unbounded();
         icons::spawn(launch_ids, size, tx);
 
@@ -483,32 +499,34 @@ impl Launcher {
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
-        self.results = match &self.screen {
-            Screen::Root => {
-                let frecency = &self.frecency;
-                self.search.search(
-                    query,
-                    |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
-                    &self.aliases,
-                )
-            }
-            Screen::CalculatorHistory(calculations) => {
-                let items: Vec<SearchItem> = calculations
-                    .iter()
-                    .map(|calculation| history_item(calculation, now))
-                    .collect();
-                let candidates = items.iter().map(|item| Candidate {
+        let Self {
+            screens,
+            list_searcher,
+            search,
+            frecency,
+            aliases,
+            ..
+        } = self;
+        self.results = match screens.last() {
+            None => search.search(
+                query,
+                |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
+                aliases,
+            ),
+            Some(Screen::List { view, .. }) => {
+                let candidates = view.items.iter().map(|item| Candidate {
                     title: &item.title,
                     keywords: &item.keywords,
                     alias: None,
                     frecency: 0.,
                 });
-                let order = self.list_searcher.filter(query, candidates);
-                order
+                list_searcher
+                    .filter(query, candidates)
                     .into_iter()
-                    .map(|ix| Row::Computed(items[ix].clone()))
+                    .map(|ix| Row::Computed(view.items[ix].clone()))
                     .collect()
             }
+            Some(_) => Vec::new(),
         };
         self.selected = 0;
         self.panel = None;
@@ -673,10 +691,11 @@ impl Launcher {
 
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
         self.hud = None;
-        if !matches!(self.screen, Screen::Root) {
-            self.screen = Screen::Root;
+        if !self.screens.is_empty() {
+            self.screens.clear();
             self.input.update(cx, |input, cx| {
-                input.set_placeholder(SEARCH_PLACEHOLDER, cx)
+                input.set_placeholder(SEARCH_PLACEHOLDER, cx);
+                input.set_pass_horizontal_arrows(false);
             });
         }
         self.input.update(cx, |input, cx| input.clear(cx));
@@ -721,6 +740,12 @@ impl Launcher {
             cx.notify();
             return;
         }
+        if self.in_grid() {
+            return self.grid_move(GRID_COLUMNS as isize, cx);
+        }
+        if matches!(self.screens.last(), Some(Screen::Detail { .. })) {
+            return self.detail_scroll(true, cx);
+        }
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
             self.confirming = None;
@@ -735,6 +760,12 @@ impl Launcher {
             cx.notify();
             return;
         }
+        if self.in_grid() {
+            return self.grid_move(-(GRID_COLUMNS as isize), cx);
+        }
+        if matches!(self.screens.last(), Some(Screen::Detail { .. })) {
+            return self.detail_scroll(false, cx);
+        }
         if self.selected > 0 {
             self.selected -= 1;
             self.confirming = None;
@@ -743,11 +774,62 @@ impl Launcher {
         }
     }
 
+    /// The actions Enter, Ctrl+Enter and the panel offer: the selected row's,
+    /// or a detail view's own.
     fn selected_actions(&self) -> Vec<Entry> {
+        if let Some(Screen::Detail { view, .. }) = self.screens.last() {
+            return view
+                .actions
+                .iter()
+                .map(|action| Entry {
+                    title: action.title.clone(),
+                    kind: EntryKind::Command(action.command.clone()),
+                })
+                .collect();
+        }
         self.results
             .get(self.selected)
             .map(|row| self.actions_for(row))
             .unwrap_or_default()
+    }
+
+    // ←/→ that the search field passes on in a grid.
+    fn grid_left(&mut self, _: &text_input::Left, _: &mut Window, cx: &mut Context<Self>) {
+        self.grid_move(-1, cx);
+    }
+
+    fn grid_right(&mut self, _: &text_input::Right, _: &mut Window, cx: &mut Context<Self>) {
+        self.grid_move(1, cx);
+    }
+
+    fn focus_next_field(
+        &mut self,
+        _: &FocusNextField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_field(true, window, cx);
+    }
+
+    fn focus_prev_field(
+        &mut self,
+        _: &FocusPrevField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_field(false, window, cx);
+    }
+
+    fn next_choice(&mut self, _: &NextChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(1, window, cx);
+    }
+
+    fn prev_choice(&mut self, _: &PrevChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(-1, window, cx);
+    }
+
+    fn toggle_choice(&mut self, _: &ToggleChoice, window: &mut Window, cx: &mut Context<Self>) {
+        self.change_choice(1, window, cx);
     }
 
     /// Enter: saves the alias being edited, or runs the action picked in the
@@ -758,6 +840,14 @@ impl Launcher {
             // The recorder hook takes every key; Enter can't arrive, but just in case.
             Some(Editor::Hotkey { .. }) => return,
             None => {}
+        }
+        match self.screens.last() {
+            Some(Screen::Form(_)) if self.panel.is_none() => return self.submit_form(window, cx),
+            Some(Screen::Detail { .. }) => {
+                let action = self.panel.unwrap_or(0);
+                return self.run_action(action, window, cx);
+            }
+            _ => {}
         }
         let waiting = self
             .confirming
@@ -804,6 +894,21 @@ impl Launcher {
     /// Runs action `ix` of the selected item. Commands then hide the window;
     /// the launcher's own entries (alias, hotkey, ranking) keep it open.
     fn run_action(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A detail view's actions belong to the view, not to a row.
+        if let Some(Screen::Detail { view, .. }) = self.screens.last() {
+            let Some(action) = view.actions.get(ix).cloned() else {
+                return;
+            };
+            let key = (view.title.clone(), ix);
+            self.panel = None;
+            if action.command.needs_confirmation() && self.confirming.as_ref() != Some(&key) {
+                self.confirming = Some(key);
+                cx.notify();
+                return;
+            }
+            self.confirming = None;
+            return self.perform(&action.command, window, cx);
+        }
         let Some(row) = self.results.get(self.selected).cloned() else {
             return;
         };
@@ -848,21 +953,29 @@ impl Launcher {
             }
             EntryKind::ClearCalculations => return self.clear_calculations(cx),
         };
-        if command == Command::OpenCalculatorHistory {
-            self.record_visit(id, cx);
-            return self.open_calculator_history(window, cx);
-        }
         // Using an answer keeps it; using a history entry moves it to the top.
         if id == CALC_ANSWER_ID {
             let expression = self.query(cx).trim().to_owned();
             self.remember_calculation(expression, title, cx);
-        } else if let Some(calculation) = self.history_entry(&id) {
-            self.remember_calculation(calculation.expression, calculation.answer, cx);
+        } else if let Some((expression, answer)) = self.history_entry(&id) {
+            self.remember_calculation(expression, answer, cx);
         }
-        self.run_command(&command, cx);
-        // Only catalog items are ranked, so only their use is worth remembering.
-        if matches!(row, Row::Catalog(_)) {
+        // Only catalog items are ranked, so only their use is worth
+        // remembering, also when they're used from a list (Browse Apps).
+        let ranked = matches!(row, Row::Catalog(_))
+            || self.search.catalog().iter().any(|item| item.id == id);
+        if ranked {
             self.record_visit(id, cx);
+        }
+        self.perform(&command, window, cx);
+    }
+
+    /// Opens a view, or carries out the command and hides the window.
+    fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::PushView(view) => self.push_view((**view).clone(), window, cx),
+            Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
+            command => self.run_command(command, cx),
         }
     }
 
@@ -1276,26 +1389,11 @@ impl Launcher {
             self.close_editor(Some(window), cx);
         } else if self.panel.take().is_some() {
             cx.notify();
-        } else if !matches!(self.screen, Screen::Root) {
-            self.go_to(Screen::Root, cx);
+        } else if !self.screens.is_empty() {
+            self.pop_screen(window, cx);
         } else {
             self.hide(cx);
         }
-    }
-
-    /// Switches the result list to `screen`, with an empty query.
-    fn go_to(&mut self, screen: Screen, cx: &mut Context<Self>) {
-        let placeholder = match &screen {
-            Screen::Root => SEARCH_PLACEHOLDER,
-            Screen::CalculatorHistory(_) => "Search calculator history…",
-        };
-        self.screen = screen;
-        self.input.update(cx, |input, cx| {
-            input.clear(cx);
-            input.set_placeholder(placeholder, cx);
-        });
-        self.refilter("");
-        cx.notify();
     }
 
     fn open_calculator_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1310,19 +1408,28 @@ impl Launcher {
                 })
             })
             .unwrap_or_default();
-        self.go_to(Screen::CalculatorHistory(calculations), cx);
-        window.focus(&self.input.focus_handle(cx));
+        let now = frecency::now();
+        let list = ListView {
+            title: "Calculator History".into(),
+            placeholder: Some("Search calculator history…".into()),
+            items: calculations
+                .iter()
+                .map(|calculation| history_item(calculation, now))
+                .collect(),
+            empty: Some("No calculations yet. Copy a calculator answer to keep it here.".into()),
+        };
+        self.push_view(View::List(list), window, cx);
     }
 
-    /// The history entry behind a row of the history list.
-    fn history_entry(&self, item_id: &str) -> Option<Calculation> {
-        let id: i64 = item_id.strip_prefix(HISTORY_ITEM)?.parse().ok()?;
-        match &self.screen {
-            Screen::CalculatorHistory(calculations) => calculations
-                .iter()
-                .find(|calculation| calculation.id == id)
-                .cloned(),
-            Screen::Root => None,
+    /// The expression and answer behind a row of the history list.
+    fn history_entry(&self, item_id: &str) -> Option<(String, String)> {
+        if !item_id.starts_with(HISTORY_ITEM) {
+            return None;
+        }
+        let item = self.list_items()?.iter().find(|item| item.id == item_id)?;
+        match item.keywords.as_slice() {
+            [expression, answer] => Some((expression.clone(), answer.clone())),
+            _ => None,
         }
     }
 
@@ -1353,8 +1460,9 @@ impl Launcher {
     }
 
     fn delete_calculation(&mut self, id: i64, cx: &mut Context<Self>) {
-        if let Screen::CalculatorHistory(calculations) = &mut self.screen {
-            calculations.retain(|calculation| calculation.id != id);
+        let item_id = format!("{HISTORY_ITEM}{id}");
+        if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+            view.items.retain(|item| item.id != item_id);
         }
         self.persist(cx, move |store| store.delete_calculation(id));
         let query = self.query(cx);
@@ -1363,8 +1471,8 @@ impl Launcher {
     }
 
     fn clear_calculations(&mut self, cx: &mut Context<Self>) {
-        if let Screen::CalculatorHistory(calculations) = &mut self.screen {
-            calculations.clear();
+        if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+            view.items.clear();
         }
         self.persist(cx, |store| store.clear_calculations());
         let query = self.query(cx);
@@ -1372,13 +1480,9 @@ impl Launcher {
         self.show_toast("Calculator history cleared".into(), cx);
     }
 
-    /// The opened list's name, for the tag next to the search field; `None`
-    /// in root search.
-    pub fn screen_title(&self) -> Option<&'static str> {
-        match self.screen {
-            Screen::Root => None,
-            Screen::CalculatorHistory(_) => Some("Calculator History"),
-        }
+    /// The open view's title; `None` in root search.
+    pub fn screen_title(&self) -> Option<String> {
+        self.screens.last().map(|screen| screen.title().to_owned())
     }
 
     fn render_row(&self, row: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1456,16 +1560,22 @@ impl Launcher {
     }
 
     fn render_icon(&self, item: &SearchItem) -> AnyElement {
+        self.render_icon_sized(item, ICON_SIZE)
+    }
+
+    /// The item's icon, glyph or letter badge, `size` logical pixels square.
+    fn render_icon_sized(&self, item: &SearchItem, size: f32) -> AnyElement {
         if let Some(icon) = self.icons.get(&item.id) {
             return img(icon.clone())
-                .size(px(ICON_SIZE))
+                .size(px(size))
                 .flex_none()
                 .into_any_element();
         }
+        let scale = size / ICON_SIZE;
         let badge = div()
-            .size(px(ICON_SIZE))
+            .size(px(size))
             .flex_none()
-            .rounded(px(6.))
+            .rounded(px(6. * scale))
             .flex()
             .items_center()
             .justify_center();
@@ -1473,7 +1583,7 @@ impl Launcher {
             Icon::Glyph(glyph) => badge
                 .bg(rgba(0xffffff1a))
                 .font_family(icon_font())
-                .text_size(px(15.))
+                .text_size(px(15. * scale))
                 .child(SharedString::from(glyph.to_string()))
                 .into_any_element(),
             // Plain items, and apps whose icon hasn't arrived or doesn't exist.
@@ -1487,7 +1597,7 @@ impl Launcher {
                     .into();
                 badge
                     .bg(badge_color(&item.title))
-                    .text_size(px(13.))
+                    .text_size(px(13. * scale))
                     .child(initial)
                     .into_any_element()
             }
@@ -1634,11 +1744,15 @@ impl Launcher {
 
     /// Right side of the footer: what Enter does, and how to see the rest.
     fn footer_hints(&self) -> impl IntoElement {
-        let primary = self
-            .selected_actions()
-            .into_iter()
-            .next()
-            .map(|action| SharedString::from(action.title));
+        let primary = match self.screens.last() {
+            Some(Screen::Form(form)) => Some(SharedString::from(form.view.submit_title.clone())),
+            _ => self
+                .selected_actions()
+                .into_iter()
+                .next()
+                .map(|action| SharedString::from(action.title)),
+        };
+        let has_actions = !self.selected_actions().is_empty();
         div()
             .flex_none()
             .flex()
@@ -1654,14 +1768,16 @@ impl Launcher {
                             .child(div().text_color(rgba(theme::TEXT)).child(primary))
                             .child(keycaps("Enter")),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child("Actions")
-                            .child(keycaps("Ctrl K")),
-                    )
+                    .when(has_actions, |hints| {
+                        hints.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child("Actions")
+                                .child(keycaps("Ctrl K")),
+                        )
+                    })
             })
     }
 
@@ -1710,18 +1826,20 @@ impl Render for Launcher {
             window.request_animation_frame();
         }
 
-        let results: AnyElement = if self.results.is_empty() {
+        let results: AnyElement = if let Some(body) = self.render_screen_body(window, cx) {
+            body
+        } else if self.results.is_empty() {
             div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
                 .text_color(rgba(0xffffff60))
-                .child(match &self.screen {
-                    Screen::CalculatorHistory(calculations) if calculations.is_empty() => {
-                        "No calculations yet. Copy a calculator answer to keep it here."
+                .child(match self.screens.last() {
+                    Some(Screen::List { view, .. }) if view.items.is_empty() => {
+                        SharedString::from(view.empty.clone().unwrap_or("Nothing here".into()))
                     }
-                    _ => "No results",
+                    _ => "No results".into(),
                 })
                 .into_any_element()
         } else {
@@ -1790,7 +1908,15 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::secondary_action))
             .on_action(cx.listener(Self::toggle_actions))
+            .on_action(cx.listener(Self::grid_left))
+            .on_action(cx.listener(Self::grid_right))
+            .on_action(cx.listener(Self::focus_next_field))
+            .on_action(cx.listener(Self::focus_prev_field))
+            .on_action(cx.listener(Self::next_choice))
+            .on_action(cx.listener(Self::prev_choice))
+            .on_action(cx.listener(Self::toggle_choice))
             .on_action(cx.listener(Self::dismiss))
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
@@ -1806,20 +1932,43 @@ impl Render for Launcher {
                     .gap_2()
                     .text_size(px(20.))
                     .line_height(px(28.))
-                    .when_some(self.screen_title(), |row, title| {
-                        row.child(
-                            div()
-                                .flex_none()
-                                .px_2()
-                                .rounded(px(5.))
-                                .bg(rgba(theme::SURFACE_HOVER))
-                                .text_size(px(12.))
-                                .line_height(px(22.))
-                                .text_color(rgba(theme::TEXT_MUTED))
-                                .child(title),
-                        )
-                    })
-                    .child(div().flex_1().min_w_0().child(self.input.clone())),
+                    .map(|row| match self.screens.last() {
+                        // Views without a search field show their title there.
+                        Some(screen) if !screen.has_search() => row
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(screen.title().to_owned())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(px(11.))
+                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .child(keycaps("Esc"))
+                                    .child("back"),
+                            ),
+                        screen => row
+                            .when_some(screen, |row, screen| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .px_2()
+                                        .rounded(px(5.))
+                                        .bg(rgba(theme::SURFACE_HOVER))
+                                        .text_size(px(12.))
+                                        .line_height(px(22.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .child(SharedString::from(screen.title().to_owned())),
+                                )
+                            })
+                            .child(div().flex_1().min_w_0().child(self.input.clone())),
+                    }),
             )
             .child(div().h(px(1.)).bg(rgba(0xffffff14)))
             .child(results)
