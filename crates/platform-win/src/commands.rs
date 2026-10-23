@@ -20,7 +20,15 @@ use crate::system::{self, Outcome};
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
 /// program, so anything else is refused.
-const URL_SCHEMES: &[&str] = &["https://", "http://", "ms-settings:"];
+const URL_SCHEMES: &[&str] = &[
+    "https://",
+    "http://",
+    "ms-settings:",
+    // Game launchers, to start a game they installed.
+    "steam://",
+    "com.epicgames.launcher://",
+    "uplay://",
+];
 
 /// Runs `command` on a thread of its own (a slow shell, a UAC prompt or a
 /// system command never blocks the UI). Its outcome, a message for the HUD
@@ -44,6 +52,15 @@ fn run_blocking(command: &Command) -> Outcome {
     match command {
         Command::LaunchApp(launch_id) => {
             shell_execute("open", &format!("shell:AppsFolder\\{launch_id}"))
+        }
+        Command::Open(target) => {
+            // ShellExecute takes `::{…}` parsing names with a `shell:` in front.
+            let target = if target.starts_with("::") {
+                format!("shell:{target}")
+            } else {
+                target.clone()
+            };
+            shell_execute("open", &target)
         }
         Command::RunAsAdmin(path) => shell_execute("runas", path),
         Command::ShowInFolder(path) => {
@@ -108,6 +125,15 @@ mod tests {
             r"C:\no such folder\no such program.exe".into(),
         ));
         assert_eq!(outcome, Err("Couldn't open it: the file is gone".into()));
+    }
+
+    /// Opens Control Panel's Device Manager; close it afterwards.
+    #[test]
+    #[ignore = "opens a window"]
+    fn opens_a_control_panel_item() {
+        let item =
+            r"::{26EE0668-A00A-44D7-9371-BEB064C98683}\0\::{74246BFC-4C96-11D0-ABEF-0020AF6B0B7A}";
+        assert_eq!(run_blocking(&Command::Open(item.into())), Ok(None));
     }
 
     #[test]

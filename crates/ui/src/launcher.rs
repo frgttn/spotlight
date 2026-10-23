@@ -423,12 +423,9 @@ impl Launcher {
             self.stats.apps = items.len();
             self.stats.discover_ms = Some(ms(elapsed));
         }
-        let app_icons: Vec<(String, String)> = items
+        let shell_icons: Vec<(String, String)> = items
             .iter()
-            .filter_map(|item| match &item.icon {
-                Icon::App(launch_id) => Some((item.id.clone(), launch_id.clone())),
-                _ => None,
-            })
+            .filter_map(|item| Some((item.id.clone(), shell_name(&item.icon)?)))
             .collect();
 
         self.search.set_catalog(provider, items);
@@ -436,12 +433,13 @@ impl Launcher {
         // Catalog indices moved, so the rows are rebuilt (and the selection resets).
         let query = self.query(cx);
         self.refilter(&query);
-        self.load_icons(app_icons, window_scale, cx);
+        self.load_icons(shell_icons, window_scale, cx);
         cx.notify();
     }
 
     /// Extracts shell icons in the background; rows switch from badges to icons
-    /// as they arrive. `items` holds (item id, `AppsFolder` parsing name) pairs.
+    /// as they arrive. `items` holds (item id, shell parsing name) pairs; each
+    /// distinct icon is extracted once (every Settings page has the same one).
     fn load_icons(
         &mut self,
         items: Vec<(String, String)>,
@@ -451,11 +449,21 @@ impl Launcher {
         if items.is_empty() {
             return;
         }
-        let (ids, launch_ids): (Vec<String>, Vec<String>) = items.into_iter().unzip();
+        let mut names: Vec<String> = Vec::new();
+        let mut ids: Vec<Vec<String>> = Vec::new();
+        for (id, name) in items {
+            match names.iter().position(|known| *known == name) {
+                Some(ix) => ids[ix].push(id),
+                None => {
+                    names.push(name);
+                    ids.push(vec![id]);
+                }
+            }
+        }
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
         let size = (ICON_EXTRACT_SIZE * window_scale).ceil() as u32;
         let (tx, rx) = async_channel::unbounded();
-        icons::spawn(launch_ids, size, tx);
+        icons::spawn(names, size, tx);
 
         cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
@@ -466,7 +474,9 @@ impl Launcher {
                 let updated = this.update(cx, |this, cx| {
                     for (ix, icon) in batch {
                         if let Some(image) = render_image(icon) {
-                            this.icons.insert(ids[ix].clone(), image);
+                            for id in &ids[ix] {
+                                this.icons.insert(id.clone(), image.clone());
+                            }
                         }
                     }
                     cx.notify();
@@ -1587,7 +1597,7 @@ impl Launcher {
                 .child(SharedString::from(glyph.to_string()))
                 .into_any_element(),
             // Plain items, and apps whose icon hasn't arrived or doesn't exist.
-            Icon::App(_) | Icon::None => {
+            Icon::App(_) | Icon::Shell(_) | Icon::None => {
                 let initial: SharedString = item
                     .title
                     .chars()
@@ -2072,6 +2082,15 @@ fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
                 .text_color(rgba(theme::TEXT_MUTED))
                 .child(key)
         }))
+}
+
+/// What to extract the icon from, for icons that come from the shell.
+fn shell_name(icon: &Icon) -> Option<String> {
+    match icon {
+        Icon::App(launch_id) => Some(format!("shell:AppsFolder\\{launch_id}")),
+        Icon::Shell(name) => Some(name.clone()),
+        Icon::Glyph(_) | Icon::None => None,
+    }
 }
 
 /// Windows 11's icon font, or its Windows 10 predecessor (same code points).

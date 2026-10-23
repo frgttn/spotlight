@@ -3,7 +3,10 @@
 
 pub mod apps;
 pub mod calc;
+pub mod control_panel;
+pub mod games;
 pub mod rates;
+pub mod settings_pages;
 pub mod spotlight;
 pub mod system;
 pub mod web;
@@ -36,6 +39,7 @@ mod glyph {
     pub const APPS: char = '\u{E71D}';
     pub const KEYBOARD: char = '\u{E765}';
     pub const FORM: char = '\u{E70F}';
+    pub const GAME: char = '\u{E7FC}';
 }
 
 /// Every built-in provider, in the order their answers and catalogs are
@@ -49,6 +53,9 @@ pub fn all(
     let web = Arc::new(web::Web::new(engine));
     let providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(apps::Apps),
+        Arc::new(settings_pages::SettingsPages),
+        Arc::new(control_panel::ControlPanel),
+        Arc::new(games::Games),
         Arc::new(system::System),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir))),
         web.clone(),

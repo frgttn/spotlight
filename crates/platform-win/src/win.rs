@@ -15,9 +15,9 @@ use windows::Win32::{
     UI::{
         HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
         WindowsAndMessaging::{
-            GetCursorPos, GetWindowRect, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
-            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-            SetWindowPos, ShowWindow,
+            GetCursorPos, GetWindowRect, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
+            SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE,
+            SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
         },
     },
 };

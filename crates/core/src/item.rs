@@ -67,6 +67,9 @@ pub enum Icon {
     None,
     /// The shell icon of an `AppsFolder` item, by its parsing name.
     App(String),
+    /// The icon of a file or shell object (a program, a Control Panel item),
+    /// by path or absolute parsing name.
+    Shell(String),
     /// A symbol from the system icon font (Segoe Fluent Icons / Segoe MDL2 Assets).
     Glyph(char),
 }
@@ -83,12 +86,16 @@ pub struct Action {
 pub enum Command {
     /// Starts an `AppsFolder` item by its parsing name (AUMID or path).
     LaunchApp(String),
+    /// Opens a file or shell object (a program, a Control Panel item) by path
+    /// or absolute parsing name, as double-clicking it would.
+    Open(String),
     /// Starts a program or shortcut (a file path) elevated, after the UAC prompt.
     RunAsAdmin(String),
     /// Opens an Explorer window on the folder holding this file, with the file selected.
     ShowInFolder(String),
-    /// Opens an `http`/`https` URL in the default browser, or an `ms-settings:`
-    /// page in the Settings app.
+    /// Opens an `http`/`https` URL in the default browser, an `ms-settings:`
+    /// page in the Settings app, or a game through its launcher (`steam://`…).
+    /// The app refuses other schemes.
     OpenUrl(String),
     /// Puts text on the clipboard.
     Copy(String),
