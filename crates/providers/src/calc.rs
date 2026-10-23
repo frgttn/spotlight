@@ -103,11 +103,17 @@ impl Provider for Calculator {
         ID
     }
 
-    /// Nothing to list; this runs once on a background thread at startup,
-    /// which is a good moment to fetch exchange rates if they're old.
+    /// The history command. This runs once on a background thread at
+    /// startup, which is also a good moment to fetch exchange rates if old.
     fn catalog(&self) -> Vec<SearchItem> {
         self.rates.refresh_if_stale();
-        Vec::new()
+        vec![
+            SearchItem::new(item_id(ID, "history"), "Calculator History")
+                .subtitle("Calculator")
+                .keywords(&["calculations", "calc history"])
+                .icon(Icon::Glyph(glyph::CALCULATOR))
+                .action("Open History", Command::OpenCalculatorHistory),
+        ]
     }
 
     fn answers(&self, query: &str) -> Vec<SearchItem> {

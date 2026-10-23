@@ -1,5 +1,6 @@
-//! Runs the [`Command`]s that search items carry, except `Copy`: the UI
-//! framework owns the clipboard, so the UI handles it.
+//! Runs the [`Command`]s that search items carry, except `Copy` (the UI
+//! framework owns the clipboard) and `OpenCalculatorHistory` (a UI screen),
+//! which the UI handles.
 
 use std::{os::windows::process::CommandExt, process, thread};
 
@@ -46,7 +47,9 @@ pub fn execute(command: &Command) {
                 eprintln!("[commands] refusing to open {url:?}: not an allowed URL");
             }
         }
-        Command::Copy(_) => eprintln!("[commands] Copy must be handled by the UI"),
+        Command::Copy(_) | Command::OpenCalculatorHistory => {
+            eprintln!("[commands] {command:?} must be handled by the UI")
+        }
         Command::System(command) => system::run(*command),
     }
 }

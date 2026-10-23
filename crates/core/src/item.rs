@@ -90,6 +90,8 @@ pub enum Command {
     OpenUrl(String),
     /// Puts text on the clipboard.
     Copy(String),
+    /// Shows the calculations the user used, in a list of their own.
+    OpenCalculatorHistory,
     System(SystemCommand),
 }
 

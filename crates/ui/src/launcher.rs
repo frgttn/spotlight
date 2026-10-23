@@ -34,8 +34,8 @@ use spotlight_platform_win::{
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     system, win,
 };
-use spotlight_search::{RootSearch, Row};
-use spotlight_store::Store;
+use spotlight_search::{Candidate, RootSearch, Row, Searcher};
+use spotlight_store::{Calculation, Store};
 
 use crate::{
     smooth_scroll::SmoothScroll,
@@ -127,13 +127,34 @@ enum EntryKind {
     RemoveAlias,
     RecordHotkey,
     RemoveHotkey,
+    /// A calculator history entry, by its id in the store.
+    DeleteCalculation(i64),
+    ClearCalculations,
 }
 
 impl Entry {
     fn needs_confirmation(&self) -> bool {
-        matches!(&self.kind, EntryKind::Command(command) if command.needs_confirmation())
+        match &self.kind {
+            EntryKind::Command(command) => command.needs_confirmation(),
+            EntryKind::ClearCalculations => true,
+            _ => false,
+        }
     }
 }
+
+/// What the result list shows: root search, or a list opened from it.
+/// Esc goes back to root search.
+enum Screen {
+    Root,
+    /// Most recent first.
+    CalculatorHistory(Vec<Calculation>),
+}
+
+/// The calculator's answer row; using it adds the calculation to the history.
+const CALC_ANSWER_ID: &str = "calc:answer";
+/// Item ids of history rows: this, then the calculation's id in the store.
+const HISTORY_ITEM: &str = "calc-history:";
+const SEARCH_PLACEHOLDER: &str = "Search apps and commands, or calculate…";
 
 /// An item with an alias or a hotkey, as the settings window lists it.
 #[derive(Clone, Debug, PartialEq)]
@@ -210,6 +231,9 @@ pub struct Launcher {
     item_hotkeys: HashMap<String, Hotkey>,
     hotkeys: hotkey::Service,
     editor: Option<Editor>,
+    screen: Screen,
+    /// Ranks the rows of a list opened from root search.
+    list_searcher: Searcher,
     visible: bool,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
@@ -233,7 +257,7 @@ impl Launcher {
         };
         win::round_corners(hwnd);
 
-        let input = cx.new(|cx| TextInput::new("Search apps and commands, or calculate…", cx));
+        let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,
@@ -318,6 +342,8 @@ impl Launcher {
             item_hotkeys,
             hotkeys,
             editor: None,
+            screen: Screen::Root,
+            list_searcher: Searcher::default(),
             visible: false,
             stats: Stats {
                 hotkey,
@@ -452,16 +478,38 @@ impl Launcher {
         self.input.read(cx).text().to_owned()
     }
 
-    /// Re-runs root search and resets the selection. Returns the search time in ms.
+    /// Re-runs the search (root search, or the open list's) and resets the
+    /// selection. Returns the search time in ms.
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
-        let frecency = &self.frecency;
-        self.results = self.search.search(
-            query,
-            |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
-            &self.aliases,
-        );
+        self.results = match &self.screen {
+            Screen::Root => {
+                let frecency = &self.frecency;
+                self.search.search(
+                    query,
+                    |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
+                    &self.aliases,
+                )
+            }
+            Screen::CalculatorHistory(calculations) => {
+                let items: Vec<SearchItem> = calculations
+                    .iter()
+                    .map(|calculation| history_item(calculation, now))
+                    .collect();
+                let candidates = items.iter().map(|item| Candidate {
+                    title: &item.title,
+                    keywords: &item.keywords,
+                    alias: None,
+                    frecency: 0.,
+                });
+                let order = self.list_searcher.filter(query, candidates);
+                order
+                    .into_iter()
+                    .map(|ix| Row::Computed(items[ix].clone()))
+                    .collect()
+            }
+        };
         self.selected = 0;
         self.panel = None;
         self.confirming = None;
@@ -482,6 +530,21 @@ impl Launcher {
                 kind: EntryKind::Command(action.command.clone()),
             })
             .collect();
+        if let Some(id) = item
+            .id
+            .strip_prefix(HISTORY_ITEM)
+            .and_then(|id| id.parse().ok())
+        {
+            entries.push(Entry {
+                title: "Delete Entry".into(),
+                kind: EntryKind::DeleteCalculation(id),
+            });
+            entries.push(Entry {
+                title: "Clear History".into(),
+                kind: EntryKind::ClearCalculations,
+            });
+            return entries;
+        }
         if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
             return entries;
         }
@@ -610,6 +673,12 @@ impl Launcher {
 
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
         self.hud = None;
+        if !matches!(self.screen, Screen::Root) {
+            self.screen = Screen::Root;
+            self.input.update(cx, |input, cx| {
+                input.set_placeholder(SEARCH_PLACEHOLDER, cx)
+            });
+        }
         self.input.update(cx, |input, cx| input.clear(cx));
         self.stats.filter_ms = Some(self.refilter(""));
         // Explicit size: with `show: false` GPUI defers its own placement to
@@ -774,7 +843,22 @@ impl Launcher {
                 self.show_toast(format!("Hotkey removed from {title}").into(), cx);
                 return;
             }
+            EntryKind::DeleteCalculation(calculation) => {
+                return self.delete_calculation(calculation, cx);
+            }
+            EntryKind::ClearCalculations => return self.clear_calculations(cx),
         };
+        if command == Command::OpenCalculatorHistory {
+            self.record_visit(id, cx);
+            return self.open_calculator_history(window, cx);
+        }
+        // Using an answer keeps it; using a history entry moves it to the top.
+        if id == CALC_ANSWER_ID {
+            let expression = self.query(cx).trim().to_owned();
+            self.remember_calculation(expression, title, cx);
+        } else if let Some(calculation) = self.history_entry(&id) {
+            self.remember_calculation(calculation.expression, calculation.answer, cx);
+        }
         self.run_command(&command, cx);
         // Only catalog items are ranked, so only their use is worth remembering.
         if matches!(row, Row::Catalog(_)) {
@@ -1186,14 +1270,115 @@ impl Launcher {
             .detach();
     }
 
-    /// Esc closes the alias editor or the action panel first, then the window.
+    /// Esc closes the alias editor or the action panel first, then goes back
+    /// from an opened list to root search, then hides the window.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             self.close_editor(Some(window), cx);
         } else if self.panel.take().is_some() {
             cx.notify();
+        } else if !matches!(self.screen, Screen::Root) {
+            self.go_to(Screen::Root, cx);
         } else {
             self.hide(cx);
+        }
+    }
+
+    /// Switches the result list to `screen`, with an empty query.
+    fn go_to(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        let placeholder = match &screen {
+            Screen::Root => SEARCH_PLACEHOLDER,
+            Screen::CalculatorHistory(_) => "Search calculator history…",
+        };
+        self.screen = screen;
+        self.input.update(cx, |input, cx| {
+            input.clear(cx);
+            input.set_placeholder(placeholder, cx);
+        });
+        self.refilter("");
+        cx.notify();
+    }
+
+    fn open_calculator_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let calculations = self
+            .store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| {
+                store.calculations().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read the calculator history: {err}");
+                    Vec::new()
+                })
+            })
+            .unwrap_or_default();
+        self.go_to(Screen::CalculatorHistory(calculations), cx);
+        window.focus(&self.input.focus_handle(cx));
+    }
+
+    /// The history entry behind a row of the history list.
+    fn history_entry(&self, item_id: &str) -> Option<Calculation> {
+        let id: i64 = item_id.strip_prefix(HISTORY_ITEM)?.parse().ok()?;
+        match &self.screen {
+            Screen::CalculatorHistory(calculations) => calculations
+                .iter()
+                .find(|calculation| calculation.id == id)
+                .cloned(),
+            Screen::Root => None,
+        }
+    }
+
+    /// Saves a calculation the user used to the history (on a background thread).
+    fn remember_calculation(&self, expression: String, answer: String, cx: &mut Context<Self>) {
+        if expression.is_empty() {
+            return;
+        }
+        let now = frecency::now();
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|mut store| {
+                        store
+                            .add_calculation(&expression, &answer, now)
+                            .map_err(|err| err.to_string())
+                    });
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save the calculation: {err}");
+                }
+            })
+            .detach();
+    }
+
+    fn delete_calculation(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Screen::CalculatorHistory(calculations) = &mut self.screen {
+            calculations.retain(|calculation| calculation.id != id);
+        }
+        self.persist(cx, move |store| store.delete_calculation(id));
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.show_toast("Entry deleted".into(), cx);
+    }
+
+    fn clear_calculations(&mut self, cx: &mut Context<Self>) {
+        if let Screen::CalculatorHistory(calculations) = &mut self.screen {
+            calculations.clear();
+        }
+        self.persist(cx, |store| store.clear_calculations());
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.show_toast("Calculator history cleared".into(), cx);
+    }
+
+    /// The opened list's name, for the tag next to the search field; `None`
+    /// in root search.
+    pub fn screen_title(&self) -> Option<&'static str> {
+        match self.screen {
+            Screen::Root => None,
+            Screen::CalculatorHistory(_) => Some("Calculator History"),
         }
     }
 
@@ -1533,7 +1718,12 @@ impl Render for Launcher {
                 .items_center()
                 .justify_center()
                 .text_color(rgba(0xffffff60))
-                .child("No results")
+                .child(match &self.screen {
+                    Screen::CalculatorHistory(calculations) if calculations.is_empty() => {
+                        "No calculations yet. Copy a calculator answer to keep it here."
+                    }
+                    _ => "No results",
+                })
                 .into_any_element()
         } else {
             let list = uniform_list(
@@ -1612,9 +1802,25 @@ impl Render for Launcher {
                 div()
                     .px_4()
                     .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .text_size(px(20.))
                     .line_height(px(28.))
-                    .child(self.input.clone()),
+                    .when_some(self.screen_title(), |row, title| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .rounded(px(5.))
+                                .bg(rgba(theme::SURFACE_HOVER))
+                                .text_size(px(12.))
+                                .line_height(px(22.))
+                                .text_color(rgba(theme::TEXT_MUTED))
+                                .child(title),
+                        )
+                    })
+                    .child(div().flex_1().min_w_0().child(self.input.clone())),
             )
             .child(div().h(px(1.)).bg(rgba(0xffffff14)))
             .child(results)
@@ -1659,6 +1865,40 @@ impl Render for Launcher {
 /// contain `+` (the plus key displays as `=`, the same key).
 fn hotkey_keys(hotkey: Hotkey) -> String {
     hotkey.to_string().replace('+', " ")
+}
+
+/// A row of the calculator history: `expression = answer`, found by either.
+fn history_item(calculation: &Calculation, now: i64) -> SearchItem {
+    let Calculation {
+        id,
+        expression,
+        answer,
+        used_at,
+    } = calculation;
+    let mut item = SearchItem::new(
+        format!("{HISTORY_ITEM}{id}"),
+        format!("{expression} = {answer}"),
+    )
+    .subtitle(days_ago(*used_at, now))
+    // The calculator glyph, as on the calculator's own rows.
+    .icon(Icon::Glyph('\u{E8EF}'))
+    .action("Copy Answer", Command::Copy(answer.clone()))
+    .action(
+        "Copy Calculation",
+        Command::Copy(format!("{expression} = {answer}")),
+    );
+    item.keywords = vec![expression.clone(), answer.clone()];
+    item
+}
+
+/// "Today", "Yesterday", "5 days ago", by calendar days in UTC.
+fn days_ago(then: i64, now: i64) -> String {
+    const DAY: i64 = 24 * 3600;
+    match now.div_euclid(DAY) - then.div_euclid(DAY) {
+        ..=0 => "Today".into(),
+        1 => "Yesterday".into(),
+        days => format!("{days} days ago"),
+    }
 }
 
 /// Key caps for a shortcut such as `"Ctrl K"`, one per key.
@@ -1726,6 +1966,33 @@ const FILLER: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn says_how_long_ago() {
+        const DAY: i64 = 24 * 3600;
+        let now = 100 * DAY + 3600;
+        assert_eq!(days_ago(now - 60, now), "Today");
+        assert_eq!(days_ago(now - DAY, now), "Yesterday");
+        assert_eq!(days_ago(now - 5 * DAY, now), "5 days ago");
+        assert_eq!(days_ago(now + 60, now), "Today");
+    }
+
+    #[test]
+    fn history_rows_are_found_by_expression_or_answer() {
+        let item = history_item(
+            &Calculation {
+                id: 7,
+                expression: "100 usd to eur".into(),
+                answer: "92.10 EUR".into(),
+                used_at: 0,
+            },
+            0,
+        );
+        assert_eq!(item.id, "calc-history:7");
+        assert_eq!(item.title, "100 usd to eur = 92.10 EUR");
+        assert_eq!(item.keywords, ["100 usd to eur", "92.10 EUR"]);
+        assert_eq!(item.actions[0].command, Command::Copy("92.10 EUR".into()));
+    }
 
     #[test]
     fn hotkeys_split_into_key_caps() {

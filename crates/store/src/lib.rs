@@ -1,4 +1,5 @@
-//! SQLite persistence: settings, frecency, aliases and item hotkeys.
+//! SQLite persistence: settings, frecency, aliases, item hotkeys and the
+//! calculator history.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -32,7 +33,27 @@ const MIGRATIONS: &[&str] = &[
         item_id TEXT PRIMARY KEY,
         hotkey  TEXT NOT NULL
     );",
+    "CREATE TABLE calculations (
+        id         INTEGER PRIMARY KEY,
+        expression TEXT NOT NULL,
+        answer     TEXT NOT NULL,
+        used_at    INTEGER NOT NULL
+    );
+    CREATE INDEX calculations_used_at ON calculations (used_at);",
 ];
+
+/// How many calculations the history keeps; older ones go.
+const CALCULATIONS_KEPT: i64 = 200;
+
+/// A calculation the user used, for the calculator history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Calculation {
+    pub id: i64,
+    pub expression: String,
+    pub answer: String,
+    /// Unix seconds.
+    pub used_at: i64,
+}
 
 pub struct Store {
     conn: Connection,
@@ -182,6 +203,54 @@ impl Store {
         Ok(())
     }
 
+    /// Adds a calculation to the history, or moves it to the top if the same
+    /// expression is already there, and trims the history to its limit.
+    pub fn add_calculation(&mut self, expression: &str, answer: &str, now: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM calculations WHERE expression = ?1",
+            [expression],
+        )?;
+        tx.execute(
+            "INSERT INTO calculations (expression, answer, used_at) VALUES (?1, ?2, ?3)",
+            params![expression, answer, now],
+        )?;
+        tx.execute(
+            "DELETE FROM calculations WHERE id NOT IN
+                (SELECT id FROM calculations ORDER BY used_at DESC, id DESC LIMIT ?1)",
+            [CALCULATIONS_KEPT],
+        )?;
+        tx.commit()
+    }
+
+    /// The calculator history, most recent first.
+    pub fn calculations(&self) -> Result<Vec<Calculation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, expression, answer, used_at FROM calculations
+             ORDER BY used_at DESC, id DESC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(Calculation {
+                id: row.get(0)?,
+                expression: row.get(1)?,
+                answer: row.get(2)?,
+                used_at: row.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    pub fn delete_calculation(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM calculations WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn clear_calculations(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM calculations", [])?;
+        Ok(())
+    }
+
     /// Forgets every use of `item_id`.
     pub fn forget(&self, item_id: &str) -> Result<()> {
         self.conn
@@ -224,6 +293,39 @@ mod tests {
         assert_eq!(store.item_hotkeys().unwrap()["system:lock"], "Ctrl+Alt+L");
         store.set_item_hotkey("system:lock", None).unwrap();
         assert!(store.item_hotkeys().unwrap().is_empty());
+    }
+
+    #[test]
+    fn calculator_history() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.add_calculation("1+1", "2", 10).unwrap();
+        store.add_calculation("2*3", "6", 20).unwrap();
+        // Used again: moves to the top instead of appearing twice.
+        store.add_calculation("1+1", "2", 30).unwrap();
+        let history = store.calculations().unwrap();
+        let expressions: Vec<_> = history.iter().map(|c| c.expression.as_str()).collect();
+        assert_eq!(expressions, ["1+1", "2*3"]);
+
+        store.delete_calculation(history[1].id).unwrap();
+        assert_eq!(store.calculations().unwrap().len(), 1);
+        store.clear_calculations().unwrap();
+        assert!(store.calculations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn calculator_history_is_capped() {
+        let mut store = Store::open_in_memory().unwrap();
+        for ix in 0..CALCULATIONS_KEPT + 5 {
+            store
+                .add_calculation(&format!("{ix}+0"), &ix.to_string(), ix)
+                .unwrap();
+        }
+        let history = store.calculations().unwrap();
+        assert_eq!(history.len() as i64, CALCULATIONS_KEPT);
+        assert_eq!(
+            history[0].expression,
+            format!("{}+0", CALCULATIONS_KEPT + 4)
+        );
     }
 
     #[test]

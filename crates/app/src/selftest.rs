@@ -161,6 +161,16 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    let history = history_round_trip(window, cx).await;
+    eprintln!(
+        "[selftest] calculator history: {history} {}",
+        if history == "opened, back to search" {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
     // The HUD, for a look from outside: the line below says when it's up.
@@ -304,4 +314,49 @@ async fn alias_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> 
         return "set, found first, not removed".into();
     }
     "set, found first, removed".into()
+}
+
+/// Opens Calculator History from root search and goes back with Esc.
+/// Returns how far it got.
+async fn history_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let settle = || executor.timer(Duration::from_millis(SETTLE_MS));
+    press(window, "ctrl-a", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("calculator history", window, cx)
+        })
+        .ok();
+    settle().await;
+    let first = window
+        .update(cx, |launcher, _, _| {
+            launcher.result_titles().into_iter().next()
+        })
+        .ok()
+        .flatten();
+    // Enter runs the first row: only press it on the row it should be.
+    if first.as_deref() != Some("Calculator History") {
+        return format!("not the first row ({first:?})");
+    }
+    press(window, "enter", cx);
+    settle().await;
+    let opened = window
+        .update(cx, |launcher, _, cx| {
+            (launcher.screen_title(), launcher.query(cx))
+        })
+        .ok();
+    if opened != Some((Some("Calculator History"), String::new())) {
+        return format!("didn't open ({opened:?})");
+    }
+    press(window, "escape", cx);
+    settle().await;
+    let back = window
+        .update(cx, |launcher, _, _| {
+            (launcher.screen_title(), launcher.is_visible())
+        })
+        .ok();
+    if back != Some((None, true)) {
+        return format!("opened, but Esc gave {back:?}");
+    }
+    "opened, back to search".into()
 }

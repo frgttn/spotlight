@@ -128,6 +128,16 @@ impl TextInput {
         cx.notify();
     }
 
+    /// The grey text shown while the field is empty.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// Resets the text without emitting [`Changed`]; the caller refreshes its own state.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();
