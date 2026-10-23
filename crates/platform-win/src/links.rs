@@ -1,11 +1,21 @@
-//! What quicklinks need from Windows: the current moment for `{date}`,
-//! `{time}` and `{uuid}`, environment variables in paths, and the installed
-//! browsers to open a link with.
+//! What quicklinks and snippets need from Windows: the current moment for
+//! `{date}`, `{time}`, `{day}` and `{uuid}`, environment variables in paths,
+//! the installed browsers to open a link with, and where exports go.
 
-use std::{env, path::Path};
+use std::{
+    env,
+    ffi::c_void,
+    path::{Path, PathBuf},
+};
 
 use spotlight_core::quicklink::Moment;
-use windows::{Win32::System::SystemInformation::GetLocalTime, core::GUID};
+use windows::{
+    Win32::{
+        System::{Com::CoTaskMemFree, SystemInformation::GetLocalTime},
+        UI::Shell::{FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
+    },
+    core::GUID,
+};
 
 use crate::registry;
 
@@ -15,16 +25,50 @@ const BROWSER_KEYS: &[&str] = &[
     r"HKLM\SOFTWARE\Clients\StartMenuInternet",
 ];
 
+/// `SYSTEMTIME::wDayOfWeek` counts from Sunday.
+const DAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
 /// The local date and time, and a fresh random UUID.
 pub fn moment() -> Moment {
     let now = unsafe { GetLocalTime() };
     Moment {
         date: format!("{:04}-{:02}-{:02}", now.wYear, now.wMonth, now.wDay),
         time: format!("{:02}:{:02}", now.wHour, now.wMinute),
+        day: DAYS
+            .get(now.wDayOfWeek as usize)
+            .copied()
+            .unwrap_or_default()
+            .to_owned(),
         uuid: GUID::new()
             .map(|guid| format!("{guid:?}").to_lowercase())
             .unwrap_or_default(),
     }
+}
+
+/// The user's Downloads folder, where a save dialog starts; their profile
+/// folder if Windows doesn't say.
+pub fn downloads_folder() -> PathBuf {
+    let known = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_Downloads, KF_FLAG_DEFAULT, None)
+            .ok()
+            .and_then(|raw| {
+                let path = raw.to_string().ok();
+                CoTaskMemFree(Some(raw.0 as *const c_void));
+                path
+            })
+    };
+    known
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_default()
 }
 
 /// `%USERPROFILE%\Desktop` → `C:\Users\me\Desktop`. Unknown variables stay as

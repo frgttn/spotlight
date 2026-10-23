@@ -10,7 +10,10 @@ use std::{
 };
 
 use gpui::{App, AppContext, AsyncApp, Keystroke, WindowHandle};
-use spotlight_core::view::FieldValue;
+use spotlight_core::{
+    item::Command,
+    view::{Field, FieldKind, FieldValue, FormView, View},
+};
 use spotlight_platform_win::metrics::{self, selftest::*};
 use spotlight_ui::launcher::Launcher;
 
@@ -207,6 +210,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("grid", grid_round_trip(window, cx).await),
         ("detail", detail_round_trip(window, cx).await),
         ("form", form_round_trip(window, cx).await),
+        ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
         ("bangs", bangs_round_trip(window, cx).await),
     ] {
@@ -231,6 +235,24 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
                 "FAIL"
             }
         );
+        let snippets = snippet_round_trip(window, cx).await;
+        eprintln!(
+            "[selftest] snippets: {snippets} {}",
+            if snippets == SNIPPETS_DONE {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+        // Pastes for real, so only when asked, and only into the window
+        // named (a test harness's text box, as a hex HWND).
+        if let Some(target) = env::var("SPOTLIGHT_SELFTEST_PASTE")
+            .ok()
+            .and_then(|hwnd| isize::from_str_radix(hwnd.trim_start_matches("0x"), 16).ok())
+        {
+            let pasted = snippet_paste(window, target, cx).await;
+            eprintln!("[selftest] snippet paste: {pasted}");
+        }
     }
 
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
@@ -527,6 +549,115 @@ async fn detail_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) ->
     }
 }
 
+/// A form with a text area: Enter starts a new line there instead of
+/// submitting, ↑ goes up a row, Ctrl+End to the end, and Ctrl+Enter submits
+/// (refused while it's empty, so nothing runs). `SPOTLIGHT_SELFTEST_HOLD=<ms>`
+/// keeps it open that long with a long wrapped line, for a look from outside.
+async fn text_area_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let settle = || executor.timer(Duration::from_millis(SETTLE_MS));
+    let form = FormView {
+        title: "Selftest Text Area".into(),
+        fields: vec![
+            Field {
+                id: "name".into(),
+                label: "Name".into(),
+                kind: FieldKind::Text {
+                    placeholder: "Name".into(),
+                    default: String::new(),
+                    required: false,
+                },
+            },
+            Field {
+                id: "text".into(),
+                label: "Snippet".into(),
+                kind: FieldKind::TextArea {
+                    placeholder: "Text".into(),
+                    default: String::new(),
+                    required: true,
+                },
+            },
+        ],
+        submit_title: "Save".into(),
+        submit: Command::Copy("{text}".into()),
+    };
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.open_view(View::Form(form), window, cx)
+        })
+        .ok();
+    settle().await;
+    let type_text = |text: &str, cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(text, window, cx)
+            })
+            .ok();
+    };
+    let text = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| launcher.form_state(cx))
+            .ok()
+            .flatten()
+            .and_then(|(values, _)| match values.get(1) {
+                Some(FieldValue::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+    };
+
+    press(window, "tab", cx);
+    type_text("one", cx);
+    press(window, "enter", cx);
+    type_text("two", cx);
+    settle().await;
+    if text(cx).as_deref() != Some("one\ntwo") {
+        return format!("Enter didn't start a line ({:?})", text(cx));
+    }
+    press(window, "up", cx);
+    type_text("X", cx);
+    press(window, "ctrl-end", cx);
+    type_text("!", cx);
+    settle().await;
+    if text(cx).as_deref() != Some("oneX\ntwo!") {
+        return format!("↑ or Ctrl+End went wrong ({:?})", text(cx));
+    }
+
+    if let Some(hold) = env::var("SPOTLIGHT_SELFTEST_HOLD")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        press(window, "enter", cx);
+        type_text(
+            "A long line that has to wrap: the quick brown fox jumps over the lazy dog, \
+             then over the fence, the river and the hill behind the old mill.",
+            cx,
+        );
+        press(window, "shift-up", cx);
+        eprintln!("[selftest] text area held open for {hold} ms");
+        executor.timer(Duration::from_millis(hold)).await;
+    }
+
+    press(window, "ctrl-a", cx);
+    press(window, "backspace", cx);
+    press(window, "ctrl-enter", cx);
+    settle().await;
+    let refused = window
+        .update(cx, |launcher, _, cx| launcher.form_state(cx))
+        .ok()
+        .flatten()
+        .and_then(|(_, error)| error);
+    if refused.as_deref() != Some("Snippet is required") {
+        return format!("lines fine, but Ctrl+Enter gave {refused:?}");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => {
+            "Enter adds a line, ↑ and Ctrl+End move, Ctrl+Enter refused empty, back to search"
+                .into()
+        }
+        Err(why) => why,
+    }
+}
+
 /// Search the Web: Enter with an empty query is refused, Tab and → change
 /// the engine. The query stays empty, so no browser opens.
 async fn form_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
@@ -686,6 +817,246 @@ async fn quicklink_save_and_delete(window: WindowHandle<Launcher>, cx: &mut Asyn
         return "saved, opened with !zzq, not deleted".into();
     }
     "saved, opened with !zzq, deleted".into()
+}
+
+const SNIPPETS_DONE: &str = "saved, taken keyword refused, listed, exported, deleted, imported, imported again: nothing new";
+
+/// Creates a snippet through its form (Ctrl+Enter saves: Enter is a new
+/// line in its text), refuses a second one with the same keyword, finds it
+/// in Search Snippets, exports it, deletes it from the action panel, imports
+/// the export and deletes it again. Nothing is pasted.
+async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let settle = || executor.timer(Duration::from_millis(SETTLE_MS));
+    let type_text = |text: &str, cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(text, window, cx)
+            })
+            .ok();
+    };
+    let state = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| {
+                (launcher.screen_title(), launcher.form_state(cx))
+            })
+            .ok()
+    };
+    let titles = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.result_titles())
+            .unwrap_or_default()
+    };
+
+    // Creates "Selftest Snippet" (or another name) with keyword ;zzs.
+    let create = async |name: &str, cx: &mut AsyncApp| -> Result<(), String> {
+        open_from_search(window, "create snippet", "Create Snippet", cx).await?;
+        type_text(name, cx);
+        press(window, "tab", cx);
+        type_text("Dear {argument name=\"Who\"},", cx);
+        press(window, "enter", cx);
+        type_text("{cursor}", cx);
+        press(window, "tab", cx);
+        type_text(";zzs", cx);
+        press(window, "ctrl-enter", cx);
+        Ok(())
+    };
+    // Search Snippets, filtered to "selftest".
+    let open_list = async |cx: &mut AsyncApp| -> Result<(), String> {
+        open_from_search(window, "search snippets", "Search Snippets", cx).await?;
+        type_text("selftest", cx);
+        Ok(())
+    };
+    // Deletes the selected snippet from the action panel (it asks to confirm).
+    let delete = |cx: &mut AsyncApp| -> Result<(), String> {
+        press(window, "ctrl-k", cx);
+        let actions = window
+            .update(cx, |launcher, _, _| launcher.panel_actions())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Some(ix) = actions.iter().position(|title| title == "Delete Snippet") else {
+            return Err(format!("no Delete in {actions:?}"));
+        };
+        for _ in 0..ix {
+            press(window, "down", cx);
+        }
+        press(window, "enter", cx);
+        press(window, "enter", cx);
+        Ok(())
+    };
+
+    if let Err(why) = create("Selftest Snippet", cx).await {
+        return why;
+    }
+    settle().await;
+    if !matches!(state(cx), Some((None, None))) {
+        return format!("not saved ({:?})", state(cx));
+    }
+    if let Err(why) = create("Selftest Again", cx).await {
+        return why;
+    }
+    settle().await;
+    let refused = state(cx)
+        .and_then(|(_, form)| form)
+        .and_then(|(_, error)| error);
+    if refused.as_deref() != Some(";zzs already pastes “Selftest Snippet”") {
+        return format!("saved, but the same keyword gave {refused:?}");
+    }
+    if let Err(why) = back_to_search(window, cx).await {
+        return why;
+    }
+
+    if let Err(why) = open_list(cx).await {
+        return why;
+    }
+    settle().await;
+    if titles(cx) != ["Selftest Snippet"] {
+        return format!("saved, but the list has {:?}", titles(cx));
+    }
+
+    let file = env::temp_dir().join(format!("spotlight-selftest-{}.json", std::process::id()));
+    let exported = window
+        .update(cx, |launcher, _, _| launcher.export_snippets_to(&file))
+        .unwrap_or_else(|_| Err("window gone".into()));
+    let json = std::fs::read_to_string(&file).unwrap_or_default();
+    if exported != Ok(1) || !json.contains(r#""keyword": ";zzs""#) {
+        let _ = std::fs::remove_file(&file);
+        return format!("listed, but the export gave {exported:?}: {json}");
+    }
+
+    if let Err(why) = delete(cx) {
+        let _ = std::fs::remove_file(&file);
+        return why;
+    }
+    settle().await;
+    if !titles(cx).is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return format!("exported, but still listed: {:?}", titles(cx));
+    }
+
+    let import = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.import_snippets_from(&file))
+            .unwrap_or_default()
+    };
+    let first = import(cx);
+    let second = import(cx);
+    let _ = std::fs::remove_file(&file);
+    if first != "Imported 1 snippet" || second != "Nothing new to import" {
+        return format!("deleted, but importing gave {first:?}, then {second:?}");
+    }
+    if let Err(why) = back_to_search(window, cx).await {
+        return why;
+    }
+    if let Err(why) = open_list(cx).await {
+        return why;
+    }
+    settle().await;
+    if titles(cx) != ["Selftest Snippet"] {
+        return format!("imported, but the list has {:?}", titles(cx));
+    }
+    if let Err(why) = delete(cx) {
+        return why;
+    }
+    settle().await;
+    if let Err(why) = back_to_search(window, cx).await {
+        return why;
+    }
+    SNIPPETS_DONE.into()
+}
+
+/// Saves `<b>{cursor}</b>` as a snippet, pastes it from Search Snippets into
+/// `target`, then deletes it. What arrived there (`<b></b>`, the caret
+/// before `</b>`) is for the harness to check. When another window was in
+/// front before the launcher, nothing is pasted: keys would go to that app.
+async fn snippet_paste(window: WindowHandle<Launcher>, target: isize, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let settle = || executor.timer(Duration::from_millis(SETTLE_MS));
+    let type_text = |text: &str, cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(text, window, cx)
+            })
+            .ok();
+    };
+    let open_list = async |cx: &mut AsyncApp| -> Result<(), String> {
+        open_from_search(window, "search snippets", "Search Snippets", cx).await?;
+        type_text("selftest paste", cx);
+        settle().await;
+        Ok(())
+    };
+
+    // Hidden and shown again, so the window in front is the one to paste into.
+    window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
+    executor.timer(Duration::from_millis(HIDDEN_MS)).await;
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.show(Instant::now(), window, cx)
+        })
+        .ok();
+    settle().await;
+
+    if let Err(why) = open_from_search(window, "create snippet", "Create Snippet", cx).await {
+        return why;
+    }
+    type_text("Selftest Paste", cx);
+    press(window, "tab", cx);
+    type_text("<b>{cursor}</b>", cx);
+    press(window, "ctrl-enter", cx);
+    settle().await;
+    if let Err(why) = open_list(cx).await {
+        return why;
+    }
+    let listed = window
+        .update(cx, |launcher, _, _| launcher.result_titles())
+        .unwrap_or_default();
+    let previous = window
+        .update(cx, |launcher, _, _| launcher.previous_window())
+        .unwrap_or_default();
+    // Otherwise Ctrl+Enter, Copy Snippet: it only puts it on the clipboard.
+    let paste = if previous == target {
+        "enter"
+    } else {
+        "ctrl-enter"
+    };
+    if listed != ["Selftest Paste"] {
+        return format!("not listed ({listed:?})");
+    }
+    press(window, paste, cx);
+    // The paste happens on a thread of its own once the window is in front.
+    executor.timer(Duration::from_millis(1000)).await;
+
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.show(Instant::now(), window, cx)
+        })
+        .ok();
+    settle().await;
+    if let Err(why) = open_list(cx).await {
+        return why;
+    }
+    press(window, "ctrl-k", cx);
+    let actions = window
+        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Some(ix) = actions.iter().position(|title| title == "Delete Snippet") {
+        for _ in 0..ix {
+            press(window, "down", cx);
+        }
+        press(window, "enter", cx);
+        press(window, "enter", cx);
+    }
+    settle().await;
+    press(window, "escape", cx);
+    window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
+    if previous == target {
+        format!("pasted into {target:#x}")
+    } else {
+        format!("copied only: {previous:#x} was in front, not {target:#x}")
+    }
 }
 
 /// The bangs list (downloaded on first use, so it waits for it): `!reddit

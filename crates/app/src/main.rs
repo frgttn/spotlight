@@ -31,6 +31,7 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
+    snippet,
     web::SearchEngine,
 };
 use spotlight_platform_win::{
@@ -85,6 +86,7 @@ struct AppState {
     clipboard: Arc<ClipboardHistory>,
     win_v: Cell<bool>,
     selection_copy: Cell<bool>,
+    snippet_expansion: Cell<bool>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -176,6 +178,8 @@ fn main() {
         .expect("failed to start the hotkey thread");
     let win_v = setting(WIN_V_SETTING).is_some_and(|value| value == "true");
     let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
+    let snippet_expansion =
+        setting(snippet::EXPANSION_SETTING).is_none_or(|value| value != "false");
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
     }
@@ -256,7 +260,12 @@ fn main() {
             .expect("failed to open the launcher window");
         window
             .update(cx, |launcher, _, _| {
-                launcher.set_selection_copy(selection_copy)
+                launcher.set_selection_copy(selection_copy);
+                launcher.set_snippet_expansion(snippet_expansion);
+                // The self-test runs beside a normal instance, which expands them.
+                if !self_test {
+                    launcher.start_expander();
+                }
             })
             .ok();
 
@@ -297,6 +306,7 @@ fn main() {
             clipboard: clipboard_history,
             win_v: Cell::new(win_v),
             selection_copy: Cell::new(selection_copy),
+            snippet_expansion: Cell::new(snippet_expansion),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -421,6 +431,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
                 view_state.selection_copy.get(),
+                view_state.snippet_expansion.get(),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
                 window,
@@ -527,6 +538,30 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .ok();
             save_setting(state, SELECTION_COPY_SETTING, enabled.to_string(), cx);
         }
+        SettingsEvent::SnippetExpansionChanged(enabled) => {
+            state.snippet_expansion.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, _| {
+                    launcher.set_snippet_expansion(*enabled)
+                })
+                .ok();
+            save_setting(state, snippet::EXPANSION_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::ExcludedAppsChanged(apps) => {
+            state
+                .launcher
+                .update(cx, |launcher, _, _| {
+                    launcher.set_excluded_snippet_apps(apps)
+                })
+                .ok();
+            save_setting(
+                state,
+                snippet::EXCLUDED_APPS_SETTING,
+                IgnoredApp::format_list(apps),
+                cx,
+            );
+        }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
                 tray.sync_autostart();
@@ -590,6 +625,7 @@ fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
             shortcuts: launcher.shortcuts(),
             sources: launcher.sources(),
             ignored_apps: launcher.ignored_clip_apps(),
+            excluded_apps: launcher.excluded_snippet_apps(),
         })
     })
 }

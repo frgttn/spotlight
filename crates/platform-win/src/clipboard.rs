@@ -38,7 +38,7 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::{
                 INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-                SendInput, VIRTUAL_KEY, VK_CONTROL,
+                SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LEFT,
             },
             Shell::{DROPFILES, DragQueryFileW, HDROP},
             WindowsAndMessaging::{
@@ -554,7 +554,7 @@ fn process_path(pid: u32) -> Option<String> {
 
 /// The program's description from its version resource ("Google Chrome"),
 /// or its file name without `.exe`.
-fn app_name(path: &str) -> String {
+pub(crate) fn app_name(path: &str) -> String {
     let fallback = || {
         Path::new(path)
             .file_stem()
@@ -615,10 +615,11 @@ pub fn foreground_window() -> isize {
 }
 
 /// Activates `window` and presses Ctrl+V in it, to paste what was just put on
-/// the clipboard. Call it while Spotlight is still the foreground app: only
+/// the clipboard, then Left `caret_back` times (to put the caret inside what
+/// was pasted). Call it while Spotlight is still the foreground app: only
 /// then may it hand the foreground to another window. Returns `false` (and
 /// does nothing) when the window is gone.
-pub fn paste_into(window: isize) -> bool {
+pub fn paste_into(window: isize, caret_back: usize) -> bool {
     if !bring_to_front(window) {
         return false;
     }
@@ -630,6 +631,10 @@ pub fn paste_into(window: isize) -> bool {
         if !press_ctrl(VK_V) {
             // Windows blocks input into apps running as administrator.
             eprintln!("[clipboard] Ctrl+V was blocked");
+            return;
+        }
+        if caret_back > 0 && !press(VK_LEFT, caret_back) {
+            eprintln!("[clipboard] Left was blocked");
         }
     });
     true
@@ -686,6 +691,30 @@ pub(crate) fn press_ctrl(key: VIRTUAL_KEY) -> bool {
         input(key, true),
         input(VK_CONTROL, true),
     ];
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    sent as usize == inputs.len()
+}
+
+/// Presses `key` `times` times in whatever window has the keyboard. `false`
+/// when Windows blocked the keys.
+pub(crate) fn press(key: VIRTUAL_KEY, times: usize) -> bool {
+    let input = |up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                ..Default::default()
+            },
+        },
+    };
+    let inputs: Vec<INPUT> = (0..times)
+        .flat_map(|_| [input(false), input(true)])
+        .collect();
     let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
     sent as usize == inputs.len()
 }

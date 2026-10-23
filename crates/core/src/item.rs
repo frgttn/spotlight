@@ -6,6 +6,7 @@
 use crate::{
     clip::IgnoredApp,
     quicklink::{self, Quicklink},
+    snippet::Snippet,
     view::{Preview, View},
     web::encode_query,
 };
@@ -126,6 +127,21 @@ pub enum Command {
     /// Saves a new (id 0) or edited quicklink. The UI checks it first.
     SaveQuicklink(Quicklink),
     DeleteQuicklink(i64),
+    /// Saves a new (id 0) or edited snippet. The UI checks it first.
+    SaveSnippet(Snippet),
+    DeleteSnippet(i64),
+    /// Puts a snippet's text on the clipboard with its placeholders filled
+    /// in at that moment (`{clipboard}` from what was there) and, with
+    /// `paste`, pastes it into the window that was active before the
+    /// launcher, the caret at `{cursor}`.
+    PasteSnippet {
+        text: String,
+        paste: bool,
+    },
+    /// Asks for a JSON file of snippets, as Raycast exports them, and adds them.
+    ImportSnippets,
+    /// Asks where to save every snippet as JSON, as Raycast imports them.
+    ExportSnippets,
     /// Opens a view on top of the current one; Esc comes back.
     PushView(Box<View>),
     /// Opens a view the provider `provider` builds when asked (see
@@ -193,6 +209,7 @@ impl Command {
             Command::System(
                 SystemCommand::Restart | SystemCommand::ShutDown | SystemCommand::SignOut
             ) | Command::DeleteQuicklink(_)
+                | Command::DeleteSnippet(_)
                 | Command::ClearClipboardHistory
         )
     }

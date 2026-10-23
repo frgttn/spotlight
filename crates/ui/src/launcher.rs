@@ -3,6 +3,7 @@
 
 mod clipboard;
 mod quicklinks;
+mod snippets;
 mod views;
 
 use std::{
@@ -34,7 +35,7 @@ use spotlight_core::{
     view::{ListView, View},
 };
 use spotlight_platform_win::{
-    clipboard as system_clipboard, commands,
+    clipboard as system_clipboard, commands, expander,
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
@@ -274,6 +275,10 @@ pub struct Launcher {
     previous_window: isize,
     /// Whether reading the selected text may fall back to Ctrl+C.
     selection_copy: bool,
+    /// Expands snippet keywords typed in other apps; `None` until started.
+    expander: Option<expander::Service>,
+    /// Whether keywords expand, as set in Settings (Snippets must be on too).
+    snippet_expansion: bool,
     /// The clipboard preview's image.
     preview_image: Option<PreviewImage>,
     /// Images no longer shown, freed on the next frame (it takes the window).
@@ -401,6 +406,8 @@ impl Launcher {
             visible: false,
             previous_window: 0,
             selection_copy: true,
+            expander: None,
+            snippet_expansion: true,
             preview_image: None,
             stale_images: Vec::new(),
             stats: Stats {
@@ -613,6 +620,9 @@ impl Launcher {
         self.search.set_enabled(ix, enabled);
         if enabled {
             self.reload_catalog(id, window.scale_factor(), cx);
+        }
+        if id == snippets::PROVIDER {
+            self.sync_expander();
         }
         // Catalog indices moved (or answers changed), so the rows are rebuilt.
         let query = self.query(cx);
@@ -841,6 +851,12 @@ impl Launcher {
         }
     }
 
+    /// The window that was in front before the launcher, which pastes go
+    /// to. For the self-test.
+    pub fn previous_window(&self) -> isize {
+        self.previous_window
+    }
+
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
         let foreground = system_clipboard::foreground_window();
         if foreground != self.hwnd {
@@ -1028,16 +1044,23 @@ impl Launcher {
         }
     }
 
-    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…).
+    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…),
+    /// or a form's submit.
     fn secondary_action(
         &mut self,
         _: &SecondaryAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.panel.is_none() && self.editor.is_none() {
-            self.run_action(1, window, cx);
+        if self.panel.is_some() || self.editor.is_some() {
+            return;
         }
+        // A form's submit: Enter can't be it in a text area, where it starts
+        // a new line.
+        if matches!(self.screens.last(), Some(Screen::Form(_))) {
+            return self.submit_form(window, cx);
+        }
+        self.run_action(1, window, cx);
     }
 
     fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
@@ -1128,7 +1151,11 @@ impl Launcher {
             || self.search.catalog().iter().any(|item| item.id == id);
         let edits = matches!(
             command,
-            Command::SaveQuicklink(_) | Command::DeleteQuicklink(_) | Command::Complete(_)
+            Command::SaveQuicklink(_)
+                | Command::DeleteQuicklink(_)
+                | Command::SaveSnippet(_)
+                | Command::DeleteSnippet(_)
+                | Command::Complete(_)
         );
         if ranked && !edits {
             self.record_visit(id, cx);
@@ -1146,6 +1173,11 @@ impl Launcher {
             Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
             Command::SaveQuicklink(link) => self.save_quicklink(link.clone(), window, cx),
             Command::DeleteQuicklink(id) => self.delete_quicklink(*id, window, cx),
+            Command::SaveSnippet(snippet) => self.save_snippet(snippet.clone(), window, cx),
+            Command::DeleteSnippet(id) => self.delete_snippet(*id, window, cx),
+            Command::PasteSnippet { text, paste } => self.paste_snippet(text, *paste, cx),
+            Command::ImportSnippets => self.import_snippets(cx),
+            Command::ExportSnippets => self.export_snippets(cx),
             Command::OpenProviderView { provider, view } => {
                 self.open_provider_view(provider, view, window, cx)
             }
@@ -2040,13 +2072,18 @@ impl Launcher {
 
     /// Right side of the footer: what Enter does, and how to see the rest.
     fn footer_hints(&self) -> impl IntoElement {
-        let primary = match self.screens.last() {
-            Some(Screen::Form(form)) => Some(SharedString::from(form.view.submit_title.clone())),
-            _ => self
-                .selected_actions()
-                .into_iter()
-                .next()
-                .map(|action| SharedString::from(action.title)),
+        let (primary, primary_keys) = match self.screens.last() {
+            Some(Screen::Form(form)) => (
+                Some(SharedString::from(form.view.submit_title.clone())),
+                form.submit_keys(),
+            ),
+            _ => (
+                self.selected_actions()
+                    .into_iter()
+                    .next()
+                    .map(|action| SharedString::from(action.title)),
+                "Enter",
+            ),
         };
         let has_actions = !self.selected_actions().is_empty();
         div()
@@ -2062,7 +2099,7 @@ impl Launcher {
                             .items_center()
                             .gap_1()
                             .child(div().text_color(rgba(theme::TEXT)).child(primary))
-                            .child(keycaps("Enter")),
+                            .child(keycaps(primary_keys)),
                     )
                     .when(has_actions, |hints| {
                         hints.child(

@@ -1,5 +1,5 @@
 //! SQLite persistence: settings, frecency, aliases, item hotkeys, the
-//! calculator history, quicklinks and the clipboard history.
+//! calculator history, quicklinks, the clipboard history and snippets.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -12,6 +12,7 @@ use spotlight_core::{
     clip::{self, ClipKind, Retention},
     frecency::Frecency,
     quicklink::{self, Quicklink},
+    snippet::Snippet,
 };
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -67,6 +68,14 @@ const MIGRATIONS: &[&str] = &[
         copied_at INTEGER NOT NULL
     );
     CREATE INDEX clips_copied_at ON clips (copied_at);",
+    // One snippet per keyword; any number without one.
+    "CREATE TABLE snippets (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT NOT NULL,
+        text       TEXT NOT NULL,
+        keyword    TEXT UNIQUE,
+        created_at INTEGER NOT NULL
+    );",
 ];
 
 /// The migration that creates `quicklinks`: databases created before it get
@@ -385,6 +394,66 @@ impl Store {
         Ok(())
     }
 
+    /// Every snippet, by name.
+    pub fn snippets(&self) -> Result<Vec<Snippet>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, text, keyword FROM snippets
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(Snippet {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                text: row.get(2)?,
+                keyword: row.get(3)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Adds `snippet` (id 0) or replaces the one with its id. Returns its id.
+    /// Fails when another snippet has its keyword.
+    pub fn save_snippet(&self, snippet: &Snippet, now: i64) -> Result<i64> {
+        let Snippet {
+            id,
+            name,
+            text,
+            keyword,
+        } = snippet;
+        if *id == 0 {
+            self.conn.execute(
+                "INSERT INTO snippets (name, text, keyword, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![name, text, keyword, now],
+            )?;
+            return Ok(self.conn.last_insert_rowid());
+        }
+        self.conn.execute(
+            "UPDATE snippets SET name = ?2, text = ?3, keyword = ?4 WHERE id = ?1",
+            params![id, name, text, keyword],
+        )?;
+        Ok(*id)
+    }
+
+    /// Adds new snippets (their ids are ignored) all at once, or none if one
+    /// fails. Returns how many were added.
+    pub fn add_snippets(&mut self, snippets: &[Snippet], now: i64) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        for snippet in snippets {
+            tx.execute(
+                "INSERT INTO snippets (name, text, keyword, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![snippet.name, snippet.text, snippet.keyword, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(snippets.len())
+    }
+
+    pub fn delete_snippet(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM snippets WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Adds `clip` to the clipboard history. When content with this `hash`
     /// is already there, that entry is replaced by a new one at the top
     /// (newer id, so it's first even within the same second), keeping its
@@ -630,6 +699,78 @@ mod tests {
 
     fn contents(clips: Vec<Clip>) -> Vec<String> {
         clips.into_iter().map(|clip| clip.content).collect()
+    }
+
+    #[test]
+    fn snippets_round_trip_with_unique_keywords() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.snippets().unwrap().is_empty());
+
+        let mut address = Snippet {
+            id: 0,
+            name: "address".into(),
+            text: "Main St 1\nSpringfield".into(),
+            keyword: Some(";addr".into()),
+        };
+        address.id = store.save_snippet(&address, 1).unwrap();
+        let mut sign = Snippet {
+            id: 0,
+            name: "Signature".into(),
+            text: "— {cursor}".into(),
+            keyword: None,
+        };
+        sign.id = store.save_snippet(&sign, 2).unwrap();
+        // By name, ignoring case: "S" sorts before "a" in plain byte order.
+        assert_eq!(store.snippets().unwrap(), [address.clone(), sign.clone()]);
+
+        // Keywords are unique; snippets without one aren't limited.
+        let taken = Snippet {
+            id: 0,
+            keyword: Some(";addr".into()),
+            ..address.clone()
+        };
+        assert!(store.save_snippet(&taken, 3).is_err());
+        let blank = Snippet {
+            id: 0,
+            ..sign.clone()
+        };
+        store.save_snippet(&blank, 3).unwrap();
+
+        sign.keyword = Some(";sig".into());
+        assert_eq!(store.save_snippet(&sign, 4).unwrap(), sign.id);
+        assert!(store.snippets().unwrap().contains(&sign));
+
+        store.delete_snippet(address.id).unwrap();
+        assert!(!store.snippets().unwrap().contains(&address));
+        assert_eq!(store.snippets().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn adding_snippets_is_all_or_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let snippet = |keyword: &str| Snippet {
+            id: 0,
+            name: keyword.into(),
+            text: "text".into(),
+            keyword: Some(keyword.into()),
+        };
+        assert_eq!(
+            store.add_snippets(&[snippet(";a"), snippet(";b")], 1),
+            Ok(2)
+        );
+        // ";b" is taken, so ";c" isn't added either.
+        assert!(
+            store
+                .add_snippets(&[snippet(";c"), snippet(";b")], 2)
+                .is_err()
+        );
+        let keywords: Vec<_> = store
+            .snippets()
+            .unwrap()
+            .into_iter()
+            .filter_map(|snippet| snippet.keyword)
+            .collect();
+        assert_eq!(keywords, [";a", ";b"]);
     }
 
     #[test]

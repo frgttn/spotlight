@@ -11,6 +11,7 @@ pub mod quicklinks;
 pub mod rates;
 pub mod selection;
 pub mod settings_pages;
+pub mod snippets;
 pub mod spotlight;
 pub mod system;
 pub mod web;
@@ -56,6 +57,9 @@ mod glyph {
     pub const IMAGE: char = '\u{EB9F}';
     pub const FOLDER: char = '\u{E8B7}';
     pub const TRANSLATE: char = '\u{F2B7}';
+    pub const SNIPPET: char = '\u{E70B}';
+    pub const IMPORT: char = '\u{E8B5}';
+    pub const EXPORT: char = '\u{EDE1}';
 }
 
 /// The built-in providers, and the ones the app talks to again later.
@@ -71,7 +75,7 @@ pub struct Builtins {
 /// Every built-in provider. `data_dir` is where providers keep caches
 /// (exchange rates) and files (clipboard images); `None` keeps nothing
 /// between runs. `store` holds what the user saves (quicklinks, clipboard
-/// history).
+/// history, snippets).
 pub fn all(
     engine: SearchEngine,
     data_dir: Option<PathBuf>,
@@ -93,9 +97,10 @@ pub fn all(
         clipboard.clone(),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(
-            store,
+            store.clone(),
             bangs::Bangs::new(data_dir),
         )),
+        Arc::new(snippets::Snippets::new(store)),
         web.clone(),
         Arc::new(selection::Selection::new(
             web.clone(),

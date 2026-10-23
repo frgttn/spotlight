@@ -65,7 +65,7 @@ impl Launcher {
         }
         // While the launcher still has the foreground, which lets it hand
         // the foreground back.
-        let pasted = paste && clipboard::paste_into(self.previous_window);
+        let pasted = paste && clipboard::paste_into(self.previous_window, 0);
         self.hide(cx);
         if !pasted {
             self.show_hud("Copied to Clipboard".into(), cx);

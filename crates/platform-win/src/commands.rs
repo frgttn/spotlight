@@ -101,6 +101,11 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::PushView(_)
         | Command::SaveQuicklink(_)
         | Command::DeleteQuicklink(_)
+        | Command::SaveSnippet(_)
+        | Command::DeleteSnippet(_)
+        | Command::PasteSnippet { .. }
+        | Command::ImportSnippets
+        | Command::ExportSnippets
         | Command::OpenProviderView { .. }
         | Command::RestoreClip { .. }
         | Command::PinClip { .. }

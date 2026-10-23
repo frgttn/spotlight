@@ -50,6 +50,19 @@ pub(super) enum FieldInput {
     Dropdown { selected: usize, focus: FocusHandle },
 }
 
+impl FormState {
+    /// The key that submits it: Ctrl+Enter when Enter starts a new line in
+    /// one of its fields.
+    pub(super) fn submit_keys(&self) -> &'static str {
+        let has_area = self
+            .view
+            .fields
+            .iter()
+            .any(|field| matches!(field.kind, FieldKind::TextArea { .. }));
+        if has_area { "Ctrl Enter" } else { "Enter" }
+    }
+}
+
 impl FieldInput {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
@@ -97,10 +110,20 @@ impl Screen {
                             placeholder,
                             default,
                             ..
+                        }
+                        | FieldKind::TextArea {
+                            placeholder,
+                            default,
+                            ..
                         } => {
+                            let multiline = matches!(field.kind, FieldKind::TextArea { .. });
                             let (placeholder, default) = (placeholder.clone(), default.clone());
                             FieldInput::Text(cx.new(|cx| {
-                                let mut input = TextInput::new(placeholder, cx);
+                                let mut input = if multiline {
+                                    TextInput::multiline(placeholder, cx)
+                                } else {
+                                    TextInput::new(placeholder, cx)
+                                };
                                 input.set_text(default, cx);
                                 input
                             }))
@@ -145,6 +168,11 @@ impl Launcher {
         let screen = Screen::new(view, cx);
         self.screens.push(screen);
         self.enter_screen(window, cx);
+    }
+
+    /// Opens `view` as if a command had pushed it. For the self-test.
+    pub fn open_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_view(view, window, cx);
     }
 
     /// Back to the screen below (root search at the bottom).
@@ -508,13 +536,15 @@ impl Launcher {
                 .enumerate()
                 .map(|(ix, (field, input))| {
                     let focused = input.focus_handle(cx).is_focused(window);
+                    let area = matches!(field.kind, FieldKind::TextArea { .. });
                     let control: AnyElement = match (input, &field.kind) {
                         (FieldInput::Text(input), _) => div()
                             .flex_1()
-                            .h(px(34.))
+                            .min_w_0()
+                            .when(area, |field| field.py(px(7.)))
+                            .when(!area, |field| field.h(px(34.)).items_center())
                             .px_2()
                             .flex()
-                            .items_center()
                             .rounded(px(6.))
                             .border_1()
                             .border_color(rgba(if focused {
@@ -609,11 +639,14 @@ impl Launcher {
                     };
                     div()
                         .flex()
-                        .items_center()
+                        // A text area's label stays by its first row.
+                        .when(area, |row| row.items_start())
+                        .when(!area, |row| row.items_center())
                         .gap_3()
                         .child(
                             div()
                                 .flex_none()
+                                .when(area, |label| label.pt(px(8.)))
                                 .w(px(110.))
                                 .text_size(px(13.))
                                 .text_color(rgba(theme::TEXT_MUTED))
@@ -647,7 +680,7 @@ impl Launcher {
                     .text_size(px(11.))
                     .text_color(rgba(theme::TEXT_FAINT))
                     .child("Tab moves between fields;")
-                    .child(keycaps("Enter"))
+                    .child(keycaps(form.submit_keys()))
                     .child(SharedString::from(form.view.submit_title.to_lowercase()))
                     .child("·")
                     .child(keycaps("Esc"))

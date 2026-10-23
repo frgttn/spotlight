@@ -1,6 +1,6 @@
 //! The settings window: launcher hotkey, web search engine, smooth scrolling,
-//! which search sources are on, how much clipboard history to keep, start at
-//! login, and every alias and item hotkey.
+//! which search sources are on, how much clipboard history to keep, where
+//! snippet keywords expand, start at login, and every alias and item hotkey.
 //!
 //! The window has no system frame. The header is the drag area and carries
 //! its own close button, so it matches the launcher instead of a stock
@@ -52,6 +52,8 @@ pub struct LauncherState {
     pub sources: Vec<Source>,
     /// Apps whose copies the clipboard history doesn't keep.
     pub ignored_apps: Vec<IgnoredApp>,
+    /// Apps where snippet keywords don't expand.
+    pub excluded_apps: Vec<IgnoredApp>,
 }
 
 /// Reads the launcher's current state; `None` while the launcher can't be
@@ -72,6 +74,10 @@ pub enum SettingsEvent {
     WinVChanged(bool),
     /// Reading the selected text may (or may no longer) use Ctrl+C.
     SelectionCopyChanged(bool),
+    /// Snippet keywords typed in other apps expand (or no longer do).
+    SnippetExpansionChanged(bool),
+    /// The apps where snippet keywords don't expand are now these; save them.
+    ExcludedAppsChanged(Vec<IgnoredApp>),
     /// Start at login was turned on or off here.
     AutostartChanged,
     /// The search provider with this id was turned on or off.
@@ -120,6 +126,11 @@ pub struct Settings {
     ignored_apps: Vec<IgnoredApp>,
     win_v: bool,
     selection_copy: bool,
+    snippet_expansion: bool,
+    excluded_apps: Vec<IgnoredApp>,
+    /// The apps with windows open, to add to `excluded_apps`; `Some` while
+    /// the list is shown.
+    app_choices: Option<Vec<IgnoredApp>>,
     autostart: bool,
     data_path: SharedString,
     focus: FocusHandle,
@@ -139,6 +150,7 @@ impl Settings {
         clipboard_retention: Retention,
         win_v: bool,
         selection_copy: bool,
+        snippet_expansion: bool,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -173,6 +185,7 @@ impl Settings {
             shortcuts,
             sources,
             ignored_apps,
+            excluded_apps,
         } = launcher(cx).unwrap_or_default();
         Self {
             hotkeys,
@@ -196,6 +209,9 @@ impl Settings {
             ignored_apps,
             win_v,
             selection_copy,
+            snippet_expansion,
+            excluded_apps,
+            app_choices: None,
             autostart: autostart::is_enabled(),
             data_path,
             focus,
@@ -217,6 +233,7 @@ impl Settings {
         self.shortcuts = state.shortcuts;
         self.sources = state.sources;
         self.ignored_apps = state.ignored_apps;
+        self.excluded_apps = state.excluded_apps;
         cx.notify();
     }
 
@@ -600,31 +617,145 @@ impl Settings {
             .flex_col()
             .gap_1()
             .children(self.ignored_apps.iter().enumerate().map(|(ix, app)| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(div().text_size(px(13.)).truncate().child(app.name.clone()))
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
-                                    .truncate()
-                                    .child(app.path.clone()),
-                            ),
-                    )
-                    .child(remove_button(
-                        ("unignore", ix),
-                        cx.listener(move |this, _, _, cx| this.unignore_app(ix, cx)),
-                    ))
+                app_row(app).child(remove_button(
+                    ("unignore", ix),
+                    cx.listener(move |this, _, _, cx| this.unignore_app(ix, cx)),
+                ))
             }))
             .into_any_element()
+    }
+
+    fn toggle_snippet_expansion(&mut self, cx: &mut Context<Self>) {
+        self.snippet_expansion = !self.snippet_expansion;
+        cx.emit(SettingsEvent::SnippetExpansionChanged(
+            self.snippet_expansion,
+        ));
+        cx.notify();
+    }
+
+    /// Shows the apps with windows open to pick from, or hides them.
+    fn toggle_app_choices(&mut self, cx: &mut Context<Self>) {
+        self.app_choices = match self.app_choices {
+            Some(_) => None,
+            None => Some(win::apps_with_windows()),
+        };
+        cx.notify();
+    }
+
+    fn exclude_app(&mut self, app: IgnoredApp, cx: &mut Context<Self>) {
+        if !IgnoredApp::contains(&self.excluded_apps, &app.path) {
+            self.excluded_apps.push(app);
+            cx.emit(SettingsEvent::ExcludedAppsChanged(
+                self.excluded_apps.clone(),
+            ));
+        }
+        self.app_choices = None;
+        cx.notify();
+    }
+
+    fn unexclude_app(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.excluded_apps.len() {
+            self.excluded_apps.remove(ix);
+            cx.emit(SettingsEvent::ExcludedAppsChanged(
+                self.excluded_apps.clone(),
+            ));
+            cx.notify();
+        }
+    }
+
+    /// Whether keywords expand, and the apps where they don't.
+    fn snippets_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self
+            .sources
+            .iter()
+            .any(|source| source.id == "snippets" && source.enabled);
+        let description = if on {
+            "Type a snippet's keyword in any app to replace it with the snippet."
+        } else {
+            "Snippets is off under Search sources, so keywords never expand."
+        };
+        let excluded: AnyElement = if self.excluded_apps.is_empty() {
+            div()
+                .px_4()
+                .pb_3()
+                .text_size(px(12.))
+                .text_color(rgba(theme::TEXT_FAINT))
+                .child("None.")
+                .into_any_element()
+        } else {
+            div()
+                .px_4()
+                .pb_3()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(self.excluded_apps.iter().enumerate().map(|(ix, app)| {
+                    app_row(app).child(remove_button(
+                        ("unexclude", ix),
+                        cx.listener(move |this, _, _, cx| this.unexclude_app(ix, cx)),
+                    ))
+                }))
+                .into_any_element()
+        };
+        let choices = self.app_choices.as_ref().map(|apps| {
+            let apps: Vec<&IgnoredApp> = apps
+                .iter()
+                .filter(|app| !IgnoredApp::contains(&self.excluded_apps, &app.path))
+                .collect();
+            let body: AnyElement = if apps.is_empty() {
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgba(theme::TEXT_FAINT))
+                    .child("No other apps have a window open.")
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(apps.into_iter().enumerate().map(|(ix, app)| {
+                        let chosen = app.clone();
+                        chip(("exclude-choice", ix), app.name.clone(), false).on_click(
+                            cx.listener(move |this, _, _, cx| this.exclude_app(chosen.clone(), cx)),
+                        )
+                    }))
+                    .into_any_element()
+            };
+            div()
+                .px_4()
+                .pb_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgba(theme::TEXT_MUTED))
+                        .child("Apps with a window open; click one to add it."),
+                )
+                .child(body)
+        });
+        card()
+            .child(
+                row("Expand keywords while typing", description).child(switch(
+                    "snippet-expansion",
+                    on && self.snippet_expansion,
+                    cx.listener(|this, _, _, cx| this.toggle_snippet_expansion(cx)),
+                )),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Don't expand in",
+                    "Typing a keyword in these apps leaves it as it is.",
+                )
+                .child(
+                    chip("add-excluded", "Add app…", self.app_choices.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_app_choices(cx))),
+                ),
+            )
+            .children(choices)
+            .child(excluded)
     }
 
     /// How long and how many entries to keep: a row of choices for each.
@@ -1116,6 +1247,9 @@ impl Render for Settings {
                     .child(section_label("Selected text"))
                     .child(self.selection_card(cx))
                     .child(div().h(px(6.)))
+                    .child(section_label("Snippets"))
+                    .child(self.snippets_card(cx))
+                    .child(div().h(px(6.)))
                     .child(section_label("System"))
                     .child(system)
                     .child(div().h(px(6.)))
@@ -1251,8 +1385,31 @@ fn custom_engine_input(template: &str, cx: &mut Context<Settings>) -> Entity<Tex
     })
 }
 
+/// An app in a list: its name, and its path under it. Add the button.
+fn app_row(app: &IgnoredApp) -> gpui::Div {
+    div().flex().items_center().gap_3().child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(div().text_size(px(13.)).truncate().child(app.name.clone()))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_FAINT))
+                    .truncate()
+                    .child(app.path.clone()),
+            ),
+    )
+}
+
 /// A choice in a row of options; the selected one is filled with the accent.
-fn chip(id: impl Into<ElementId>, label: &'static str, selected: bool) -> Stateful<gpui::Div> {
+fn chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+) -> Stateful<gpui::Div> {
     div()
         .id(id)
         .h(px(28.))
@@ -1273,7 +1430,7 @@ fn chip(id: impl Into<ElementId>, label: &'static str, selected: bool) -> Statef
                 .text_color(rgba(theme::TEXT_MUTED))
                 .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
         })
-        .child(label)
+        .child(label.into())
 }
 
 /// A clickable field in the shortcut list.

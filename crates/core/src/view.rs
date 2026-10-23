@@ -119,6 +119,13 @@ pub enum FieldKind {
         /// Submitting is refused while it's empty.
         required: bool,
     },
+    /// Text over several lines: Enter starts a new line, Ctrl+Enter submits.
+    TextArea {
+        placeholder: String,
+        default: String,
+        /// Submitting is refused while it's empty.
+        required: bool,
+    },
     Checkbox {
         default: bool,
     },
@@ -142,8 +149,10 @@ impl FormView {
     /// Why the form can't be submitted with `values` yet, naming the field.
     pub fn check(&self, values: &[FieldValue]) -> Result<(), String> {
         for (field, value) in self.fields.iter().zip(values) {
-            if let (FieldKind::Text { required: true, .. }, FieldValue::Text(text)) =
-                (&field.kind, value)
+            if let (
+                FieldKind::Text { required: true, .. } | FieldKind::TextArea { required: true, .. },
+                FieldValue::Text(text),
+            ) = (&field.kind, value)
                 && text.trim().is_empty()
             {
                 return Err(format!("{} is required", field.label));
@@ -192,7 +201,7 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
     let placeholder = format!("{{{id}}}");
     let (text, in_url) = match command {
         Command::OpenUrl(url) => (url, true),
-        Command::Copy(text) => (text, false),
+        Command::Copy(text) | Command::PasteSnippet { text, .. } => (text, false),
         Command::OpenQuicklink { link, .. } => {
             // Quicklinks encode their own way (`%20`, and paths not at all).
             if link.contains(&placeholder) {
@@ -207,6 +216,17 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
                 .into_iter()
                 .chain(link.keyword.as_mut())
                 .chain(link.open_with.as_mut());
+            for field in fields {
+                if *field == placeholder {
+                    *field = value(false);
+                }
+            }
+            return;
+        }
+        Command::SaveSnippet(snippet) => {
+            let fields = [&mut snippet.name, &mut snippet.text]
+                .into_iter()
+                .chain(snippet.keyword.as_mut());
             for field in fields {
                 if *field == placeholder {
                     *field = value(false);
@@ -350,5 +370,23 @@ mod tests {
         assert_eq!(form.check(&empty), Err("Search for is required".into()));
         let filled = [FieldValue::Text("x".into()), FieldValue::Dropdown(0)];
         assert_eq!(form.check(&filled), Ok(()));
+
+        let area = FormView {
+            fields: vec![Field {
+                id: "text".into(),
+                label: "Snippet".into(),
+                kind: FieldKind::TextArea {
+                    placeholder: String::new(),
+                    default: String::new(),
+                    required: true,
+                },
+            }],
+            ..search_form()
+        };
+        assert_eq!(
+            area.check(&[FieldValue::Text("\n \n".into())]),
+            Err("Snippet is required".into())
+        );
+        assert_eq!(area.check(&[FieldValue::Text("a\nb".into())]), Ok(()));
     }
 }

@@ -145,7 +145,7 @@ fn from_automation(window: isize) -> Result<Option<String>, String> {
 /// Waits (up to a second) until no modifier key is held: after an item
 /// hotkey (Ctrl+Alt+S) the user may still hold Alt, and Ctrl+C would become
 /// Ctrl+Alt+C.
-fn wait_for_modifiers() {
+pub(crate) fn wait_for_modifiers() {
     let held = || {
         [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
             .iter()

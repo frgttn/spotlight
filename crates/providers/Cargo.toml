@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-providers"
-description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web, quicklinks, clipboard history"
+description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web, quicklinks, clipboard history, snippets"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

@@ -3,8 +3,10 @@
 pub mod clip;
 pub mod frecency;
 pub mod item;
+pub mod placeholder;
 pub mod provider;
 pub mod quicklink;
+pub mod snippet;
 pub mod view;
 pub mod web;
 
