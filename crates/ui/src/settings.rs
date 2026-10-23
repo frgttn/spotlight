@@ -2,39 +2,47 @@
 //! which search sources are on, how much clipboard history to keep, where
 //! snippet keywords expand, start at login, and every alias and item hotkey.
 //!
-//! The window has no system frame. The header is the drag area and carries
-//! its own close button, so it matches the launcher instead of a stock
-//! Windows dialog.
+//! Laid out like Raycast's: a sidebar with a search field, the general pages
+//! and one page per extension (search provider), and the chosen page on the
+//! right with back and forward buttons. The window has no system frame; the
+//! top bars are the drag area and carry their own close button.
 
-use std::rc::Rc;
+use std::{
+    rc::Rc,
+    sync::{Arc, OnceLock},
+};
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, SharedString, Stateful, Subscription, Task, Window, WindowControlArea, actions,
-    div, prelude::*, px, rgba,
+    FontWeight, Image, ImageFormat, KeyBinding, Pixels, ScrollHandle, SharedString, Stateful,
+    Subscription, Task, Window, WindowControlArea, actions, div, img, prelude::*, px, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     clip::{self, IgnoredApp, Retention},
+    item::Command,
     web::{self, SearchEngine},
 };
 use spotlight_platform_win::{
-    autostart,
+    autostart, commands,
     hotkey::{self, Hotkey, Recorded, SetError},
     win,
 };
 
 use crate::{
-    launcher::{Shortcut, Source},
-    text_input::TextInput,
+    launcher::{ExtensionItem, Shortcut, Source, icon_font},
+    smooth_scroll::{Scroller, capture_wheel},
+    text_input::{self, TextInput},
     theme,
 };
 
 actions!(settings, [Close, Save]);
 
 const CONTEXT: &str = "Settings";
-/// Logical size of the settings window.
-pub const WINDOW_SIZE: (f32, f32) = (600., 560.);
+/// Logical size the settings window opens at.
+pub const WINDOW_SIZE: (f32, f32) = (1040., 720.);
+/// The smallest it can be resized to: the sidebar and a usable page.
+pub const WINDOW_MIN_SIZE: (f32, f32) = (760., 480.);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -48,6 +56,8 @@ pub fn bind_keys(cx: &mut App) {
 pub struct LauncherState {
     /// Items with an alias or a hotkey.
     pub shortcuts: Vec<Shortcut>,
+    /// Every item that can take one, listed on its extension's page.
+    pub items: Vec<ExtensionItem>,
     /// Search providers and whether each is on.
     pub sources: Vec<Source>,
     /// Apps whose copies the clipboard history doesn't keep.
@@ -109,6 +119,8 @@ pub struct Settings {
     launcher: LauncherReader,
     /// Aliases and item hotkeys as last read from the launcher.
     shortcuts: Vec<Shortcut>,
+    /// Every item that can take an alias or a hotkey, by title.
+    items: Vec<ExtensionItem>,
     /// The alias being edited in place: item id and the field.
     editing_alias: Option<(String, Entity<TextInput>)>,
     /// Outcome of the last change in the list: item id, text, and whether it is an error.
@@ -132,10 +144,21 @@ pub struct Settings {
     /// the list is shown.
     app_choices: Option<Vec<IgnoredApp>>,
     autostart: bool,
+    /// The build's version, shown on About.
+    version: &'static str,
     data_path: SharedString,
+    /// Pages visited, for back and forward; `history_ix` is the one shown.
+    history: Vec<Page>,
+    history_ix: usize,
+    /// Filters the sidebar.
+    search: Entity<TextInput>,
+    /// The sidebar's list and the page, animated like the launcher's list
+    /// while smooth scrolling is on.
+    nav_scroll: Scroller,
+    page_scroll: Scroller,
     focus: FocusHandle,
     recorder: FocusHandle,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl EventEmitter<SettingsEvent> for Settings {}
@@ -151,6 +174,7 @@ impl Settings {
         win_v: bool,
         selection_copy: bool,
         snippet_expansion: bool,
+        version: &'static str,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -164,6 +188,7 @@ impl Settings {
         // No title bar draws it, but the taskbar and Alt+Tab still show it.
         window.set_window_title("Spotlight Settings");
         let recorder = cx.focus_handle();
+        let search = cx.new(|cx| TextInput::new("Search settings…", cx));
         // Recording takes every key press system-wide, so it ends as soon as
         // the user clicks elsewhere in the window or switches to another one.
         let subscriptions = [
@@ -178,11 +203,17 @@ impl Settings {
                     this.stop_recording(cx);
                 }
             }),
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, _, _: &text_input::Changed, _, cx| this.search_changed(cx),
+            ),
         ];
         let focus = cx.focus_handle();
-        window.focus(&focus);
+        window.focus(&search.focus_handle(cx));
         let LauncherState {
             shortcuts,
+            items,
             sources,
             ignored_apps,
             excluded_apps,
@@ -194,6 +225,7 @@ impl Settings {
             message: None,
             recording_for: None,
             shortcuts,
+            items,
             launcher,
             editing_alias: None,
             shortcut_message: None,
@@ -213,7 +245,13 @@ impl Settings {
             excluded_apps,
             app_choices: None,
             autostart: autostart::is_enabled(),
+            version,
             data_path,
+            history: vec![Page::General],
+            history_ix: 0,
+            search,
+            nav_scroll: Scroller::new(ScrollHandle::new(), smooth_scrolling),
+            page_scroll: Scroller::new(ScrollHandle::new(), smooth_scrolling),
             focus,
             recorder,
             _subscriptions: subscriptions,
@@ -231,6 +269,7 @@ impl Settings {
             return;
         };
         self.shortcuts = state.shortcuts;
+        self.items = state.items;
         self.sources = state.sources;
         self.ignored_apps = state.ignored_apps;
         self.excluded_apps = state.excluded_apps;
@@ -349,6 +388,7 @@ impl Settings {
         let current = self
             .shortcuts
             .iter()
+            .chain(self.items.iter().map(|item| &item.shortcut))
             .find(|shortcut| shortcut.item_id == item_id)
             .and_then(|shortcut| shortcut.alias.clone())
             .unwrap_or_default();
@@ -385,7 +425,8 @@ impl Settings {
         });
         // The launcher takes the alias away from any other item that had it.
         if let Some(alias) = &alias {
-            for shortcut in &mut self.shortcuts {
+            let items = self.items.iter_mut().map(|item| &mut item.shortcut);
+            for shortcut in self.shortcuts.iter_mut().chain(items) {
                 if shortcut
                     .alias
                     .as_ref()
@@ -395,19 +436,38 @@ impl Settings {
                 }
             }
         }
-        self.set_local(&item_id, |shortcut| shortcut.alias = alias);
+        self.set_local(&item_id, |shortcut| shortcut.alias = alias.clone());
         cx.notify();
     }
 
-    /// Changes the local copy right away. A row left with neither an alias nor
-    /// a hotkey stays until the next refresh, so a slip can be undone in place.
-    fn set_local(&mut self, item_id: &str, change: impl FnOnce(&mut Shortcut)) {
-        if let Some(shortcut) = self
+    /// Changes the local copies right away. A row left with neither an alias
+    /// nor a hotkey stays until the next refresh, so a slip can be undone in
+    /// place; an item that just got its first one joins the Shortcuts page.
+    fn set_local(&mut self, item_id: &str, change: impl Fn(&mut Shortcut)) {
+        let item = self
+            .items
+            .iter_mut()
+            .find(|item| item.shortcut.item_id == item_id);
+        if let Some(item) = item {
+            change(&mut item.shortcut);
+        }
+        match self
             .shortcuts
             .iter_mut()
             .find(|shortcut| shortcut.item_id == item_id)
         {
-            change(shortcut);
+            Some(shortcut) => change(shortcut),
+            None => {
+                if let Some(item) = self
+                    .items
+                    .iter()
+                    .find(|item| item.shortcut.item_id == item_id)
+                {
+                    self.shortcuts.push(item.shortcut.clone());
+                    self.shortcuts
+                        .sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
+                }
+            }
         }
     }
 
@@ -519,6 +579,8 @@ impl Settings {
 
     fn toggle_smooth_scrolling(&mut self, cx: &mut Context<Self>) {
         self.smooth_scrolling = !self.smooth_scrolling;
+        self.nav_scroll.set_enabled(self.smooth_scrolling);
+        self.page_scroll.set_enabled(self.smooth_scrolling);
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
         cx.notify();
     }
@@ -533,22 +595,6 @@ impl Settings {
             enabled: source.enabled,
         });
         cx.notify();
-    }
-
-    /// One row per search provider, each with its switch.
-    fn source_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.sources.iter().enumerate().map(|(ix, source)| {
-            div()
-                .flex()
-                .flex_col()
-                .when(ix > 0, |row| row.child(divider()))
-                .child(row(source.name, source.description).child(switch(
-                    ("source", ix),
-                    source.enabled,
-                    cx.listener(move |this, _, _, cx| this.toggle_source(ix, cx)),
-                )))
-        });
-        card().children(rows)
     }
 
     fn set_clipboard_retention(&mut self, retention: Retention, cx: &mut Context<Self>) {
@@ -574,7 +620,7 @@ impl Settings {
         let description = if on {
             "Apps that don't share their selection get Ctrl+C; the clipboard is put back right after, and terminals are skipped."
         } else {
-            "Selected Text is off under Search sources, so the selection is never read."
+            "The extension is off, so the selection is never read."
         };
         card().child(
             row("Copy the selection when needed", description).child(switch(
@@ -672,7 +718,7 @@ impl Settings {
         let description = if on {
             "Type a snippet's keyword in any app to replace it with the snippet."
         } else {
-            "Snippets is off under Search sources, so keywords never expand."
+            "The extension is off, so keywords never expand."
         };
         let excluded: AnyElement = if self.excluded_apps.is_empty() {
             div()
@@ -839,8 +885,12 @@ impl Settings {
         cx.notify();
     }
 
-    /// Esc: cancels an alias or custom URL edit, otherwise closes the window.
+    /// Esc: clears the search, cancels an alias or custom URL edit, otherwise
+    /// closes the window.
     fn close(&mut self, _: &Close, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.focus_handle(cx).is_focused(window) && !self.query(cx).is_empty() {
+            return self.search.update(cx, |search, cx| search.clear(cx));
+        }
         let editing_engine = self
             .custom_engine
             .as_ref()
@@ -860,60 +910,6 @@ impl Settings {
         } else {
             window.remove_window();
         }
-    }
-
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex_none()
-            .h(px(48.))
-            .pl_5()
-            .pr_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(rgba(theme::HAIRLINE))
-            .child(
-                // Dragging the window works anywhere in the header except the close button.
-                div()
-                    .id("drag")
-                    .window_control_area(WindowControlArea::Drag)
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .size(px(18.))
-                            .rounded(px(5.))
-                            .bg(rgba(theme::ACCENT))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(11.))
-                            .child("S"),
-                    )
-                    .child(div().text_size(px(14.)).child("Spotlight Settings")),
-            )
-            .child(
-                div()
-                    .id("close")
-                    .size(px(32.))
-                    .rounded(px(6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgba(theme::TEXT_MUTED))
-                    .hover(|style| {
-                        style
-                            .bg(rgba(theme::SURFACE_HOVER))
-                            .text_color(rgba(theme::TEXT))
-                    })
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx)))
-                    .child("✕"),
-            )
     }
 
     fn hotkey_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -981,47 +977,79 @@ impl Settings {
                 )
                 .into_any_element();
         }
-        let rows = self.shortcuts.iter().enumerate().map(|(ix, shortcut)| {
-            let message = self
-                .shortcut_message
-                .as_ref()
-                .filter(|(id, _, _)| *id == shortcut.item_id)
-                .map(|(_, text, is_error)| {
-                    div()
-                        .px_4()
-                        .pb_2()
-                        .text_size(px(12.))
-                        .text_color(rgba(if *is_error {
-                            theme::ERROR
-                        } else {
-                            theme::SUCCESS
-                        }))
-                        .child(text.clone())
-                });
-            div()
-                .flex()
-                .flex_col()
-                .when(ix > 0, |row| row.child(divider()))
-                .child(
-                    div()
-                        .min_h(px(48.))
-                        .px_4()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(SharedString::from(shortcut.title.clone())),
-                        )
-                        .child(self.alias_cell(ix, shortcut, cx))
-                        .child(self.hotkey_cell(ix, shortcut, cx)),
-                )
-                .children(message)
-        });
+        let rows = self
+            .shortcuts
+            .iter()
+            .enumerate()
+            .map(|(ix, shortcut)| self.shortcut_row(ix, shortcut, None, None, cx));
         card().children(rows).into_any_element()
+    }
+
+    /// An item's row: its icon if given, title and subtitle, then the alias
+    /// and hotkey cells and the outcome of the last change under them.
+    fn shortcut_row(
+        &self,
+        ix: usize,
+        shortcut: &Shortcut,
+        icon: Option<AnyElement>,
+        subtitle: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let message = self
+            .shortcut_message
+            .as_ref()
+            .filter(|(id, _, _)| *id == shortcut.item_id)
+            .map(|(_, text, is_error)| {
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_size(px(12.))
+                    .text_color(rgba(if *is_error {
+                        theme::ERROR
+                    } else {
+                        theme::SUCCESS
+                    }))
+                    .child(text.clone())
+            });
+        let subtitle = subtitle.map(|subtitle| {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(12.))
+                .text_color(rgba(theme::TEXT_FAINT))
+                .child(SharedString::from(subtitle.to_owned()))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .when(ix > 0, |row| row.child(divider()))
+            .child(
+                div()
+                    .min_h(px(48.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .children(icon)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(shortcut.title.clone())),
+                            )
+                            .children(subtitle),
+                    )
+                    .child(self.alias_cell(ix, shortcut, cx))
+                    .child(self.hotkey_cell(ix, shortcut, cx)),
+            )
+            .children(message)
     }
 
     fn alias_cell(&self, ix: usize, shortcut: &Shortcut, cx: &mut Context<Self>) -> AnyElement {
@@ -1146,9 +1174,426 @@ impl Focusable for Settings {
     }
 }
 
-impl Render for Settings {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hotkey_hint = if self.recording.is_some() {
+/// A page of the window, picked in the sidebar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    General,
+    Extensions,
+    Shortcuts,
+    About,
+    /// The settings of the search provider with this id.
+    Extension(&'static str),
+}
+
+/// How many pixels of scrolling the top bar's title takes to fade in.
+const TITLE_FADE: f32 = 16.;
+
+/// The pages above the extensions in the sidebar.
+const PAGES: [Page; 4] = [
+    Page::General,
+    Page::Extensions,
+    Page::Shortcuts,
+    Page::About,
+];
+
+// Icon colours, after Raycast's.
+const RED: u32 = 0xff5f57ff;
+const ORANGE: u32 = 0xff9f0aff;
+const YELLOW: u32 = 0xe5b000ff;
+const GREEN: u32 = 0x30b158ff;
+const TEAL: u32 = 0x30a8c8ff;
+const BLUE: u32 = 0x0a84ffff;
+const INDIGO: u32 = 0x5e5ce6ff;
+const PURPLE: u32 = 0xaf52deff;
+const PINK: u32 = 0xff375fff;
+const GRAY: u32 = 0x6e6e73ff;
+
+impl Page {
+    /// Its sidebar icon: a Segoe Fluent Icons glyph and the badge colour.
+    fn icon(self) -> (char, u32) {
+        match self {
+            Page::General => ('\u{E713}', GRAY),
+            Page::Extensions => ('\u{EA86}', INDIGO),
+            Page::Shortcuts => ('\u{E765}', GRAY),
+            Page::About => ('\u{E946}', GRAY),
+            Page::Extension(id) => match id {
+                "apps" => ('\u{E71D}', BLUE),
+                "calc" => ('\u{E8EF}', ORANGE),
+                "clipboard" => ('\u{E77F}', RED),
+                "control-panel" => ('\u{E770}', TEAL),
+                "games" => ('\u{E7FC}', GREEN),
+                "quicklinks" => ('\u{E71B}', PINK),
+                "selection" => ('\u{E8B3}', YELLOW),
+                "settings" => ('\u{E713}', GRAY),
+                "snippets" => ('\u{E943}', PURPLE),
+                "spotlight" => ('\u{E721}', INDIGO),
+                "system" => ('\u{E7E8}', RED),
+                "web" => ('\u{E774}', BLUE),
+                _ => ('\u{EA86}', GRAY),
+            },
+        }
+    }
+
+    /// How far down a page with a large centred header its title ends, so
+    /// the top bar shows the title once the page scrolls past it.
+    fn header_height(self) -> Option<f32> {
+        match self {
+            Page::Extension(_) => Some(120.),
+            Page::About => Some(145.),
+            Page::General | Page::Extensions | Page::Shortcuts => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Page::General => "general",
+            Page::Extensions => "extensions",
+            Page::Shortcuts => "shortcuts",
+            Page::About => "about",
+            Page::Extension(id) => id,
+        }
+    }
+
+    /// Settings on the page, so the search finds the page by them.
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            Page::General => &[
+                "Start at login",
+                "Launcher hotkey",
+                "Appearance",
+                "Smooth scrolling",
+            ],
+            Page::Extensions => &["Search sources", "Enabled"],
+            Page::Shortcuts => &["Aliases", "Hotkeys"],
+            Page::About => &[
+                "Version",
+                "Updates",
+                "Changelog",
+                "Website",
+                "GitHub",
+                "Feedback",
+                "Data folder",
+            ],
+            Page::Extension("clipboard") => &["Keep for", "Keep at most", "Win+V", "Ignored apps"],
+            Page::Extension("selection") => &["Copy the selection", "Ctrl+C"],
+            Page::Extension("snippets") => &["Expand keywords", "Don't expand in"],
+            Page::Extension("web") => &["Search engine", "Custom"],
+            Page::Extension(_) => &[],
+        }
+    }
+}
+
+impl Settings {
+    fn page(&self) -> Page {
+        self.history[self.history_ix]
+    }
+
+    fn page_title(&self, page: Page) -> &'static str {
+        match page {
+            Page::General => "General",
+            Page::Extensions => "Extensions",
+            Page::Shortcuts => "Shortcuts",
+            Page::About => "About",
+            Page::Extension(id) => self
+                .sources
+                .iter()
+                .find(|source| source.id == id)
+                .map_or("Extension", |source| source.name),
+        }
+    }
+
+    /// The search text, lowercased and trimmed.
+    fn query(&self, cx: &App) -> String {
+        self.search.read(cx).text().trim().to_lowercase()
+    }
+
+    fn page_matches(&self, page: Page, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let hit = |text: &str| text.to_lowercase().contains(query);
+        hit(self.page_title(page))
+            || page.keywords().iter().any(|keyword| hit(keyword))
+            || match page {
+                Page::Extensions => self.sources.iter().any(|source| hit(source.name)),
+                Page::Shortcuts => self.shortcuts.iter().any(|shortcut| {
+                    hit(&shortcut.title) || shortcut.alias.as_deref().is_some_and(hit)
+                }),
+                Page::Extension(id) => {
+                    self.sources
+                        .iter()
+                        .any(|source| source.id == id && hit(source.description))
+                        || self
+                            .items
+                            .iter()
+                            .any(|item| item.provider == id && item_matches(item, query))
+                }
+                Page::General | Page::About => false,
+            }
+    }
+
+    /// Every page, in sidebar order.
+    fn pages(&self) -> impl Iterator<Item = Page> + '_ {
+        PAGES
+            .into_iter()
+            .chain(self.sources.iter().map(|source| Page::Extension(source.id)))
+    }
+
+    /// Shows the first page the search finds when the one shown doesn't match.
+    fn search_changed(&mut self, cx: &mut Context<Self>) {
+        let query = self.query(cx);
+        let first = self.pages().find(|&page| self.page_matches(page, &query));
+        if !self.page_matches(self.page(), &query)
+            && let Some(first) = first
+        {
+            self.go(first, cx);
+        }
+        cx.notify();
+    }
+
+    fn go(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page == self.page() {
+            return;
+        }
+        self.history.truncate(self.history_ix + 1);
+        self.history.push(page);
+        self.history_ix += 1;
+        self.left_page(cx);
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.history_ix > 0 {
+            self.history_ix -= 1;
+            self.left_page(cx);
+        }
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if self.history_ix + 1 < self.history.len() {
+            self.history_ix += 1;
+            self.left_page(cx);
+        }
+    }
+
+    /// Ends what was going on in the page left behind, and reads the
+    /// launcher again: catalogs still loading when the window opened (apps
+    /// take a moment) have their items by now.
+    fn left_page(&mut self, cx: &mut Context<Self>) {
+        self.stop_recording(cx);
+        self.editing_alias = None;
+        self.app_choices = None;
+        self.page_scroll.reset();
+        self.refresh_from_launcher(cx);
+        cx.notify();
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.query(cx);
+        let general: Vec<_> = PAGES
+            .into_iter()
+            .filter(|&page| self.page_matches(page, &query))
+            .map(|page| self.nav_item(page, cx))
+            .collect();
+        let extensions: Vec<_> = self
+            .sources
+            .iter()
+            .map(|source| Page::Extension(source.id))
+            .filter(|&page| self.page_matches(page, &query))
+            .map(|page| self.nav_item(page, cx))
+            .collect();
+        let nothing = general.is_empty() && extensions.is_empty();
+
+        div()
+            .flex_none()
+            .w(px(264.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(rgba(theme::HAIRLINE))
+            .bg(rgba(0x00000030))
+            .child(
+                div()
+                    .id("sidebar-drag")
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex_none()
+                    .h(px(48.))
+                    .px_5()
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .child("Settings"),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .mx_3()
+                    .mb_3()
+                    .h(px(36.))
+                    .px_2p5()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(rgba(theme::SURFACE_BORDER))
+                    .bg(rgba(theme::SURFACE))
+                    .text_size(px(13.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(icon_font())
+                            .text_size(px(12.))
+                            .text_color(rgba(theme::TEXT_FAINT))
+                            .child("\u{E721}"),
+                    )
+                    .child(div().flex_1().min_w_0().child(self.search.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(self.nav_list(general, extensions, nothing))
+                    .child(capture_wheel(
+                        cx.entity().downgrade(),
+                        |this: &mut Self, delta, cx| wheel(&mut this.nav_scroll, delta, cx),
+                    )),
+            )
+    }
+
+    fn nav_list(
+        &self,
+        general: Vec<Stateful<gpui::Div>>,
+        extensions: Vec<Stateful<gpui::Div>>,
+        nothing: bool,
+    ) -> impl IntoElement {
+        div()
+            .id("nav")
+            .track_scroll(&self.nav_scroll.handle())
+            .size_full()
+            .overflow_y_scroll()
+            .px_3()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(general)
+            .when(!extensions.is_empty(), |nav| {
+                nav.child(div().flex_none().h(px(14.))).children(extensions)
+            })
+            .when(nothing, |nav| {
+                nav.child(
+                    div()
+                        .px_2()
+                        .py_2()
+                        .text_size(px(12.))
+                        .text_color(rgba(theme::TEXT_FAINT))
+                        .child("No matching settings."),
+                )
+            })
+    }
+
+    fn nav_item(&self, page: Page, cx: &mut Context<Self>) -> Stateful<gpui::Div> {
+        let (glyph, color) = page.icon();
+        let selected = page == self.page();
+        div()
+            .id(ElementId::Name(format!("nav-{}", page.key()).into()))
+            .flex_none()
+            .h(px(38.))
+            .px_2p5()
+            .flex()
+            .items_center()
+            .gap_3()
+            .rounded(px(8.))
+            .text_size(px(14.))
+            .cursor_pointer()
+            .when(selected, |item| item.bg(rgba(theme::SURFACE_HOVER)))
+            .when(!selected, |item| {
+                item.hover(|style| style.bg(rgba(theme::SURFACE)))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
+            .child(badge(glyph, color, 24.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(self.page_title(page)),
+            )
+    }
+
+    /// Back, forward, the page title (the drag area), the extension's switch
+    /// on its page, and the minimize and close buttons.
+    fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_back = self.history_ix > 0;
+        let can_forward = self.history_ix + 1 < self.history.len();
+        let page = self.page();
+        // Pages with a large centred header name themselves there, and here
+        // only once it has scrolled away, fading in like Raycast's.
+        let title_opacity = match page.header_height() {
+            Some(header) => ((self.page_scroll.scrolled() - header) / TITLE_FADE).clamp(0., 1.),
+            None => 1.,
+        };
+        let extension_switch = match page {
+            Page::Extension(id) => {
+                self.sources
+                    .iter()
+                    .position(|source| source.id == id)
+                    .map(|ix| {
+                        switch(
+                            ("source", ix),
+                            self.sources[ix].enabled,
+                            cx.listener(move |this, _, _, cx| this.toggle_source(ix, cx)),
+                        )
+                        .mr_2()
+                    })
+            }
+            _ => None,
+        };
+        div()
+            .flex_none()
+            .h(px(48.))
+            .pl_3()
+            .pr_2()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .child(
+                icon_button("back", '\u{E72B}', can_back)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+            )
+            .child(
+                icon_button("forward", '\u{E72A}', can_forward)
+                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+            )
+            .child(
+                // Dragging the window works anywhere here but on the buttons.
+                div()
+                    .id("drag")
+                    .window_control_area(WindowControlArea::Drag)
+                    .flex_1()
+                    .h_full()
+                    .pl_2()
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .child(div().opacity(title_opacity).child(self.page_title(page))),
+            )
+            .children(extension_switch)
+            .child(
+                icon_button("minimize", '\u{E921}', true)
+                    .on_click(|_, window, _| window.minimize_window()),
+            )
+            .child(
+                icon_button("close", '\u{E8BB}', true)
+                    .on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx))),
+            )
+    }
+
+    fn general_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let hotkey_hint = if self.recording.is_some() && self.recording_for.is_none() {
             "Press the keys now, or Esc to cancel."
         } else {
             "Opens and closes the search window. Click to change."
@@ -1165,48 +1610,333 @@ impl Render for Settings {
                 }))
                 .child(text)
         });
-
-        let launcher = card()
-            .child(row("Launcher hotkey", hotkey_hint).child(self.hotkey_control(cx)))
-            .children(message)
-            .child(divider())
-            .child(row(
-                "Web search",
-                "When nothing else fits, the last result searches the web with this.",
-            ))
-            .child(self.engine_control(cx))
-            .child(divider())
-            .child(
-                row(
-                    "Smooth scrolling",
-                    "Animate the result list when you scroll or move the selection.",
+        vec![
+            card()
+                .child(
+                    row(
+                        "Start at Login",
+                        "Run Spotlight in the background when you sign in.",
+                    )
+                    .child(switch(
+                        "autostart",
+                        self.autostart,
+                        cx.listener(|this, _, _, cx| this.toggle_autostart(cx)),
+                    )),
                 )
-                .child(switch(
-                    "smooth-scrolling",
-                    self.smooth_scrolling,
-                    cx.listener(|this, _, _, cx| this.toggle_smooth_scrolling(cx)),
-                )),
-            );
+                .child(divider())
+                .child(row("Launcher Hotkey", hotkey_hint).child(self.hotkey_control(cx)))
+                .children(message)
+                .into_any_element(),
+            section_title("Appearance"),
+            card()
+                .child(
+                    row(
+                        "Smooth Scrolling",
+                        "Animate the result list when you scroll or move the selection.",
+                    )
+                    .child(switch(
+                        "smooth-scrolling",
+                        self.smooth_scrolling,
+                        cx.listener(|this, _, _, cx| this.toggle_smooth_scrolling(cx)),
+                    )),
+                )
+                .into_any_element(),
+        ]
+    }
 
-        let shortcuts_hint = if self.recording.is_some() && self.recording_for.is_some() {
+    /// Every extension with its switch; a click elsewhere on a row opens its page.
+    fn extensions_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let count = self.sources.len();
+        let rows = self.sources.iter().enumerate().map(|(ix, source)| {
+            let page = Page::Extension(source.id);
+            let (glyph, color) = page.icon();
+            div()
+                .flex()
+                .flex_col()
+                .when(ix > 0, |row| row.child(divider()))
+                .child(
+                    div()
+                        .id(("extension", ix))
+                        .min_h(px(54.))
+                        .px_4()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .cursor_pointer()
+                        .map(|row| card_row_corners(row, ix, count))
+                        .hover(|style| style.bg(rgba(theme::SURFACE)))
+                        .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
+                        .child(badge(glyph, color, 26.))
+                        .child(text_block(source.name, source.description))
+                        .child(switch(
+                            ("source", ix),
+                            source.enabled,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_source(ix, cx)
+                            }),
+                        )),
+                )
+        });
+        vec![
+            hint(
+                "Turned off, an extension adds nothing to the search. Click one for its settings.",
+            ),
+            card().children(rows).into_any_element(),
+        ]
+    }
+
+    /// What to do in a list of aliases and hotkeys right now, or `idle`.
+    fn shortcuts_hint(&self, idle: &'static str) -> &'static str {
+        if self.recording.is_some() && self.recording_for.is_some() {
             "Press the keys now, or Esc to cancel."
         } else if self.editing_alias.is_some() {
             "Enter saves (empty removes the alias), Esc cancels."
         } else {
-            "Click an alias or hotkey to change it."
-        };
+            idle
+        }
+    }
 
-        let system = card().child(
-            row(
-                "Start at login",
-                "Run Spotlight in the background when you sign in.",
-            )
-            .child(switch(
-                "autostart",
-                self.autostart,
-                cx.listener(|this, _, _, cx| this.toggle_autostart(cx)),
-            )),
-        );
+    fn shortcuts_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let hint_text = self
+            .shortcuts_hint("Aliases and hotkeys of apps and commands. Click one to change it.");
+        vec![hint(hint_text), self.shortcut_list(cx)]
+    }
+
+    /// The extension's items with their alias and hotkey cells, like
+    /// Raycast's. While the search finds some of them, only those.
+    fn extension_items(&self, id: &'static str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let items: Vec<&ExtensionItem> = self
+            .items
+            .iter()
+            .filter(|item| item.provider == id)
+            .collect();
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let query = self.query(cx);
+        let found: Vec<&ExtensionItem> = items
+            .iter()
+            .copied()
+            .filter(|item| !query.is_empty() && item_matches(item, &query))
+            .collect();
+        let shown = if found.is_empty() { items } else { found };
+        let rows: Vec<_> = shown
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                self.shortcut_row(
+                    ix,
+                    &item.shortcut,
+                    Some(item_icon(item)),
+                    item.subtitle.as_deref(),
+                    cx,
+                )
+            })
+            .collect();
+        vec![
+            div()
+                .pt_3()
+                .px_1()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgba(theme::TEXT_MUTED))
+                        .child(format!("{} · {}", items_heading(id), shown.len())),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgba(theme::TEXT_FAINT))
+                        .child(self.shortcuts_hint("Click an alias or hotkey to change it.")),
+                )
+                .into_any_element(),
+            card().children(rows).into_any_element(),
+        ]
+    }
+
+    /// The logo, name and version, then updates, links and where the data is.
+    fn about_page(&self) -> Vec<AnyElement> {
+        let version = format!("v{}", self.version);
+        let mut links = vec![
+            link_row("website", '\u{E774}', "Website", WEBSITE),
+            link_row("github", '\u{E943}', "GitHub", REPOSITORY),
+            link_row(
+                "feedback",
+                '\u{E8BD}',
+                "Send Feedback",
+                concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new"),
+            ),
+        ];
+        if let Some(profile) = X_PROFILE {
+            links.push(link_row("x", '\u{E8F2}', "Twitter / X", profile));
+        }
+        let count = links.len();
+        let links = links.into_iter().enumerate().map(|(ix, link)| {
+            div()
+                .flex()
+                .flex_col()
+                .when(ix > 0, |row| row.child(divider()))
+                .child(card_row_corners(link, ix, count))
+        });
+        vec![
+            div()
+                .pt_4()
+                .pb_2()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .child(img(logo()).size(px(88.)).flex_none())
+                .child(
+                    div()
+                        .pt_2()
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Spotlight"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgba(theme::TEXT_MUTED))
+                        .child(self.version),
+                )
+                .child(
+                    div()
+                        .pt_1()
+                        .text_size(px(12.))
+                        .text_color(rgba(theme::TEXT_FAINT))
+                        .child("Open source under MIT or Apache-2.0."),
+                )
+                .into_any_element(),
+            section_title("Updates"),
+            card()
+                .child(row("Spotlight Updates", version).child(
+                    button("check-updates", "Check now").on_click(|_, _, _| {
+                        open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest"))
+                    }),
+                ))
+                .child(divider())
+                .child(card_row_corners(
+                    link_row(
+                        "changelog",
+                        '\u{E8A5}',
+                        "Open Changelog",
+                        concat!(env!("CARGO_PKG_REPOSITORY"), "/releases"),
+                    ),
+                    1,
+                    2,
+                ))
+                .into_any_element(),
+            section_title("Links"),
+            card().children(links).into_any_element(),
+            section_title("Data"),
+            card()
+                .child(row("Data Folder", self.data_path.clone()))
+                .into_any_element(),
+        ]
+    }
+
+    /// The extension's icon, name and description, then its own settings if
+    /// it has any.
+    fn extension_page(&self, id: &'static str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(source) = self.sources.iter().find(|source| source.id == id) else {
+            return vec![hint("This extension isn't loaded.")];
+        };
+        let (glyph, color) = Page::Extension(id).icon();
+        // Centred like Raycast's: the icon, the name and what it does. Its
+        // switch is in the top bar.
+        let mut body = vec![
+            div()
+                .pt_4()
+                .pb_6()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(badge(glyph, color, 64.))
+                .child(
+                    div()
+                        .pt_2()
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(source.name),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgba(theme::TEXT_MUTED))
+                        .child(if source.enabled {
+                            source.description
+                        } else {
+                            "Turned off: it adds nothing to the search."
+                        }),
+                )
+                .into_any_element(),
+        ];
+        match id {
+            "clipboard" => body.extend([
+                section_title("History"),
+                self.clipboard_card(cx).into_any_element(),
+            ]),
+            "selection" => body.push(self.selection_card(cx).into_any_element()),
+            "snippets" => body.extend([
+                section_title("Expansion"),
+                self.snippets_card(cx).into_any_element(),
+            ]),
+            "web" => body.extend([
+                section_title("Search Engine"),
+                card()
+                    .child(row(
+                        "Web Search",
+                        "When nothing else fits, the last result searches the web with this.",
+                    ))
+                    .child(self.engine_control(cx))
+                    .into_any_element(),
+            ]),
+            _ => {}
+        }
+        let items = self.extension_items(id, cx);
+        if body.len() == 1 && items.is_empty() {
+            body.push(
+                div()
+                    .flex()
+                    .justify_center()
+                    .text_size(px(12.))
+                    .text_color(rgba(theme::TEXT_FAINT))
+                    .child(if source.enabled {
+                        "This extension has no other settings."
+                    } else {
+                        "Turn it on to see its items."
+                    })
+                    .into_any_element(),
+            );
+        }
+        body.extend(items);
+        body
+    }
+}
+
+impl Render for Settings {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Both run, so neither waits on the other's frame.
+        let nav_moving = self.nav_scroll.tick();
+        if self.page_scroll.tick() || nav_moving {
+            window.request_animation_frame();
+        }
+        let page = self.page();
+        let body = match page {
+            Page::General => self.general_page(cx),
+            Page::Extensions => self.extensions_page(cx),
+            Page::Shortcuts => self.shortcuts_page(cx),
+            Page::About => self.about_page(),
+            Page::Extension(id) => self.extension_page(id, cx),
+        };
 
         div()
             .key_context(CONTEXT)
@@ -1214,130 +1944,322 @@ impl Render for Settings {
             .on_action(cx.listener(Self::save))
             .size_full()
             .flex()
-            .flex_col()
             .bg(rgba(theme::BACKGROUND_TINT))
             .text_color(rgba(theme::TEXT))
             .text_size(px(14.))
-            .child(self.header(cx))
+            .child(self.sidebar(cx))
             .child(
-                // Focus lives below the header: an element that tracks focus
-                // claims mouse-downs on it, and a claimed mouse-down in the
-                // header would stop Windows from starting a window drag.
                 div()
-                    .id("content")
-                    .track_focus(&self.focus)
                     .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pt_4()
-                    .pb_2()
+                    .min_w_0()
+                    .h_full()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .child(section_label("Launcher"))
-                    .child(launcher)
-                    .child(div().h(px(6.)))
-                    .child(section_label("Search sources"))
-                    .child(self.source_list(cx))
-                    .child(div().h(px(6.)))
-                    .child(section_label("Clipboard history"))
-                    .child(self.clipboard_card(cx))
-                    .child(div().h(px(6.)))
-                    .child(section_label("Selected text"))
-                    .child(self.selection_card(cx))
-                    .child(div().h(px(6.)))
-                    .child(section_label("Snippets"))
-                    .child(self.snippets_card(cx))
-                    .child(div().h(px(6.)))
-                    .child(section_label("System"))
-                    .child(system)
-                    .child(div().h(px(6.)))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .gap_4()
-                            .child(section_label("Aliases & hotkeys"))
-                            .child(
-                                div()
-                                    .px_1()
-                                    .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
-                                    .child(shortcuts_hint),
-                            ),
-                    )
-                    .child(self.shortcut_list(cx)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .px_5()
-                    .py_3()
-                    .flex()
-                    .justify_between()
-                    .gap_4()
-                    .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .child(self.top_bar(cx))
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(format!("Data: {}", self.data_path)),
-                    )
-                    .child(div().flex_none().child("Esc to close")),
+                            .min_h_0()
+                            .relative()
+                            .child(
+                                // Focus lives below the top bar: an element
+                                // that tracks focus claims mouse-downs on it,
+                                // and a claimed mouse-down in the bar would
+                                // stop Windows from starting a window drag.
+                                div()
+                                    .id("page")
+                                    .track_focus(&self.focus)
+                                    .track_scroll(&self.page_scroll.handle())
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .px_5()
+                                    .pt_1()
+                                    .pb_5()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .children(body),
+                            )
+                            .child(capture_wheel(
+                                cx.entity().downgrade(),
+                                |this: &mut Self, delta, cx| {
+                                    wheel(&mut this.page_scroll, delta, cx)
+                                },
+                            )),
+                    ),
             )
     }
 }
 
-fn section_label(text: &'static str) -> impl IntoElement {
+/// Animates a wheel notch while smooth scrolling is on; returns whether it did.
+fn wheel(scroller: &mut Scroller, delta: Pixels, cx: &mut Context<Settings>) -> bool {
+    if !scroller.is_enabled() {
+        return false;
+    }
+    scroller.scroll_by(delta);
+    cx.notify();
+    true
+}
+
+/// The project's home, from the workspace manifest.
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+/// The website: the repository until the project has a site of its own.
+const WEBSITE: &str = REPOSITORY;
+/// The X (Twitter) profile; About shows no row for it while there is none.
+const X_PROFILE: Option<&str> = None;
+
+/// The app's logo (the exe icon's artwork), decoded once.
+fn logo() -> Arc<Image> {
+    static LOGO: OnceLock<Arc<Image>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Svg,
+            include_bytes!("../../app/assets/icon.svg").to_vec(),
+        ))
+    })
+    .clone()
+}
+
+/// Opens `url` in the default browser, off the UI thread.
+fn open_url(url: &str) {
+    // Failures are logged by `commands`; there is nowhere better to show them.
+    let _ = commands::spawn(Command::OpenUrl(url.to_owned()));
+}
+
+/// A row that opens `url`: a glyph, the title, and an arrow for leaving the app.
+fn link_row(
+    id: &'static str,
+    glyph: char,
+    title: &'static str,
+    url: &'static str,
+) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(46.))
+        .px_4()
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(theme::SURFACE)))
+        .on_click(move |_, _, _| open_url(url))
+        .child(
+            div()
+                .flex_none()
+                .w(px(18.))
+                .font_family(icon_font())
+                .text_size(px(15.))
+                .text_color(rgba(theme::TEXT_MUTED))
+                .child(SharedString::from(glyph.to_string())),
+        )
+        .child(div().flex_1().child(title))
+        .child(
+            div()
+                .flex_none()
+                .font_family(icon_font())
+                .text_size(px(11.))
+                .text_color(rgba(theme::TEXT_FAINT))
+                .child("\u{E8A7}"),
+        )
+}
+
+/// A plain push button.
+fn button(id: &'static str, label: &'static str) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(30.))
+        .px_4()
+        .flex()
+        .items_center()
+        .rounded(px(7.))
+        .bg(rgba(theme::SURFACE_HOVER))
+        .text_size(px(13.))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xffffff26)))
+        .child(label)
+}
+
+/// A heading between the cards of a page.
+fn section_title(text: &'static str) -> AnyElement {
+    div()
+        .pt_3()
+        .px_1()
+        .text_size(px(13.))
+        .text_color(rgba(theme::TEXT_MUTED))
+        .child(text)
+        .into_any_element()
+}
+
+/// A line of help above a card.
+fn hint(text: &'static str) -> AnyElement {
     div()
         .px_1()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(rgba(theme::TEXT_FAINT))
-        .child(text.to_uppercase())
+        .child(text)
+        .into_any_element()
 }
+
+/// What an extension's items are, as the heading of their list.
+fn items_heading(id: &str) -> &'static str {
+    match id {
+        "apps" => "Applications",
+        "games" => "Games",
+        "quicklinks" => "Quicklinks",
+        "snippets" => "Snippets",
+        "settings" | "control-panel" => "Pages",
+        _ => "Commands",
+    }
+}
+
+fn item_matches(item: &ExtensionItem, query: &str) -> bool {
+    item.shortcut.title.to_lowercase().contains(query)
+        || item
+            .shortcut
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.to_lowercase().contains(query))
+}
+
+/// An item's icon in the list: its own, its glyph, or its initial.
+fn item_icon(item: &ExtensionItem) -> AnyElement {
+    if let Some(image) = &item.image {
+        return img(image.clone())
+            .size(px(20.))
+            .flex_none()
+            .into_any_element();
+    }
+    let tile = div()
+        .flex_none()
+        .size(px(20.))
+        .rounded(px(5.))
+        .bg(rgba(theme::SURFACE_HOVER))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(11.));
+    match item.glyph {
+        Some(glyph) => tile
+            .font_family(icon_font())
+            .child(SharedString::from(glyph.to_string())),
+        None => tile.child(SharedString::from(
+            item.shortcut
+                .title
+                .chars()
+                .next()
+                .map(|ch| ch.to_uppercase().collect::<String>())
+                .unwrap_or_default(),
+        )),
+    }
+    .into_any_element()
+}
+
+/// A Segoe Fluent Icons glyph, white on a rounded square of `color`.
+fn badge(glyph: char, color: u32, size: f32) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(size))
+        .rounded(px(size * 0.26))
+        .bg(rgba(color))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(icon_font())
+        .text_size(px(size * 0.55))
+        .text_color(rgba(0xffffffff))
+        .child(SharedString::from(glyph.to_string()))
+}
+
+/// A small square button with a glyph; a disabled one is dimmed and inert.
+fn icon_button(id: &'static str, glyph: char, enabled: bool) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(28.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(icon_font())
+        .text_size(px(11.))
+        .when(enabled, |button| {
+            button
+                .text_color(rgba(theme::TEXT_MUTED))
+                .cursor_pointer()
+                .hover(|style| {
+                    style
+                        .bg(rgba(theme::SURFACE_HOVER))
+                        .text_color(rgba(theme::TEXT))
+                })
+        })
+        .when(!enabled, |button| button.text_color(rgba(theme::HAIRLINE)))
+        .child(SharedString::from(glyph.to_string()))
+}
+
+/// Corner radius of a card.
+const CARD_RADIUS: f32 = 10.;
 
 fn card() -> gpui::Div {
     div()
         .flex()
         .flex_col()
-        .rounded(px(10.))
+        .rounded(px(CARD_RADIUS))
         .border_1()
         .border_color(rgba(theme::SURFACE_BORDER))
         .bg(rgba(theme::SURFACE))
 }
 
+/// Rounds the outer corners of row `ix` of `count` in a card, so a hover fill
+/// follows the card's corners at its ends and stays square between rows.
+fn card_row_corners<E: Styled>(row: E, ix: usize, count: usize) -> E {
+    // Inside the card's 1 px border.
+    let radius = px(CARD_RADIUS - 1.);
+    let row = if ix == 0 { row.rounded_t(radius) } else { row };
+    if ix + 1 == count {
+        row.rounded_b(radius)
+    } else {
+        row
+    }
+}
+
+/// A line between the rows of a card, edge to edge like Raycast's, so a
+/// row's hover fill meets it without a notch at either end.
 fn divider() -> impl IntoElement {
-    div().mx_4().h(px(1.)).bg(rgba(theme::HAIRLINE))
+    div().flex_none().h(px(1.)).bg(rgba(theme::HAIRLINE))
 }
 
 /// A settings row: title and description on the left, the control on the right.
-fn row(title: &'static str, description: &'static str) -> gpui::Div {
+fn row(title: impl Into<SharedString>, description: impl Into<SharedString>) -> gpui::Div {
     div()
-        .min_h(px(60.))
+        .min_h(px(54.))
         .px_4()
         .py_2()
         .flex()
         .items_center()
         .justify_between()
         .gap_6()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(title)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_MUTED))
-                        .child(description),
-                ),
-        )
+        .child(text_block(title, description))
+}
+
+/// A title with a smaller description under it (none when empty).
+fn text_block(title: impl Into<SharedString>, description: impl Into<SharedString>) -> gpui::Div {
+    let description = description.into();
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(title.into())
+        .when(!description.is_empty(), |block| {
+            block.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .child(description),
+            )
+        })
 }
 
 fn keycap(label: String) -> impl IntoElement {

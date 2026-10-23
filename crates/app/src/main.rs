@@ -406,6 +406,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
     }
 
     let (width, height) = settings::WINDOW_SIZE;
+    let (min_width, min_height) = settings::WINDOW_MIN_SIZE;
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
@@ -414,8 +415,9 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
         ))),
         // Frameless: the view draws its own header with a drag area and close button.
         titlebar: None,
-        is_resizable: false,
-        is_minimizable: false,
+        // The edges still resize it: GPUI leaves them to Windows.
+        is_resizable: true,
+        window_min_size: Some(size(px(min_width), px(min_height))),
         window_background: WindowBackgroundAppearance::Blurred,
         app_id: Some("spotlight".into()),
         ..Default::default()
@@ -432,6 +434,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.win_v.get(),
                 view_state.selection_copy.get(),
                 view_state.snippet_expansion.get(),
+                env!("SPOTLIGHT_VERSION"),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
                 window,
@@ -625,6 +628,7 @@ fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
         let launcher = launcher.read(cx).ok()?;
         Some(LauncherState {
             shortcuts: launcher.shortcuts(),
+            items: launcher.extension_items(),
             sources: launcher.sources(),
             ignored_apps: launcher.ignored_clip_apps(),
             excluded_apps: launcher.excluded_snippet_apps(),

@@ -186,6 +186,19 @@ pub struct Shortcut {
     pub hotkey: Option<Hotkey>,
 }
 
+/// An item that can take an alias or a hotkey, as its extension's page in
+/// the settings window lists it.
+#[derive(Clone)]
+pub struct ExtensionItem {
+    /// The id of the search provider it comes from.
+    pub provider: String,
+    pub shortcut: Shortcut,
+    pub subtitle: Option<String>,
+    /// Its icon once extracted, or the glyph it is drawn with.
+    pub image: Option<Arc<RenderImage>>,
+    pub glyph: Option<char>,
+}
+
 /// A search provider, as the settings window lists it to turn it on or off.
 #[derive(Clone)]
 pub struct Source {
@@ -1479,6 +1492,34 @@ impl Launcher {
             .collect();
         shortcuts.sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
         shortcuts
+    }
+
+    /// Every item that can take an alias or a hotkey (the ones that do
+    /// something), by title. A provider that is off has none loaded.
+    pub fn extension_items(&self) -> Vec<ExtensionItem> {
+        let mut items: Vec<ExtensionItem> = self
+            .search
+            .catalog()
+            .iter()
+            .filter(|item| !item.actions.is_empty())
+            .map(|item| ExtensionItem {
+                provider: item.id.split(':').next().unwrap_or_default().to_owned(),
+                shortcut: Shortcut {
+                    item_id: item.id.clone(),
+                    title: item.title.clone(),
+                    alias: self.aliases.get(&item.id).cloned(),
+                    hotkey: self.item_hotkeys.get(&item.id).copied(),
+                },
+                subtitle: item.subtitle.clone(),
+                image: self.icons.get(&item.id).cloned(),
+                glyph: match item.icon {
+                    Icon::Glyph(glyph) => Some(glyph),
+                    _ => None,
+                },
+            })
+            .collect();
+        items.sort_by_cached_key(|item| item.shortcut.title.to_lowercase());
+        items
     }
 
     fn set_alias(&mut self, item_id: &str, alias: Option<String>, cx: &mut Context<Self>) {
