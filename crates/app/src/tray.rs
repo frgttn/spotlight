@@ -95,18 +95,18 @@ fn tooltip(hotkey: &str) -> String {
     format!("Spotlight ({hotkey})")
 }
 
-/// The logo (two interlocked half rings, from `assets/logo.svg`) on a
-/// transparent background, drawn at 32 px with 4x4 supersampling. Dark on a
-/// light taskbar, light on a dark one.
+/// The logo (two interlocked half rings, the same geometry as `assets/logo-white.svg`
+/// and `assets/logo-black.svg`) on a transparent background, drawn at 32 px with
+/// 4x4 supersampling. White on a dark taskbar, black on a light one.
 fn icon() -> Result<Icon, String> {
     const SIZE: u32 = 32;
     const SAMPLES: u32 = 4;
     // Logo coordinates are on a 100 x 100 grid; this many pixels per unit.
     const SCALE: f32 = 0.38;
     let mark: [u8; 3] = if spotlight_platform_win::system::taskbar_dark() {
-        [242, 244, 243]
+        [255, 255, 255]
     } else {
-        [39, 47, 45]
+        [0, 0, 0]
     };
 
     // Right half ring around (50, 36.75) and left half ring around (50, 63.25),
