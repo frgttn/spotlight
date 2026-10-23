@@ -5563,6 +5563,7 @@ name = "spotlight-providers"
 version = "0.0.0"
 dependencies = [
  "fend-core",
+ "serde_json",
  "spotlight-core",
  "spotlight-platform-win",
 ]

@@ -10,5 +10,6 @@ publish.workspace = true
 
 [dependencies]
 fend-core.workspace = true
+serde_json.workspace = true
 spotlight-core.workspace = true
 spotlight-platform-win.workspace = true

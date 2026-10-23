@@ -17,6 +17,7 @@ workspace = true
 features = [
     "Devices_Radios",
     "Foundation_Collections",
+    "Web_Http",
     "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

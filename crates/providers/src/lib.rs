@@ -3,10 +3,11 @@
 
 pub mod apps;
 pub mod calc;
+pub mod rates;
 pub mod system;
 pub mod web;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use spotlight_core::{provider::Provider, web::SearchEngine};
 
@@ -35,12 +36,17 @@ mod glyph {
 
 /// Every built-in provider, in the order their answers and catalogs are
 /// listed, and the web provider again, to change its search engine later.
-pub fn all(engine: SearchEngine) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
+/// `data_dir` is where providers keep caches (exchange rates); `None` keeps
+/// nothing between runs.
+pub fn all(
+    engine: SearchEngine,
+    data_dir: Option<PathBuf>,
+) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
     let web = Arc::new(web::Web::new(engine));
     let providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(apps::Apps),
         Arc::new(system::System),
-        Arc::new(calc::Calculator),
+        Arc::new(calc::Calculator::new(rates::Rates::new(data_dir))),
         web.clone(),
     ];
     (providers, web)

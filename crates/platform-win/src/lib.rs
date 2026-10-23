@@ -15,5 +15,6 @@ pub mod hotkey;
 pub mod icons;
 pub mod instance;
 pub mod metrics;
+pub mod net;
 pub mod system;
 pub mod win;

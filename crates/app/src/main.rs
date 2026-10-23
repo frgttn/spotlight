@@ -19,7 +19,7 @@ mod tray;
 use std::{
     cell::{Cell, RefCell},
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -102,7 +102,8 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0usize);
     let show_on_start = env::var_os("SPOTLIGHT_SHOW_ON_START").is_some();
-    let (store, data_path) = open_store();
+    let data_dir = data_dir();
+    let (store, data_path) = open_store(data_dir.as_deref());
     let store = store.map(|store| Arc::new(Mutex::new(store)));
 
     let setting = |key: &str| {
@@ -157,7 +158,7 @@ fn main() {
         let launcher_store = store.clone();
         let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
-        let (providers, web) = spotlight_providers::all(search_engine.clone());
+        let (providers, web) = spotlight_providers::all(search_engine.clone(), data_dir.clone());
         let window = cx
             .open_window(
                 WindowOptions {
@@ -457,14 +458,18 @@ fn hotkey_label(hotkey: Option<Hotkey>) -> SharedString {
     hotkey.map_or("no hotkey".into(), |hotkey| hotkey.to_string().into())
 }
 
-/// `%APPDATA%\spotlight\spotlight.db`, or `SPOTLIGHT_DATA_DIR`. Without a
-/// database the launcher still works; it just doesn't remember usage or settings.
-/// Also returns the path for display.
-fn open_store() -> (Option<Store>, SharedString) {
-    let Some(dir) = env::var_os("SPOTLIGHT_DATA_DIR")
+/// `%APPDATA%\spotlight`, or `SPOTLIGHT_DATA_DIR`: the database and caches.
+fn data_dir() -> Option<PathBuf> {
+    env::var_os("SPOTLIGHT_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("spotlight")))
-    else {
+}
+
+/// `spotlight.db` in the data folder ([`data_dir`]). Without a database the
+/// launcher still works; it just doesn't remember usage or settings.
+/// Also returns the path for display.
+fn open_store(dir: Option<&Path>) -> (Option<Store>, SharedString) {
+    let Some(dir) = dir else {
         return (None, "unavailable (APPDATA is not set)".into());
     };
     let path = dir.join("spotlight.db");
