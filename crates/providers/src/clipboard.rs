@@ -16,12 +16,12 @@ use std::{
 
 use image::{ImageFormat, imageops::FilterType};
 use spotlight_core::{
-    clip::{self, ClipKind, Retention},
+    clip::{self, ClipKind, IGNORED_APPS_SETTING, IgnoredApp, Retention},
     frecency,
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
-    view::{ListView, Preview, PreviewBody, View},
+    view::{ListFilter, ListView, Preview, PreviewBody, View},
 };
 use spotlight_platform_win::clipboard::{Content, Copied};
 use spotlight_store::{Clip, Store};
@@ -35,7 +35,11 @@ const HISTORY_VIEW: &str = "history";
 const THUMBNAIL_SIZE: u32 = 640;
 /// How much of an entry's text search looks at, and the preview shows.
 const SEARCHED_CHARS: usize = 500;
-const PREVIEW_CHARS: usize = 20_000;
+const PREVIEW_CHARS: usize = 10_000;
+/// Keyword of pinned entries, for the Pinned filter. The kind's keyword is
+/// `type:` and the kind ([`Tag::keyword`]): prefixed, so text that happens to
+/// be "image" isn't filtered as an image.
+const PINNED_KEYWORD: &str = "is:pinned";
 
 pub struct ClipboardHistory {
     store: Option<Arc<Mutex<Store>>>,
@@ -84,6 +88,11 @@ impl ClipboardHistory {
         let Some(store) = &self.store else {
             return;
         };
+        if let Some((_, path)) = &copied.app
+            && self.is_ignored(store, path)
+        {
+            return;
+        }
         let (name, path) = copied.app.unzip();
         let mut clip = Clip {
             id: 0,
@@ -127,6 +136,18 @@ impl ClipboardHistory {
             eprintln!("[clipboard] could not save a clipboard entry: {err}");
         }
         self.trim();
+    }
+
+    /// Whether the user asked not to keep copies from the program at `path`.
+    /// Read from the settings each time, since the launcher changes it.
+    fn is_ignored(&self, store: &Mutex<Store>, path: &str) -> bool {
+        let ignored = store
+            .lock()
+            .ok()
+            .and_then(|store| store.setting(IGNORED_APPS_SETTING).ok().flatten())
+            .map(|text| IgnoredApp::parse_list(&text))
+            .unwrap_or_default();
+        IgnoredApp::contains(&ignored, path)
     }
 
     /// Drops the entries the retention no longer keeps, with their images.
@@ -206,6 +227,16 @@ impl ClipboardHistory {
             placeholder: Some("Search clipboard history…".into()),
             items: clips.iter().map(|clip| item(clip, now)).collect(),
             empty: Some(empty.into()),
+            filters: [
+                ListFilter::new("All", None),
+                ListFilter::new("Pinned", Some(PINNED_KEYWORD)),
+            ]
+            .into_iter()
+            .chain(
+                [Tag::Text, Tag::Link, Tag::Image, Tag::File, Tag::Color]
+                    .map(|tag| ListFilter::new(tag.plural(), Some(&tag.keyword()))),
+            )
+            .collect(),
         }
     }
 }
@@ -275,6 +306,20 @@ impl Tag {
         }
     }
 
+    fn plural(self) -> &'static str {
+        match self {
+            Tag::Text => "Text",
+            Tag::Link => "Links",
+            Tag::Color => "Colors",
+            Tag::Image => "Images",
+            Tag::File => "Files",
+        }
+    }
+
+    fn keyword(self) -> String {
+        format!("type:{}", self.name().to_lowercase())
+    }
+
     fn glyph(self) -> char {
         match self {
             Tag::Text => glyph::TEXT,
@@ -319,7 +364,10 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
         clip::ago(clip.copied_at, now)
     };
 
-    let mut keywords = vec![tag.name().to_lowercase()];
+    let mut keywords = vec![tag.keyword()];
+    if clip.pinned {
+        keywords.push(PINNED_KEYWORD.into());
+    }
     if clip.kind != ClipKind::Image {
         keywords.push(clip.content.chars().take(SEARCHED_CHARS).collect());
     }
@@ -365,11 +413,20 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
                 pinned: !clip.pinned,
             },
         )
-        .action("Delete Entry", Command::DeleteClip(clip.id))
-        .action(
-            "Delete All Unpinned Entries",
-            Command::ClearClipboardHistory,
+        .action("Delete Entry", Command::DeleteClip(clip.id));
+    if let (Some(name), Some(path)) = (&clip.app, &clip.app_path) {
+        item = item.action(
+            format!("Ignore Copies from {name}"),
+            Command::IgnoreClipApp(IgnoredApp {
+                path: path.clone(),
+                name: name.clone(),
+            }),
         );
+    }
+    item = item.action(
+        "Delete All Unpinned Entries",
+        Command::ClearClipboardHistory,
+    );
     item.preview(preview(clip, tag, &paths, now))
 }
 
@@ -512,6 +569,55 @@ mod tests {
         history.record(copied(Content::Text("secret".into())));
         assert!(titles(&history).is_empty());
         assert!(history.history().empty.unwrap().contains("turned off"));
+    }
+
+    #[test]
+    fn filters_pick_by_kind_and_pin() {
+        let history = history();
+        history.record(copied(Content::Text("image".into())));
+        history.record(copied(Content::Text("https://example.com".into())));
+        let list = history.history();
+        let shown = |label: &str| -> Vec<String> {
+            let filter = list.filters.iter().find(|f| f.label == label).unwrap();
+            list.items
+                .iter()
+                .filter(|item| filter.keeps(item))
+                .map(|item| item.title.clone())
+                .collect()
+        };
+        assert_eq!(shown("All").len(), 2);
+        assert_eq!(shown("Links"), ["https://example.com"]);
+        // The word "image" is text, not an image.
+        assert_eq!(shown("Text"), ["image"]);
+        assert!(shown("Images").is_empty());
+        assert!(shown("Pinned").is_empty());
+    }
+
+    #[test]
+    fn ignored_apps_are_not_kept() {
+        let history = history();
+        let store = history.store.clone().unwrap();
+        let ignored = [IgnoredApp {
+            path: r"C:\WINDOWS\notepad.exe".into(),
+            name: "Notepad".into(),
+        }];
+        store
+            .lock()
+            .unwrap()
+            .set_setting(IGNORED_APPS_SETTING, &IgnoredApp::format_list(&ignored))
+            .unwrap();
+        history.record(copied(Content::Text("from notepad".into())));
+        history.record(Copied {
+            content: Content::Text("from elsewhere".into()),
+            app: Some(("Other".into(), r"C:\other.exe".into())),
+        });
+        assert_eq!(titles(&history), ["from elsewhere"]);
+        let actions = &history.history().items[0].actions;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.title == "Ignore Copies from Other")
+        );
     }
 
     #[test]

@@ -37,6 +37,32 @@ pub struct ListView {
     pub items: Vec<SearchItem>,
     /// Shown when there are no items at all (rather than none matching).
     pub empty: Option<String>,
+    /// Choices that narrow the list (All, Images, Links…), which Tab steps
+    /// through. Empty: no filter.
+    pub filters: Vec<ListFilter>,
+}
+
+/// One choice of a list's filter: items with `keyword` among their keywords.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListFilter {
+    pub label: String,
+    /// `None` keeps every item.
+    pub keyword: Option<String>,
+}
+
+impl ListFilter {
+    pub fn new(label: impl Into<String>, keyword: Option<&str>) -> Self {
+        Self {
+            label: label.into(),
+            keyword: keyword.map(str::to_owned),
+        }
+    }
+
+    pub fn keeps(&self, item: &SearchItem) -> bool {
+        self.keyword
+            .as_ref()
+            .is_none_or(|keyword| item.keywords.contains(keyword))
+    }
 }
 
 /// What a list shows beside itself for the selected row.

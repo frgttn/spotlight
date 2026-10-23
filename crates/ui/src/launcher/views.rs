@@ -26,6 +26,8 @@ pub(super) enum Screen {
         /// The provider and view id it came from, to build it again after
         /// a change (an entry deleted); `None` for views carried whole.
         origin: Option<(String, String)>,
+        /// The chosen one of `view.filters`.
+        filter: usize,
     },
     Detail {
         view: DetailView,
@@ -74,11 +76,13 @@ impl Screen {
                 view,
                 grid: false,
                 origin: None,
+                filter: 0,
             },
             View::Grid(view) => Screen::List {
                 view,
                 grid: true,
                 origin: None,
+                filter: 0,
             },
             View::Detail(view) => Screen::Detail {
                 view,
@@ -203,7 +207,10 @@ impl Launcher {
             .and_then(|provider| provider.view(id));
         match fresh {
             Some(View::List(fresh) | View::Grid(fresh)) => {
-                if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+                if let Some(Screen::List { view, filter, .. }) = self.screens.last_mut() {
+                    if *filter >= fresh.filters.len() {
+                        *filter = 0;
+                    }
                     *view = fresh;
                 }
             }
@@ -221,6 +228,38 @@ impl Launcher {
             .unwrap_or_else(|| previous.min(self.results.len().saturating_sub(1)));
         self.scroll.reveal(self.selected, self.results.len());
         cx.notify();
+    }
+
+    /// Tab / Shift+Tab in a list with a filter: the next or previous choice.
+    /// Returns `false` when the open view has no filter.
+    pub(super) fn step_filter(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(Screen::List { view, filter, .. }) = self.screens.last_mut() else {
+            return false;
+        };
+        let count = view.filters.len();
+        if count == 0 {
+            return false;
+        }
+        *filter = if forward {
+            (*filter + 1) % count
+        } else {
+            (*filter + count - 1) % count
+        };
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+        true
+    }
+
+    /// The open list's filter choice, if it has a filter.
+    pub(super) fn filter_label(&self) -> Option<SharedString> {
+        match self.screens.last() {
+            Some(Screen::List { view, filter, .. }) => view
+                .filters
+                .get(*filter)
+                .map(|choice| SharedString::from(choice.label.clone())),
+            _ => None,
+        }
     }
 
     pub(super) fn in_grid(&self) -> bool {

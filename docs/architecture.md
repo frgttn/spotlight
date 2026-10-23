@@ -160,8 +160,9 @@ Script commands are a simple, language-agnostic way to extend the launcher.
 | Background | GPUI `Blurred` + a dense tint. GPUI's accent-policy blur barely blurs on Windows 11; the DWM acrylic system backdrop was tried and rejected (light grey, unstable focus) |
 | Apps | `shell:AppsFolder` enumeration (Win32 + MSIX in one list); launch via `ShellExecuteW("shell:AppsFolder\<id>")` |
 | Icons | `IShellItemImageFactory::GetImage`, cached as PNG on disk |
-| Clipboard history | `AddClipboardFormatListener` |
-| Paste into the previous app | Restore focus, then `SendInput` Ctrl+V |
+| Clipboard history | `AddClipboardFormatListener` on a message-only window of its own thread; reads 100 ms after a change (apps write in steps); skips copies marked `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore` or `CanIncludeInClipboardHistory = 0` |
+| Paste into the previous app | Foreground window remembered when the launcher opens; `SetForegroundWindow` while still foreground, then `SendInput` Ctrl+V once it has focus (blocked by UIPI in elevated apps) |
+| Win+V | Can't be registered (Windows owns it): a `WH_KEYBOARD_LL` hook on the hotkey thread swallows the V, then taps an unused key so releasing Win doesn't open Start |
 | Selected text | UIA `TextPattern`, falling back to a simulated Ctrl+C |
 | Window management | `SetWindowPos`, `MonitorFromWindow`, `GetMonitorInfoW`, `SetWinEventHook` |
 | Single instance + deeplinks | Named mutex + named pipe; `spotlight://` registered under `HKCU\Software\Classes` |
@@ -189,7 +190,7 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
    Actions are data (`Command`: launch app, open URL, copy, system command) that the app runs, rather than a `Provider::run` callback, so scripts and plugins can only ask for this safe set.
    Each provider can be turned off in Settings (`RootSearch::set_enabled`): it then has no catalog loaded and is skipped for answers and fallbacks. `Provider::name` / `description` label its switch.
 2. Root search core, part 2: ✅ action panel (Ctrl+K), ✅ view stack (List / Grid / Detail / Form, Esc goes back), ✅ HUD and toasts, ✅ aliases and per-item hotkeys, ✅ calculator currencies and history; ✅ more sources (Settings pages, Control Panel, Steam / Epic / GOG / Ubisoft games); still to do: frecency tuning.
-3. Clipboard history, snippets (with expansion), quicklinks.
+3. ✅ Quicklinks (with search bangs); ✅ clipboard history: text, links, colours, files and images (PNG files plus a 640 px copy for the preview), pinning, filters (Tab), retention by age and count, ignored apps, paste into the previous app, Win+V as an option. Lists can show a preview of the selected row (`SearchItem::preview`) and a filter (`ListView::filters`). Still to do: snippets (with expansion).
 3.5 Database encryption: `rusqlite` with `bundled-sqlcipher` instead of `bundled`. The key is random, kept next to the database encrypted with DPAPI (`CryptProtectData`, current user), so nothing to type. An existing plain database is converted once with `sqlcipher_export`. Clipboard images on disk get the same key (or move into the database). Deferred until clipboard history and snippets settle, since both add private data.
 4. Window management, file search.
 5. Script commands.

@@ -11,7 +11,7 @@ use gpui::{
 };
 use image::{Frame, ImageFormat};
 use spotlight_core::{
-    clip::ClipKind,
+    clip::{ClipKind, IGNORED_APPS_SETTING, IgnoredApp},
     item::SearchItem,
     view::{Preview, PreviewBody},
 };
@@ -131,6 +131,42 @@ impl Launcher {
             count => format!("Deleted {count} entries"),
         };
         self.show_toast(message.into(), cx);
+    }
+
+    /// Stops keeping copies from `app` (the recorder reads the list from the
+    /// settings on every copy).
+    pub(super) fn ignore_clip_app(&mut self, app: IgnoredApp, cx: &mut Context<Self>) {
+        let saved = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "there is no database".to_owned())
+            .and_then(|store| {
+                let store = store.lock().map_err(|_| "store lock poisoned".to_owned())?;
+                let mut apps = ignored_apps(&store);
+                if !IgnoredApp::contains(&apps, &app.path) {
+                    apps.push(app.clone());
+                }
+                store
+                    .set_setting(IGNORED_APPS_SETTING, &IgnoredApp::format_list(&apps))
+                    .map_err(|err| err.to_string())
+            });
+        let message = match saved {
+            Ok(()) => format!("Copies from {} won't be kept", app.name),
+            Err(err) => {
+                eprintln!("[spotlight] could not ignore {}: {err}", app.path);
+                format!("Couldn't ignore {}", app.name)
+            }
+        };
+        self.show_toast(message.into(), cx);
+    }
+
+    /// The apps whose copies aren't kept, for Settings.
+    pub fn ignored_clip_apps(&self) -> Vec<IgnoredApp> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| ignored_apps(&store))
+            .unwrap_or_default()
     }
 
     /// Whether the open list shows a preview beside its rows.
@@ -327,6 +363,15 @@ impl Launcher {
 
 /// The clipboard provider's id, whose view lists the entries.
 const PROVIDER: &str = "clipboard";
+
+fn ignored_apps(store: &spotlight_store::Store) -> Vec<IgnoredApp> {
+    store
+        .setting(IGNORED_APPS_SETTING)
+        .ok()
+        .flatten()
+        .map(|text| IgnoredApp::parse_list(&text))
+        .unwrap_or_default()
+}
 
 /// What to put back on the clipboard for `clip`.
 fn content_of(clip: &Clip) -> Option<Content> {

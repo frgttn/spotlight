@@ -28,6 +28,51 @@ pub const KEEP_DAYS: &[(Option<u32>, &str)] = &[
     (None, "Forever"),
 ];
 
+/// `settings` key: apps whose copies the history doesn't keep, one per line
+/// as `path<TAB>name`.
+pub const IGNORED_APPS_SETTING: &str = "clipboard_ignored_apps";
+
+/// An app whose copies the history doesn't keep.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IgnoredApp {
+    /// The program's path, which copies are matched by.
+    pub path: String,
+    /// How it's shown ("Google Chrome").
+    pub name: String,
+}
+
+impl IgnoredApp {
+    /// Parses [`IGNORED_APPS_SETTING`]'s value.
+    pub fn parse_list(text: &str) -> Vec<Self> {
+        text.lines()
+            .filter_map(|line| {
+                let (path, name) = line.split_once('\t').unwrap_or((line, ""));
+                let path = path.trim();
+                (!path.is_empty()).then(|| Self {
+                    path: path.to_owned(),
+                    name: match name.trim() {
+                        "" => path.to_owned(),
+                        name => name.to_owned(),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub fn format_list(apps: &[Self]) -> String {
+        apps.iter()
+            .map(|app| format!("{}\t{}", app.path, app.name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `apps` has the program at `path` (paths compare without case,
+    /// as Windows does).
+    pub fn contains(apps: &[Self], path: &str) -> bool {
+        apps.iter().any(|app| app.path.eq_ignore_ascii_case(path))
+    }
+}
+
 /// The choices Settings offers for [`Retention::max`].
 pub const KEEP_MAX: &[(u32, &str)] =
     &[(100, "100"), (500, "500"), (1000, "1,000"), (5000, "5,000")];
@@ -171,6 +216,27 @@ mod tests {
         assert_eq!(ago(0, 30 * 3600), "Yesterday");
         assert_eq!(ago(0, 4 * 86_400), "4 days ago");
         assert_eq!(thumbnail_path(r"C:\d\ab.png"), r"C:\d\ab.thumb.png");
+    }
+
+    #[test]
+    fn ignored_apps_round_trip() {
+        let apps = vec![
+            IgnoredApp {
+                path: r"C:\Apps\KeePass.exe".into(),
+                name: "KeePass".into(),
+            },
+            IgnoredApp {
+                path: r"C:\Apps\x.exe".into(),
+                name: r"C:\Apps\x.exe".into(),
+            },
+        ];
+        assert_eq!(
+            IgnoredApp::parse_list(&IgnoredApp::format_list(&apps)),
+            apps
+        );
+        assert_eq!(IgnoredApp::parse_list("  \n"), []);
+        assert!(IgnoredApp::contains(&apps, r"c:\apps\keepass.EXE"));
+        assert!(!IgnoredApp::contains(&apps, r"C:\Apps\other.exe"));
     }
 
     #[test]

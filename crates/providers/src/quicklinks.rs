@@ -217,6 +217,7 @@ impl Provider for Quicklinks {
             placeholder: Some("Search quicklinks…".into()),
             items: items.clone(),
             empty: Some("No quicklinks yet. Create one with Create Quicklink.".into()),
+            filters: Vec::new(),
         });
         items.push(
             SearchItem::new(item_id(ID, "search"), "Search Quicklinks")
@@ -348,6 +349,7 @@ impl Provider for Quicklinks {
             empty: Some(
                 "The bangs haven't been downloaded yet. Check the connection and try again.".into(),
             ),
+            filters: Vec::new(),
         }))
     }
 }

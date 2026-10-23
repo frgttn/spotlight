@@ -29,7 +29,10 @@ use gpui::{
     App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions, prelude::*, px, size,
 };
-use spotlight_core::{clip::Retention, web::SearchEngine};
+use spotlight_core::{
+    clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
+    web::SearchEngine,
+};
 use spotlight_platform_win::{
     clipboard,
     hotkey::{self, Hotkey},
@@ -60,6 +63,11 @@ const DISABLED_PROVIDERS_SETTING: &str = "disabled_providers";
 const CLIPBOARD_RETENTION_SETTING: &str = "clipboard_retention";
 /// The clipboard history provider's id: turning it off stops recording.
 const CLIPBOARD_PROVIDER: &str = "clipboard";
+/// `settings` key: `"true"` when Win+V opens the clipboard history; missing
+/// means off (Windows keeps it).
+const WIN_V_SETTING: &str = "clipboard_win_v";
+/// The item Win+V runs: the Clipboard History command.
+const CLIPBOARD_HISTORY_ITEM: &str = "clipboard:history";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
@@ -72,6 +80,7 @@ struct AppState {
     web: Arc<Web>,
     /// The clipboard history, to change how much it keeps and whether it records.
     clipboard: Arc<ClipboardHistory>,
+    win_v: Cell<bool>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -161,6 +170,10 @@ fn main() {
     let (item_presses_tx, item_presses_rx) = async_channel::unbounded::<String>();
     let (hotkeys, registered) = hotkey::spawn(saved_hotkey, presses_tx.clone(), item_presses_tx)
         .expect("failed to start the hotkey thread");
+    let win_v = setting(WIN_V_SETTING).is_some_and(|value| value == "true");
+    if win_v && !self_test {
+        set_win_v(&hotkeys, true);
+    }
     let hotkey = match registered {
         Ok(hotkey) => {
             if saved_hotkey.is_some_and(|saved| saved != hotkey) {
@@ -272,6 +285,7 @@ fn main() {
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
+            win_v: Cell::new(win_v),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -394,6 +408,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.smooth_scrolling.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
+                view_state.win_v.get(),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
                 window,
@@ -471,6 +486,19 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 cx,
             );
         }
+        SettingsEvent::IgnoredAppsChanged(apps) => {
+            save_setting(
+                state,
+                IGNORED_APPS_SETTING,
+                IgnoredApp::format_list(apps),
+                cx,
+            );
+        }
+        SettingsEvent::WinVChanged(enabled) => {
+            set_win_v(&state.hotkeys, *enabled);
+            state.win_v.set(*enabled);
+            save_setting(state, WIN_V_SETTING, enabled.to_string(), cx);
+        }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
                 tray.sync_autostart();
@@ -493,6 +521,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
         }
+    }
+}
+
+/// Makes Win+V open the clipboard history, or gives it back to Windows.
+fn set_win_v(hotkeys: &hotkey::Service, enabled: bool) {
+    let item = enabled.then_some(CLIPBOARD_HISTORY_ITEM);
+    if let Err(err) = hotkeys.intercept_win_v(item) {
+        eprintln!("[spotlight] {err}");
     }
 }
 
@@ -525,6 +561,7 @@ fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
         Some(LauncherState {
             shortcuts: launcher.shortcuts(),
             sources: launcher.sources(),
+            ignored_apps: launcher.ignored_clip_apps(),
         })
     })
 }

@@ -648,8 +648,16 @@ impl Launcher {
                 |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
                 aliases,
             ),
-            Some(Screen::List { view, .. }) => {
-                let candidates = view.items.iter().map(|item| Candidate {
+            Some(Screen::List { view, filter, .. }) => {
+                let shown: Vec<&SearchItem> = match view.filters.get(*filter) {
+                    Some(filter) => view
+                        .items
+                        .iter()
+                        .filter(|item| filter.keeps(item))
+                        .collect(),
+                    None => view.items.iter().collect(),
+                };
+                let candidates = shown.iter().map(|item| Candidate {
                     title: &item.title,
                     keywords: &item.keywords,
                     alias: None,
@@ -658,7 +666,7 @@ impl Launcher {
                 list_searcher
                     .filter(query, candidates)
                     .into_iter()
-                    .map(|ix| Row::Computed(view.items[ix].clone()))
+                    .map(|ix| Row::Computed(shown[ix].clone()))
                     .collect()
             }
             Some(_) => Vec::new(),
@@ -945,13 +953,16 @@ impl Launcher {
         self.grid_move(1, cx);
     }
 
+    /// Tab: the next form field, or the next choice of a list's filter.
     fn focus_next_field(
         &mut self,
         _: &FocusNextField,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_field(true, window, cx);
+        if !self.step_filter(true, cx) {
+            self.focus_field(true, window, cx);
+        }
     }
 
     fn focus_prev_field(
@@ -960,7 +971,9 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_field(false, window, cx);
+        if !self.step_filter(false, cx) {
+            self.focus_field(false, window, cx);
+        }
     }
 
     fn next_choice(&mut self, _: &NextChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -1132,6 +1145,7 @@ impl Launcher {
             Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
             Command::ClearClipboardHistory => self.clear_clips(window, cx),
+            Command::IgnoreClipApp(app) => self.ignore_clip_app(app.clone(), cx),
             command => self.run_command(command, cx),
         }
     }
@@ -1237,13 +1251,19 @@ impl Launcher {
         let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {
             return;
         };
-        // Commands that open a view (Clipboard History) open the launcher on it.
+        // Commands that open a view (Clipboard History) open the launcher on
+        // it; pressed again while that view is up, the launcher closes.
         if matches!(
             action.command,
             Command::PushView(_)
                 | Command::OpenProviderView { .. }
                 | Command::OpenCalculatorHistory
         ) {
+            let title = &self.search.catalog()[ix].title;
+            if self.visible && self.screen_title().as_ref() == Some(title) {
+                self.hide(cx);
+                return;
+            }
             self.show(Instant::now(), window, cx);
             self.record_visit(id.to_owned(), cx);
             self.perform(&action.command, window, cx);
@@ -1636,6 +1656,7 @@ impl Launcher {
                 .map(|calculation| history_item(calculation, now))
                 .collect(),
             empty: Some("No calculations yet. Copy a calculator answer to keep it here.".into()),
+            filters: Vec::new(),
         };
         self.push_view(View::List(list), window, cx);
     }
@@ -2213,7 +2234,31 @@ impl Render for Launcher {
                                         .child(SharedString::from(screen.title().to_owned())),
                                 )
                             })
-                            .child(div().flex_1().min_w_0().child(self.input.clone())),
+                            .child(div().flex_1().min_w_0().child(self.input.clone()))
+                            .when_some(self.filter_label(), |row, label| {
+                                row.child(
+                                    div()
+                                        .id("filter")
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_2()
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(rgba(theme::SURFACE_BORDER))
+                                        .text_size(px(12.))
+                                        .line_height(px(22.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.step_filter(true, cx);
+                                        }))
+                                        .child(label)
+                                        .child(keycaps("Tab")),
+                                )
+                            }),
                     }),
             )
             .child(div().h(px(1.)).bg(rgba(0xffffff14)))

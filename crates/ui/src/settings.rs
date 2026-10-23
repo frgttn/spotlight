@@ -15,7 +15,7 @@ use gpui::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
-    clip::{self, Retention},
+    clip::{self, IgnoredApp, Retention},
     web::{self, SearchEngine},
 };
 use spotlight_platform_win::{
@@ -50,6 +50,8 @@ pub struct LauncherState {
     pub shortcuts: Vec<Shortcut>,
     /// Search providers and whether each is on.
     pub sources: Vec<Source>,
+    /// Apps whose copies the clipboard history doesn't keep.
+    pub ignored_apps: Vec<IgnoredApp>,
 }
 
 /// Reads the launcher's current state; `None` while the launcher can't be
@@ -64,6 +66,10 @@ pub enum SettingsEvent {
     SearchEngineChanged(SearchEngine),
     /// The clipboard history now keeps this much; trim it and save it.
     ClipboardRetentionChanged(Retention),
+    /// The apps whose copies aren't kept are now these; save them.
+    IgnoredAppsChanged(Vec<IgnoredApp>),
+    /// Win+V opens the clipboard history (`true`) or Windows' own.
+    WinVChanged(bool),
     /// Start at login was turned on or off here.
     AutostartChanged,
     /// The search provider with this id was turned on or off.
@@ -109,6 +115,8 @@ pub struct Settings {
     /// Search providers and whether each is on, as last read from the launcher.
     sources: Vec<Source>,
     clipboard_retention: Retention,
+    ignored_apps: Vec<IgnoredApp>,
+    win_v: bool,
     autostart: bool,
     data_path: SharedString,
     focus: FocusHandle,
@@ -126,6 +134,7 @@ impl Settings {
         smooth_scrolling: bool,
         search_engine: SearchEngine,
         clipboard_retention: Retention,
+        win_v: bool,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -156,7 +165,11 @@ impl Settings {
         ];
         let focus = cx.focus_handle();
         window.focus(&focus);
-        let LauncherState { shortcuts, sources } = launcher(cx).unwrap_or_default();
+        let LauncherState {
+            shortcuts,
+            sources,
+            ignored_apps,
+        } = launcher(cx).unwrap_or_default();
         Self {
             hotkeys,
             hotkey,
@@ -176,6 +189,8 @@ impl Settings {
             engine_message: None,
             sources,
             clipboard_retention,
+            ignored_apps,
+            win_v,
             autostart: autostart::is_enabled(),
             data_path,
             focus,
@@ -196,6 +211,7 @@ impl Settings {
         };
         self.shortcuts = state.shortcuts;
         self.sources = state.sources;
+        self.ignored_apps = state.ignored_apps;
         cx.notify();
     }
 
@@ -521,6 +537,65 @@ impl Settings {
         }
     }
 
+    fn toggle_win_v(&mut self, cx: &mut Context<Self>) {
+        self.win_v = !self.win_v;
+        cx.emit(SettingsEvent::WinVChanged(self.win_v));
+        cx.notify();
+    }
+
+    fn unignore_app(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.ignored_apps.len() {
+            self.ignored_apps.remove(ix);
+            cx.emit(SettingsEvent::IgnoredAppsChanged(self.ignored_apps.clone()));
+            cx.notify();
+        }
+    }
+
+    /// One row per ignored app, with a button that keeps its copies again.
+    fn ignored_app_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.ignored_apps.is_empty() {
+            return div()
+                .px_4()
+                .pb_3()
+                .text_size(px(12.))
+                .text_color(rgba(theme::TEXT_FAINT))
+                .child("None. To add one, press Ctrl+K on an entry copied from it and choose Ignore Copies from….")
+                .into_any_element();
+        }
+        div()
+            .px_4()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(self.ignored_apps.iter().enumerate().map(|(ix, app)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(px(13.)).truncate().child(app.name.clone()))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .truncate()
+                                    .child(app.path.clone()),
+                            ),
+                    )
+                    .child(remove_button(
+                        ("unignore", ix),
+                        cx.listener(move |this, _, _, cx| this.unignore_app(ix, cx)),
+                    ))
+            }))
+            .into_any_element()
+    }
+
     /// How long and how many entries to keep: a row of choices for each.
     fn clipboard_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.clipboard_retention;
@@ -573,6 +648,24 @@ impl Settings {
                 "The oldest entries go first once the history is full.",
             ))
             .child(choices(max.collect()))
+            .child(divider())
+            .child(
+                row(
+                    "Open with Win+V",
+                    "Instead of Windows' own clipboard history. Turned off, Win+V is Windows' again.",
+                )
+                .child(switch(
+                    "win-v",
+                    self.win_v,
+                    cx.listener(|this, _, _, cx| this.toggle_win_v(cx)),
+                )),
+            )
+            .child(divider())
+            .child(row(
+                "Ignored apps",
+                "Copies made in these apps are never kept.",
+            ))
+            .child(self.ignored_app_list(cx))
     }
 
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {

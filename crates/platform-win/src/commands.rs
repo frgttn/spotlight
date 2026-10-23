@@ -106,6 +106,7 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::PinClip { .. }
         | Command::DeleteClip(_)
         | Command::ClearClipboardHistory
+        | Command::IgnoreClipApp(_)
         | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
     }

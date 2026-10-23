@@ -4,6 +4,7 @@
 //! commands and WASM plugins.
 
 use crate::{
+    clip::IgnoredApp,
     quicklink::Quicklink,
     view::{Preview, View},
 };
@@ -147,6 +148,8 @@ pub enum Command {
     DeleteClip(i64),
     /// Deletes every clipboard history entry that isn't pinned.
     ClearClipboardHistory,
+    /// Stops keeping copies made in this app.
+    IgnoreClipApp(IgnoredApp),
     /// Goes back to root search with this text in the search field, the
     /// cursor at its end: `!g` completed to `!gh `.
     Complete(String),

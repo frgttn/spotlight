@@ -6,23 +6,33 @@
 //! framework runs its own message loop. The same thread changes the hotkey
 //! and records new ones, because a hotkey can only be unregistered by the
 //! thread that registered it, and a low-level hook runs on the thread that
-//! installed it.
+//! installed it. Win+V, which Windows keeps for itself, is taken with a
+//! low-level hook too (see [`Service::intercept_win_v`]).
 
-use std::{cell::RefCell, collections::HashMap, fmt, sync::mpsc, thread, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    fmt,
+    mem::size_of,
+    sync::mpsc,
+    thread,
+    time::Instant,
+};
 
 use windows::Win32::{
     Foundation::{ERROR_HOTKEY_ALREADY_REGISTERED, GetLastError, LPARAM, LRESULT, WPARAM},
     System::Threading::GetCurrentThreadId,
     UI::{
         Input::KeyboardAndMouse::{
-            GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
-            MOD_WIN, RegisterHotKey, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
+            GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
+            KEYBDINPUT, KEYEVENTF_KEYUP, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+            RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE,
             VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
             VK_RWIN, VK_SHIFT,
         },
         WindowsAndMessaging::{
-            CallNextHookEx, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE,
-            PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+            CallNextHookEx, GetMessageW, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+            PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
             WH_KEYBOARD_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN, WM_USER,
         },
     },
@@ -157,6 +167,7 @@ enum Request {
     SetItem(String, Option<Hotkey>, mpsc::Sender<Result<(), SetError>>),
     Record(async_channel::Sender<Recorded>),
     Resume,
+    InterceptWinV(Option<String>, mpsc::Sender<Result<(), String>>),
 }
 
 /// Handle to the hotkey thread.
@@ -205,6 +216,19 @@ impl Service {
     /// Ends recording and re-registers the current hotkey.
     pub fn resume(&self) {
         self.send(Request::Resume);
+    }
+
+    /// Makes Win+V run the item `item_id` (its id arrives on `item_presses`,
+    /// as for an item hotkey) instead of opening Windows' clipboard history,
+    /// or (`None`) gives Win+V back to Windows. Windows doesn't let apps
+    /// register Win+V, so a low-level keyboard hook takes it before Windows
+    /// sees it.
+    pub fn intercept_win_v(&self, item_id: Option<&str>) -> Result<(), String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.send(Request::InterceptWinV(item_id.map(str::to_owned), reply_tx));
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| Err("the hotkey thread has stopped".into()))
     }
 
     fn send(&self, request: Request) {
@@ -256,6 +280,7 @@ pub fn spawn(
                     format!("could not register any of {tried:?}")
                 });
             let _ = ready_tx.send((GetCurrentThreadId(), registered));
+            WIN_V_PRESSES.with(|presses| *presses.borrow_mut() = Some(item_presses.clone()));
 
             // The low-level hook is called from this loop, too.
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -283,6 +308,7 @@ pub fn spawn(
                 }
             }
             registrar.stop_recording();
+            registrar.release_win_v();
         })
         .map_err(|err| err.to_string())?;
 
@@ -313,11 +339,18 @@ struct Registrar {
     items: HashMap<String, (i32, Hotkey)>,
     /// Last hotkey id handed to an item.
     last_item_id: i32,
+    /// Installed while Win+V runs an item (see `Service::intercept_win_v`).
+    win_v_hook: Option<HHOOK>,
 }
 
 thread_local! {
     /// Where the hook sends what it records. The hook runs on the hotkey thread.
     static RECORDER: RefCell<Option<async_channel::Sender<Recorded>>> = const { RefCell::new(None) };
+    /// Where Win+V sends its item id, and which item; read by `win_v_key`.
+    static WIN_V_PRESSES: RefCell<Option<async_channel::Sender<String>>> = const { RefCell::new(None) };
+    static WIN_V_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The V of a Win+V was swallowed: swallow its repeats and release too.
+    static V_SWALLOWED: Cell<bool> = const { Cell::new(false) };
 }
 
 impl Registrar {
@@ -374,7 +407,39 @@ impl Registrar {
                 }
             }
             Request::Resume => self.resume(),
+            Request::InterceptWinV(item, reply) => {
+                let result = match item {
+                    Some(item) => {
+                        WIN_V_ITEM.with(|current| *current.borrow_mut() = Some(item));
+                        self.hold_win_v()
+                    }
+                    None => {
+                        self.release_win_v();
+                        Ok(())
+                    }
+                };
+                let _ = reply.send(result);
+            }
         }
+    }
+
+    fn hold_win_v(&mut self) -> Result<(), String> {
+        if self.win_v_hook.is_none() {
+            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(win_v_key), None, 0) }
+                .map_err(|err| format!("could not take Win+V: {err}"))?;
+            self.win_v_hook = Some(hook);
+        }
+        Ok(())
+    }
+
+    fn release_win_v(&mut self) {
+        if let Some(hook) = self.win_v_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+        WIN_V_ITEM.with(|current| *current.borrow_mut() = None);
+        V_SWALLOWED.set(false);
     }
 
     fn item_for(&self, id: i32) -> Option<&str> {
@@ -482,6 +547,67 @@ unsafe extern "system" fn record_key(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// Low-level hook while Win+V runs an item: swallows the V of Win+V (so
+/// Windows' clipboard history doesn't open) and reports the item. Every other
+/// key passes.
+unsafe extern "system" fn win_v_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if code == HC_ACTION as i32
+            && event.vkCode == u32::from(b'V')
+            && event.flags & LLKHF_INJECTED != LLKHF_INJECTED
+        {
+            let key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if !key_down {
+                if V_SWALLOWED.replace(false) {
+                    return LRESULT(1);
+                }
+            } else if V_SWALLOWED.get() {
+                // Auto-repeat while held: already handled.
+                return LRESULT(1);
+            } else {
+                let pressed = |key: VIRTUAL_KEY| GetAsyncKeyState(key.0 as i32) < 0;
+                let win_only = (pressed(VK_LWIN) || pressed(VK_RWIN))
+                    && !pressed(VK_CONTROL)
+                    && !pressed(VK_MENU)
+                    && !pressed(VK_SHIFT);
+                if win_only {
+                    V_SWALLOWED.set(true);
+                    mask_start_menu();
+                    let item = WIN_V_ITEM.with(|item| item.borrow().clone());
+                    WIN_V_PRESSES.with(|presses| {
+                        if let (Some(presses), Some(item)) = (presses.borrow().as_ref(), item) {
+                            let _ = presses.try_send(item);
+                        }
+                    });
+                    return LRESULT(1);
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+/// Taps a key no layout uses, so that releasing Win after a swallowed V
+/// doesn't count as Win pressed alone, which opens the Start menu.
+fn mask_start_menu() {
+    const VK_NONE: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+    let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_NONE,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+    unsafe {
+        SendInput(&inputs, size_of::<INPUT>() as i32);
     }
 }
 
