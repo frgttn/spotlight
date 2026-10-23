@@ -20,10 +20,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
-    FocusHandle, Focusable, Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent,
-    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla,
-    img, prelude::*, px, rgb, rgba, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
+    Hsla, KeyBinding, RenderImage, SharedString, Subscription, Task, UniformListScrollHandle,
+    Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -49,7 +48,7 @@ use self::{
     views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
 };
 use crate::{
-    smooth_scroll::SmoothScroll,
+    smooth_scroll::{SmoothScroll, capture_wheel},
     text_input::{self, TextInput},
     theme,
 };
@@ -2195,40 +2194,15 @@ impl Render for Launcher {
             .size_full()
             .py(px(LIST_PADDING));
 
-            // Wheel notches are taken before the list sees them (capture phase)
-            // and animated instead; everything else falls through to GPUI.
-            let this = cx.entity().downgrade();
-            let wheel = canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Capture
-                            || !bounds.contains(&event.position)
-                            || !matches!(event.delta, ScrollDelta::Lines(_))
-                        {
-                            return;
-                        }
-                        let delta = event.delta.pixel_delta(window.line_height()).y;
-                        let handled = this
-                            .update(cx, |this, cx| {
-                                if !this.scroll.is_enabled() {
-                                    return false;
-                                }
-                                this.scroll.scroll_by(delta, this.results.len());
-                                cx.notify();
-                                true
-                            })
-                            .unwrap_or(false);
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    });
-                },
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full();
+            // Wheel notches are animated instead; everything else falls through to GPUI.
+            let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Self, delta, cx| {
+                if !this.scroll.is_enabled() {
+                    return false;
+                }
+                this.scroll.scroll_by(delta, this.results.len());
+                cx.notify();
+                true
+            });
 
             div()
                 .flex_1()
@@ -2463,7 +2437,7 @@ fn shell_name(icon: &Icon) -> Option<String> {
 }
 
 /// Windows 11's icon font, or its Windows 10 predecessor (same code points).
-fn icon_font() -> &'static str {
+pub(crate) fn icon_font() -> &'static str {
     static FONT: OnceLock<&'static str> = OnceLock::new();
     FONT.get_or_init(|| {
         let windows =
