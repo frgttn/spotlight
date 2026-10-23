@@ -5,8 +5,9 @@
 
 use crate::{
     clip::IgnoredApp,
-    quicklink::Quicklink,
+    quicklink::{self, Quicklink},
     view::{Preview, View},
+    web::encode_query,
 };
 
 /// One row in a result list.
@@ -156,7 +157,35 @@ pub enum Command {
     System(SystemCommand),
 }
 
+/// Where a command takes the text selected in the app the launcher came
+/// from: in an `OpenUrl` URL (percent-encoded) or a quicklink.
+pub const SELECTION: &str = "{selection}";
+
 impl Command {
+    /// Whether it uses the selected text ([`SELECTION`]), which the app reads
+    /// before running it.
+    pub fn needs_selection(&self) -> bool {
+        match self {
+            Command::OpenUrl(url) => url.contains(SELECTION),
+            Command::OpenQuicklink { link, .. } => quicklink::has_selection(link),
+            _ => false,
+        }
+    }
+
+    /// The command with the selected `text` in place of [`SELECTION`].
+    pub fn with_selection(&self, text: &str) -> Command {
+        match self {
+            Command::OpenUrl(url) => {
+                Command::OpenUrl(url.replace(SELECTION, &encode_query(text.trim())))
+            }
+            Command::OpenQuicklink { link, app } => Command::OpenQuicklink {
+                link: quicklink::fill_selection(link, text),
+                app: app.clone(),
+            },
+            command => command.clone(),
+        }
+    }
+
     /// Commands that are hard to undo ask for a second Enter.
     pub fn needs_confirmation(&self) -> bool {
         matches!(
@@ -191,4 +220,43 @@ pub enum SystemCommand {
     Eject(char),
     /// Every removable drive.
     EjectAll,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fills_in_the_selection() {
+        let search = Command::OpenUrl("https://www.google.com/search?q={selection}".into());
+        assert!(search.needs_selection());
+        assert_eq!(
+            search.with_selection(" rust & gpui \n"),
+            Command::OpenUrl("https://www.google.com/search?q=rust+%26+gpui".into())
+        );
+        let link = Command::OpenQuicklink {
+            link: "https://translate.google.com/?text={selection}&tl=ru".into(),
+            app: None,
+        };
+        assert!(link.needs_selection());
+        assert_eq!(
+            link.with_selection("a b"),
+            Command::OpenQuicklink {
+                link: "https://translate.google.com/?text=a%20b&tl=ru".into(),
+                app: None,
+            }
+        );
+        assert!(!Command::OpenUrl("https://x.com/?q={query}".into()).needs_selection());
+        let path = Command::OpenQuicklink {
+            link: r"C:\Notes\{selection}.md".into(),
+            app: None,
+        };
+        assert_eq!(
+            path.with_selection("todo list"),
+            Command::OpenQuicklink {
+                link: r"C:\Notes\todo list.md".into(),
+                app: None,
+            }
+        );
+    }
 }

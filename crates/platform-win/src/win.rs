@@ -7,6 +7,7 @@ use std::{ffi::c_void, mem::size_of};
 
 use windows::Win32::{
     Foundation::{HWND, POINT, RECT},
+    Globalization::GetUserDefaultLocaleName,
     Graphics::{
         Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
         Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
@@ -150,6 +151,18 @@ pub fn hide(raw: isize) {
 pub fn focus(raw: isize) {
     unsafe {
         let _ = SetForegroundWindow(hwnd(raw));
+    }
+}
+
+/// The user's language as a two-letter code (`"ru"`), from their Windows
+/// regional format; `"en"` when it can't be told.
+pub fn user_language() -> String {
+    let mut name = [0u16; 85];
+    let len = unsafe { GetUserDefaultLocaleName(&mut name) };
+    let name = String::from_utf16_lossy(&name[..(len.max(1) - 1) as usize]);
+    match name.split('-').next() {
+        Some(language) if language.len() >= 2 => language.to_lowercase(),
+        _ => "en".into(),
     }
 }
 

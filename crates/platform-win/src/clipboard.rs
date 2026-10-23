@@ -11,6 +11,7 @@ use std::{
     io::Cursor,
     mem::size_of,
     path::Path,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -22,9 +23,10 @@ use windows::{
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
         System::{
             DataExchange::{
-                AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-                GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard,
-                RegisterClipboardFormatW, SetClipboardData,
+                AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats,
+                GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber,
+                IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+                SetClipboardData,
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
             Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
@@ -36,7 +38,7 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::{
                 INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-                SendInput, VIRTUAL_KEY, VK_CONTROL, VK_V,
+                SendInput, VIRTUAL_KEY, VK_CONTROL,
             },
             Shell::{DROPFILES, DragQueryFileW, HDROP},
             WindowsAndMessaging::{
@@ -81,6 +83,13 @@ const MAX_PIXELS: u64 = 50_000_000;
 /// How long after a change the clipboard is read, for the app to finish
 /// writing it.
 const SETTLE: Duration = Duration::from_millis(100);
+
+/// Set while Spotlight copies another app's selection to read it (see
+/// `selection`): what lands on the clipboard then isn't the user's copy.
+static BORROWED: AtomicBool = AtomicBool::new(false);
+/// Changes up to this clipboard sequence number were Spotlight borrowing
+/// the clipboard and putting it back; the history skips them.
+static BORROWED_THROUGH: AtomicU32 = AtomicU32::new(0);
 
 /// Starts watching the clipboard: everything copied from now on that isn't
 /// marked private arrives on `copied`. The thread ends when `copied` closes.
@@ -135,6 +144,11 @@ pub fn listen(copied: async_channel::Sender<Copied>) -> Result<(), String> {
                 )
                 .as_bool()
                 {}
+                if BORROWED.load(Ordering::Acquire)
+                    || GetClipboardSequenceNumber() <= BORROWED_THROUGH.load(Ordering::Acquire)
+                {
+                    continue;
+                }
                 let Some(read) = read(window, &mut apps) else {
                     continue;
                 };
@@ -514,6 +528,13 @@ impl AppNames {
     }
 }
 
+/// The program path of the app owning `window`.
+pub(crate) fn window_program(window: isize) -> Option<String> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(HWND(window as *mut c_void), Some(&mut pid)) };
+    (pid != 0).then(|| process_path(pid)).flatten()
+}
+
 fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
@@ -598,6 +619,25 @@ pub fn foreground_window() -> isize {
 /// then may it hand the foreground to another window. Returns `false` (and
 /// does nothing) when the window is gone.
 pub fn paste_into(window: isize) -> bool {
+    if !bring_to_front(window) {
+        return false;
+    }
+    thread::spawn(move || {
+        if !wait_for_focus(window) {
+            eprintln!("[clipboard] the target window didn't come to the front; not pasting");
+            return;
+        }
+        if !press_ctrl(VK_V) {
+            // Windows blocks input into apps running as administrator.
+            eprintln!("[clipboard] Ctrl+V was blocked");
+        }
+    });
+    true
+}
+
+/// Asks Windows to activate `window`. Only allowed while Spotlight is the
+/// foreground app. `false` when the window is gone.
+pub(crate) fn bring_to_front(window: isize) -> bool {
     let target = HWND(window as *mut c_void);
     unsafe {
         if window == 0 || !IsWindow(Some(target)).as_bool() {
@@ -605,48 +645,124 @@ pub fn paste_into(window: isize) -> bool {
         }
         let _ = SetForegroundWindow(target);
     }
-    thread::spawn(move || {
-        // Keys go to whatever has focus, so wait until it's the target.
-        let started = Instant::now();
-        while unsafe { GetForegroundWindow() }.0 as isize != window {
-            if started.elapsed() > Duration::from_millis(500) {
-                eprintln!("[clipboard] the target window didn't come to the front; not pasting");
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        // Let the app finish activating (restoring its caret) before the keys.
-        thread::sleep(Duration::from_millis(30));
-        let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    dwFlags: if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
-                    ..Default::default()
-                },
-            },
-        };
-        let inputs = [
-            key(VK_CONTROL, false),
-            key(VK_V, false),
-            key(VK_V, true),
-            key(VK_CONTROL, true),
-        ];
-        let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-        if sent as usize != inputs.len() {
-            // Windows blocks input into apps running as administrator.
-            eprintln!(
-                "[clipboard] Ctrl+V was blocked ({sent} of {} keys)",
-                inputs.len()
-            );
-        }
-    });
     true
+}
+
+/// Waits (up to half a second) until `window` is in front, then a moment
+/// for it to put its caret and focus back. Keys go to whatever has focus.
+pub(crate) fn wait_for_focus(window: isize) -> bool {
+    let started = Instant::now();
+    while unsafe { GetForegroundWindow() }.0 as isize != window {
+        if started.elapsed() > Duration::from_millis(500) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(30));
+    true
+}
+const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(b'V' as u16);
+
+/// Presses Ctrl and `key` in whatever window has the keyboard. `false` when
+/// Windows blocked the keys.
+pub(crate) fn press_ctrl(key: VIRTUAL_KEY) -> bool {
+    let input = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                ..Default::default()
+            },
+        },
+    };
+    let inputs = [
+        input(VK_CONTROL, false),
+        input(key, false),
+        input(key, true),
+        input(VK_CONTROL, true),
+    ];
+    let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+    sent as usize == inputs.len()
+}
+
+/// Counts every clipboard change; it moves when an app copies.
+pub(crate) fn sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+/// Everything on the clipboard, format by format, to put back after
+/// borrowing it.
+pub(crate) struct Snapshot(Vec<(u32, Vec<u8>)>);
+
+/// Formats held as GDI objects rather than memory; they can't be copied
+/// byte for byte (Windows makes their memory forms, DIB and so on, itself).
+const GDI_FORMATS: [u32; 6] = [2, 3, 9, 14, 0x82, 0x8E];
+/// A clipboard larger than this isn't put back after borrowing it.
+const MAX_SNAPSHOT: usize = 64 * 1024 * 1024;
+
+impl Snapshot {
+    /// Copies what's on the clipboard. `None` when it's busy or too large.
+    pub(crate) fn take(owner: isize) -> Option<Self> {
+        let _open = Open::with_retries(HWND(owner as *mut c_void))?;
+        let mut formats = Vec::new();
+        let mut total = 0;
+        let mut format = 0;
+        loop {
+            format = unsafe { EnumClipboardFormats(format) };
+            if format == 0 {
+                break;
+            }
+            if GDI_FORMATS.contains(&format) {
+                continue;
+            }
+            if let Some(bytes) = with_data(format, <[u8]>::to_vec) {
+                total += bytes.len();
+                if total > MAX_SNAPSHOT {
+                    return None;
+                }
+                formats.push((format, bytes));
+            }
+        }
+        Some(Snapshot(formats))
+    }
+
+    /// Puts the clipboard back as it was.
+    pub(crate) fn restore(&self, owner: isize) -> Result<(), String> {
+        let _open = Open::with_retries(HWND(owner as *mut c_void))
+            .ok_or("the clipboard is busy in another app")?;
+        unsafe {
+            EmptyClipboard().map_err(|err| err.to_string())?;
+            for (format, bytes) in &self.0 {
+                set_data(*format, bytes)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Starts or ends borrowing the clipboard: the history ignores the changes
+/// in between, and the one that puts it back.
+pub(crate) fn set_borrowed(borrowed: bool) {
+    if borrowed {
+        BORROWED.store(true, Ordering::Release);
+    } else {
+        BORROWED_THROUGH.store(sequence(), Ordering::Release);
+        BORROWED.store(false, Ordering::Release);
+    }
+}
+
+/// The text on the clipboard now, if any.
+pub(crate) fn text(owner: isize) -> Option<String> {
+    let _open = Open::with_retries(HWND(owner as *mut c_void))?;
+    match read_text()? {
+        Raw::Content(Content::Text(text)) => Some(text),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

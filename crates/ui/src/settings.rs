@@ -70,6 +70,8 @@ pub enum SettingsEvent {
     IgnoredAppsChanged(Vec<IgnoredApp>),
     /// Win+V opens the clipboard history (`true`) or Windows' own.
     WinVChanged(bool),
+    /// Reading the selected text may (or may no longer) use Ctrl+C.
+    SelectionCopyChanged(bool),
     /// Start at login was turned on or off here.
     AutostartChanged,
     /// The search provider with this id was turned on or off.
@@ -117,6 +119,7 @@ pub struct Settings {
     clipboard_retention: Retention,
     ignored_apps: Vec<IgnoredApp>,
     win_v: bool,
+    selection_copy: bool,
     autostart: bool,
     data_path: SharedString,
     focus: FocusHandle,
@@ -135,6 +138,7 @@ impl Settings {
         search_engine: SearchEngine,
         clipboard_retention: Retention,
         win_v: bool,
+        selection_copy: bool,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -191,6 +195,7 @@ impl Settings {
             clipboard_retention,
             ignored_apps,
             win_v,
+            selection_copy,
             autostart: autostart::is_enabled(),
             data_path,
             focus,
@@ -535,6 +540,32 @@ impl Settings {
             cx.emit(SettingsEvent::ClipboardRetentionChanged(retention));
             cx.notify();
         }
+    }
+
+    fn toggle_selection_copy(&mut self, cx: &mut Context<Self>) {
+        self.selection_copy = !self.selection_copy;
+        cx.emit(SettingsEvent::SelectionCopyChanged(self.selection_copy));
+        cx.notify();
+    }
+
+    /// Whether the Selected Text source is on, which reading it depends on.
+    fn selection_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self
+            .sources
+            .iter()
+            .any(|source| source.id == "selection" && source.enabled);
+        let description = if on {
+            "Apps that don't share their selection get Ctrl+C; the clipboard is put back right after, and terminals are skipped."
+        } else {
+            "Selected Text is off under Search sources, so the selection is never read."
+        };
+        card().child(
+            row("Copy the selection when needed", description).child(switch(
+                "selection-copy",
+                on && self.selection_copy,
+                cx.listener(|this, _, _, cx| this.toggle_selection_copy(cx)),
+            )),
+        )
     }
 
     fn toggle_win_v(&mut self, cx: &mut Context<Self>) {
@@ -1081,6 +1112,9 @@ impl Render for Settings {
                     .child(div().h(px(6.)))
                     .child(section_label("Clipboard history"))
                     .child(self.clipboard_card(cx))
+                    .child(div().h(px(6.)))
+                    .child(section_label("Selected text"))
+                    .child(self.selection_card(cx))
                     .child(div().h(px(6.)))
                     .child(section_label("System"))
                     .child(system)

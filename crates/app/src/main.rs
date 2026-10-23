@@ -66,6 +66,9 @@ const CLIPBOARD_PROVIDER: &str = "clipboard";
 /// `settings` key: `"true"` when Win+V opens the clipboard history; missing
 /// means off (Windows keeps it).
 const WIN_V_SETTING: &str = "clipboard_win_v";
+/// `settings` key: `"false"` when reading the selected text mustn't use
+/// Ctrl+C; missing means it may.
+const SELECTION_COPY_SETTING: &str = "selection_copy";
 /// The item Win+V runs: the Clipboard History command.
 const CLIPBOARD_HISTORY_ITEM: &str = "clipboard:history";
 
@@ -81,6 +84,7 @@ struct AppState {
     /// The clipboard history, to change how much it keeps and whether it records.
     clipboard: Arc<ClipboardHistory>,
     win_v: Cell<bool>,
+    selection_copy: Cell<bool>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -171,6 +175,7 @@ fn main() {
     let (hotkeys, registered) = hotkey::spawn(saved_hotkey, presses_tx.clone(), item_presses_tx)
         .expect("failed to start the hotkey thread");
     let win_v = setting(WIN_V_SETTING).is_some_and(|value| value == "true");
+    let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
     }
@@ -249,6 +254,11 @@ fn main() {
                 },
             )
             .expect("failed to open the launcher window");
+        window
+            .update(cx, |launcher, _, _| {
+                launcher.set_selection_copy(selection_copy)
+            })
+            .ok();
 
         cx.spawn(async move |cx| {
             while let Ok(pressed_at) = presses_rx.recv().await {
@@ -286,6 +296,7 @@ fn main() {
             web,
             clipboard: clipboard_history,
             win_v: Cell::new(win_v),
+            selection_copy: Cell::new(selection_copy),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -409,6 +420,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
+                view_state.selection_copy.get(),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
                 window,
@@ -445,6 +457,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
         }
         SettingsEvent::SearchEngineChanged(engine) => {
             state.web.set_engine(engine.clone());
+            // Their items name the engine and carry its URL.
+            state
+                .launcher
+                .update(cx, |launcher, window, cx| {
+                    launcher.reload_provider("web", window, cx);
+                    launcher.reload_provider("selection", window, cx);
+                })
+                .ok();
             *state.search_engine.borrow_mut() = engine.clone();
             save_setting(state, SEARCH_ENGINE_SETTING, engine.to_setting(), cx);
         }
@@ -498,6 +518,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             set_win_v(&state.hotkeys, *enabled);
             state.win_v.set(*enabled);
             save_setting(state, WIN_V_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::SelectionCopyChanged(enabled) => {
+            state.selection_copy.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, _| launcher.set_selection_copy(*enabled))
+                .ok();
+            save_setting(state, SELECTION_COPY_SETTING, enabled.to_string(), cx);
         }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {

@@ -9,6 +9,7 @@ pub mod control_panel;
 pub mod games;
 pub mod quicklinks;
 pub mod rates;
+pub mod selection;
 pub mod settings_pages;
 pub mod spotlight;
 pub mod system;
@@ -54,6 +55,7 @@ mod glyph {
     pub const COLOR: char = '\u{E790}';
     pub const IMAGE: char = '\u{EB9F}';
     pub const FOLDER: char = '\u{E8B7}';
+    pub const TRANSLATE: char = '\u{F2B7}';
 }
 
 /// The built-in providers, and the ones the app talks to again later.
@@ -95,6 +97,10 @@ pub fn all(
             bangs::Bangs::new(data_dir),
         )),
         web.clone(),
+        Arc::new(selection::Selection::new(
+            web.clone(),
+            spotlight_platform_win::win::user_language(),
+        )),
         Arc::new(spotlight::Spotlight),
     ];
     Builtins {

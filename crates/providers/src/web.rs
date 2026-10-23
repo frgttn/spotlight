@@ -44,7 +44,7 @@ impl Web {
         }
     }
 
-    fn engine(&self) -> SearchEngine {
+    pub fn engine(&self) -> SearchEngine {
         self.engine
             .read()
             .map(|engine| engine.clone())

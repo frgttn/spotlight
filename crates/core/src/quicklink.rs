@@ -7,6 +7,8 @@
 //!   optionally with a default value or a fixed set of choices. Arguments with
 //!   the same name share one value.
 //! - `{date}`, `{time}`, `{uuid}`: filled in when the link opens.
+//! - `{selection}`: the text selected in the app the launcher was opened
+//!   from (when reading it is turned on in Settings).
 //!
 //! Anything else in braces is left as it is.
 
@@ -102,6 +104,7 @@ enum Placeholder {
     Date,
     Time,
     Uuid,
+    Selection,
 }
 
 /// Splits `link` into literal text and placeholders: `(start, end, placeholder)`
@@ -135,6 +138,7 @@ fn parse(inner: &str) -> Option<Placeholder> {
         "date" => Some(Placeholder::Date),
         "time" => Some(Placeholder::Time),
         "uuid" => Some(Placeholder::Uuid),
+        "selection" => Some(Placeholder::Selection),
         _ => None,
     };
     if let Some(simple) = simple {
@@ -275,15 +279,33 @@ pub fn expand_moment(link: &str, moment: &Moment) -> String {
         Placeholder::Date => Some(moment.date.clone()),
         Placeholder::Time => Some(moment.time.clone()),
         Placeholder::Uuid => Some(moment.uuid.clone()),
-        Placeholder::Argument(_) => None,
+        Placeholder::Argument(_) | Placeholder::Selection => None,
     })
 }
 
 /// Whether `link` contains `{date}`, `{time}` or `{uuid}`.
 pub fn has_moment(link: &str) -> bool {
+    placeholders(link).iter().any(|(_, _, placeholder)| {
+        matches!(
+            placeholder,
+            Placeholder::Date | Placeholder::Time | Placeholder::Uuid
+        )
+    })
+}
+
+/// Whether `link` contains `{selection}`.
+pub fn has_selection(link: &str) -> bool {
     placeholders(link)
         .iter()
-        .any(|(_, _, placeholder)| !matches!(placeholder, Placeholder::Argument(_)))
+        .any(|(_, _, placeholder)| *placeholder == Placeholder::Selection)
+}
+
+/// `link` with `{selection}` replaced by `text`, encoded as typed values are.
+pub fn fill_selection(link: &str, text: &str) -> String {
+    let value = encode_value(text.trim(), is_url(link));
+    replace_placeholders(link, |placeholder| {
+        (*placeholder == Placeholder::Selection).then(|| value.clone())
+    })
 }
 
 /// Replaces each placeholder `replacement` returns text for.

@@ -38,7 +38,7 @@ use spotlight_platform_win::{
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    win,
+    selection, win,
 };
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{Calculation, Store};
@@ -173,6 +173,8 @@ impl Entry {
 const CALC_ANSWER_ID: &str = "calc:answer";
 /// Item ids of history rows: this, then the calculation's id in the store.
 const HISTORY_ITEM: &str = "calc-history:";
+/// The Selected Text provider: turned off, the selection is never read.
+const SELECTION_PROVIDER: &str = "selection";
 const SEARCH_PLACEHOLDER: &str = "Search apps and commands, or calculate…";
 
 /// An item with an alias or a hotkey, as the settings window lists it.
@@ -267,8 +269,11 @@ pub struct Launcher {
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
     visible: bool,
-    /// The window that was active when the launcher opened, to paste into.
+    /// The window that was active when the launcher opened, to paste into
+    /// and read the selected text from.
     previous_window: isize,
+    /// Whether reading the selected text may fall back to Ctrl+C.
+    selection_copy: bool,
     /// The clipboard preview's image.
     preview_image: Option<PreviewImage>,
     /// Images no longer shown, freed on the next frame (it takes the window).
@@ -395,6 +400,7 @@ impl Launcher {
             list_searcher: Searcher::default(),
             visible: false,
             previous_window: 0,
+            selection_copy: true,
             preview_image: None,
             stale_images: Vec::new(),
             stats: Stats {
@@ -1132,6 +1138,9 @@ impl Launcher {
 
     /// Opens a view, or carries out the command and hides the window.
     fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        if command.needs_selection() {
+            return self.run_with_selection(command.clone(), cx);
+        }
         match command {
             Command::PushView(view) => self.push_view((**view).clone(), window, cx),
             Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
@@ -1205,6 +1214,47 @@ impl Launcher {
         }
     }
 
+    /// Reads the text selected in the app the launcher came from, then runs
+    /// `command` with it. The launcher hides first: the app has to be in
+    /// front for its selection to be read.
+    fn run_with_selection(&mut self, command: Command, cx: &mut Context<Self>) {
+        let provider = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == SELECTION_PROVIDER);
+        if !provider.is_some_and(|ix| self.search.is_enabled(ix)) {
+            self.hide(cx);
+            self.show_hud("Selected Text is turned off in Settings".into(), cx);
+            return;
+        }
+        let outcome = selection::spawn(self.previous_window, self.hwnd, self.selection_copy);
+        self.hide(cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = outcome
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("Couldn't read the selection".into()));
+            this.update(cx, |this, cx| match outcome {
+                Ok(Some(text)) => this.run_command(&command.with_selection(&text), cx),
+                Ok(None) => this.show_hud("No text selected".into(), cx),
+                Err(err) => this.show_hud(err.into(), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Lets reading the selected text use Ctrl+C when an app doesn't share it.
+    pub fn set_selection_copy(&mut self, enabled: bool) {
+        self.selection_copy = enabled;
+    }
+
+    /// Loads provider `id`'s catalog again (its items depend on a setting).
+    pub fn reload_provider(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_catalog(id, window.scale_factor(), cx);
+    }
+
     /// Runs a command in the background and shows what it reports
     /// ("Bluetooth Off", "Volume 40%", or why it failed) in the HUD, unless
     /// the launcher has been opened again meanwhile.
@@ -1268,6 +1318,12 @@ impl Launcher {
             self.record_visit(id.to_owned(), cx);
             self.perform(&action.command, window, cx);
             return;
+        }
+        if action.command.needs_selection() {
+            // The hotkey was pressed in the app whose selection it's for.
+            self.previous_window = system_clipboard::foreground_window();
+            self.record_visit(id.to_owned(), cx);
+            return self.run_with_selection(action.command, cx);
         }
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);

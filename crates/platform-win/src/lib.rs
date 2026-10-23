@@ -19,5 +19,6 @@ pub mod links;
 pub mod metrics;
 pub mod net;
 pub mod registry;
+pub mod selection;
 pub mod system;
 pub mod win;
