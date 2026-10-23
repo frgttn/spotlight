@@ -5541,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
  "embed-resource",
@@ -5553,11 +5553,12 @@ dependencies = [
  "spotlight-store",
  "spotlight-ui",
  "tray-icon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "spotlight-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde_json",
  "unicode-segmentation",
@@ -5565,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight-platform-win"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
  "image",
@@ -5575,7 +5576,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight-providers"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "fend-core",
  "image",
@@ -5587,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight-search"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "nucleo-matcher",
  "spotlight-core",
@@ -5595,7 +5596,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rusqlite",
  "spotlight-core",
@@ -5603,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "spotlight-ui"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
  "gpui",

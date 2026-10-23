@@ -7,7 +7,7 @@ default-members = ["crates/app"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.0"
+version = "0.1.0"
 # Let chains (`if let … && …`) need 1.88.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
