@@ -118,6 +118,16 @@ impl TextInput {
         &self.content
     }
 
+    /// Replaces the text, all of it selected (so typing replaces it), without
+    /// emitting [`Changed`].
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     /// Resets the text without emitting [`Changed`]; the caller refreshes its own state.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.content = "".into();

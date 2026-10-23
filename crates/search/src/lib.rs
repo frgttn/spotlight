@@ -11,6 +11,9 @@ use nucleo_matcher::{
     pattern::{CaseMatching, Normalization, Pattern},
 };
 
+/// Added when the query is exactly the item's alias (case-insensitive): an
+/// alias is a name the user picked for that item, so it goes first.
+const ALIAS_BONUS: f64 = 1000.;
 /// Added when the title or a keyword starts with the query (case-insensitive).
 const PREFIX_BONUS: f64 = 30.;
 /// Points per unit of `ln(1 + frecency)`: one recent use ≈ 10, five ≈ 27, ten ≈ 36.
@@ -24,6 +27,9 @@ pub struct Candidate<'a> {
     pub title: &'a str,
     /// Matched like the title; the best of all of them counts.
     pub keywords: &'a [String],
+    /// The user's alias for the item: matched like a keyword, and an exact
+    /// match ranks the item first.
+    pub alias: Option<&'a str>,
     /// Current (decayed) frecency score; 0 for items never used.
     pub frecency: f64,
 }
@@ -74,6 +80,7 @@ impl Searcher {
                 let title = candidate.title;
                 let matched = std::iter::once(title)
                     .chain(candidate.keywords.iter().map(String::as_str))
+                    .chain(candidate.alias)
                     .filter_map(|text| {
                         let fuzzy =
                             pattern.score(Utf32Str::new(text, &mut self.buf), &mut self.matcher)?;
@@ -86,7 +93,11 @@ impl Searcher {
                     })
                     .reduce(f64::max)?;
                 let used = FRECENCY_WEIGHT * candidate.frecency.max(0.).ln_1p();
-                Some((matched + used, title.len(), ix))
+                let alias = match candidate.alias {
+                    Some(alias) if alias.to_lowercase() == query_lower => ALIAS_BONUS,
+                    _ => 0.,
+                };
+                Some((matched + used + alias, title.len(), ix))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
@@ -102,6 +113,7 @@ mod tests {
         titles.iter().map(|title| Candidate {
             title,
             keywords: &[],
+            alias: None,
             frecency: 0.,
         })
     }
@@ -110,6 +122,7 @@ mod tests {
         titles.iter().map(|&(title, frecency)| Candidate {
             title,
             keywords: &[],
+            alias: None,
             frecency,
         })
     }
@@ -137,17 +150,41 @@ mod tests {
             Candidate {
                 title: "Restart",
                 keywords: &keywords,
+                alias: None,
                 frecency: 0.,
             },
             Candidate {
                 title: "Rebel Galaxy",
                 keywords: &[],
+                alias: None,
                 frecency: 0.,
             },
         ];
         let mut searcher = Searcher::default();
         assert_eq!(searcher.filter("reboot", items), vec![0]);
         assert_eq!(searcher.filter("reb", items).len(), 2);
+    }
+
+    #[test]
+    fn an_exact_alias_goes_first() {
+        let items = [
+            Candidate {
+                title: "Visual Studio Code",
+                keywords: &[],
+                alias: Some("c"),
+                frecency: 0.,
+            },
+            Candidate {
+                title: "Calculator",
+                keywords: &[],
+                alias: None,
+                frecency: 9.,
+            },
+        ];
+        let mut searcher = Searcher::default();
+        assert_eq!(searcher.filter("C", items)[0], 0);
+        // Not the exact alias: the better, more used title wins.
+        assert_eq!(searcher.filter("ca", items)[0], 1);
     }
 
     #[test]

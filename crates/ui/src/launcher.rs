@@ -15,7 +15,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler, Focusable,
-    Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
     UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
     uniform_list,
 };
@@ -23,12 +23,14 @@ use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
-    item::{Action, Command, Icon, SearchItem, SystemCommand},
+    item::{Command, Icon, SearchItem, SystemCommand},
     item_id,
     provider::Provider,
 };
 use spotlight_platform_win::{
-    commands, icons,
+    commands,
+    hotkey::{self, Hotkey, Recorded, SetError},
+    icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     system, win,
 };
@@ -109,6 +111,47 @@ impl Provider for Synthetic {
     }
 }
 
+/// One line in the action panel: an action of the item, or one the launcher
+/// adds to every catalog item (ranking, alias, hotkey).
+#[derive(Clone)]
+struct Entry {
+    title: String,
+    kind: EntryKind,
+}
+
+#[derive(Clone)]
+enum EntryKind {
+    Command(Command),
+    ResetRanking,
+    EditAlias,
+    RemoveAlias,
+    RecordHotkey,
+    RemoveHotkey,
+}
+
+impl Entry {
+    fn needs_confirmation(&self) -> bool {
+        matches!(&self.kind, EntryKind::Command(command) if command.needs_confirmation())
+    }
+}
+
+/// A small card over the window for setting an item's alias or hotkey.
+enum Editor {
+    Alias {
+        item_id: String,
+        title: String,
+        input: Entity<TextInput>,
+    },
+    Hotkey {
+        item_id: String,
+        title: String,
+        /// Why the last combination wasn't taken.
+        message: Option<SharedString>,
+        /// Receives what the recorder hook sees.
+        _recording: Task<()>,
+    },
+}
+
 /// Measurements, shown in the footer and logged to stderr.
 #[derive(Default)]
 struct Stats {
@@ -152,14 +195,22 @@ pub struct Launcher {
     frecency: HashMap<String, Frecency>,
     /// `None` when the database couldn't be opened; usage is then not remembered.
     store: Option<Arc<Mutex<Store>>>,
+    /// Item id → the user's alias for it.
+    aliases: HashMap<String, String>,
+    /// Item id → its registered hotkey.
+    item_hotkeys: HashMap<String, Hotkey>,
+    hotkeys: hotkey::Service,
+    editor: Option<Editor>,
     visible: bool,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
 }
 
 impl Launcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         hotkey: SharedString,
+        hotkeys: hotkey::Service,
         mut providers: Vec<Arc<dyn Provider>>,
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
@@ -201,6 +252,36 @@ impl Launcher {
                 })
             })
             .unwrap_or_default();
+        let (aliases, saved_hotkeys) = store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| {
+                let aliases = store.aliases().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read aliases: {err}");
+                    HashMap::new()
+                });
+                let hotkeys = store.item_hotkeys().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read item hotkeys: {err}");
+                    HashMap::new()
+                });
+                (aliases, hotkeys)
+            })
+            .unwrap_or_default();
+        // Registered now, so they work before the window is ever shown. One
+        // another app has taken since stays saved but inactive for this run.
+        let item_hotkeys = saved_hotkeys
+            .into_iter()
+            .filter_map(|(id, text)| {
+                let hotkey = Hotkey::parse(&text)?;
+                match hotkeys.set_item(&id, Some(hotkey)) {
+                    Ok(()) => Some((id, hotkey)),
+                    Err(err) => {
+                        eprintln!("[spotlight] hotkey {hotkey} for {id:?}: {err}");
+                        None
+                    }
+                }
+            })
+            .collect();
 
         let mut this = Self {
             hwnd,
@@ -224,6 +305,10 @@ impl Launcher {
             icons: HashMap::new(),
             frecency,
             store,
+            aliases,
+            item_hotkeys,
+            hotkeys,
+            editor: None,
             visible: false,
             stats: Stats {
                 hotkey,
@@ -363,9 +448,11 @@ impl Launcher {
         let started = Instant::now();
         let now = frecency::now();
         let frecency = &self.frecency;
-        self.results = self.search.search(query, |id| {
-            frecency.get(id).map_or(0., |used| used.score_at(now))
-        });
+        self.results = self.search.search(
+            query,
+            |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
+            &self.aliases,
+        );
         self.selected = 0;
         self.panel = None;
         self.confirming = None;
@@ -373,17 +460,44 @@ impl Launcher {
         ms(started.elapsed())
     }
 
-    /// The selected item's actions: its own, then the ones the launcher adds.
-    fn actions_for(&self, row: &Row) -> Vec<Action> {
+    /// The item's actions, then the ones the launcher adds to catalog items.
+    /// Computed rows (calculator, web) change with the query, so they can't
+    /// keep an alias, a hotkey or a ranking.
+    fn actions_for(&self, row: &Row) -> Vec<Entry> {
         let item = self.item(row);
-        let mut actions = item.actions.clone();
-        if matches!(row, Row::Catalog(_)) && self.frecency.contains_key(&item.id) {
-            actions.push(Action {
-                title: "Reset Ranking".into(),
-                command: Command::ResetRanking(item.id.clone()),
-            });
+        let mut entries: Vec<Entry> = item
+            .actions
+            .iter()
+            .map(|action| Entry {
+                title: action.title.clone(),
+                kind: EntryKind::Command(action.command.clone()),
+            })
+            .collect();
+        if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
+            return entries;
         }
-        actions
+        let mut add = |title: &str, kind| {
+            entries.push(Entry {
+                title: title.to_owned(),
+                kind,
+            })
+        };
+        if self.aliases.contains_key(&item.id) {
+            add("Change Alias…", EntryKind::EditAlias);
+            add("Remove Alias", EntryKind::RemoveAlias);
+        } else {
+            add("Set Alias…", EntryKind::EditAlias);
+        }
+        if self.item_hotkeys.contains_key(&item.id) {
+            add("Change Hotkey…", EntryKind::RecordHotkey);
+            add("Remove Hotkey", EntryKind::RemoveHotkey);
+        } else {
+            add("Set Hotkey…", EntryKind::RecordHotkey);
+        }
+        if self.frecency.contains_key(&item.id) {
+            add("Reset Ranking", EntryKind::ResetRanking);
+        }
+        entries
     }
 
     fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
@@ -404,10 +518,34 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
+    /// Types into the field that has the keyboard: the alias editor's while it's open.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |input, cx| {
+        let input = match &self.editor {
+            Some(Editor::Alias { input, .. }) => input.clone(),
+            _ => self.input.clone(),
+        };
+        input.update(cx, |input, cx| {
             input.replace_text_in_range(None, text, window, cx)
         });
+    }
+
+    /// The action selected in the open panel. For the self-test.
+    pub fn panel_selected(&self) -> Option<String> {
+        let selected = self.panel?;
+        self.selected_actions()
+            .into_iter()
+            .nth(selected)
+            .map(|entry| entry.title)
+    }
+
+    /// Whether the alias editor is open. For the self-test.
+    pub fn editing_alias(&self) -> bool {
+        matches!(self.editor, Some(Editor::Alias { .. }))
+    }
+
+    /// Item id → alias. For the self-test.
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
     }
 
     /// Every catalog, apps included, has loaded.
@@ -492,6 +630,7 @@ impl Launcher {
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.close_editor(None, cx);
         win::hide(self.hwnd);
         self.visible = false;
         cx.notify();
@@ -526,16 +665,22 @@ impl Launcher {
         }
     }
 
-    fn selected_actions(&self) -> Vec<Action> {
+    fn selected_actions(&self) -> Vec<Entry> {
         self.results
             .get(self.selected)
             .map(|row| self.actions_for(row))
             .unwrap_or_default()
     }
 
-    /// Enter: the action picked in the panel, the one waiting for a second
-    /// Enter, or the primary action.
-    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+    /// Enter: saves the alias being edited, or runs the action picked in the
+    /// panel, the one waiting for a second Enter, or the primary action.
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.editor {
+            Some(Editor::Alias { .. }) => return self.save_alias(window, cx),
+            // The recorder hook takes every key; Enter can't arrive, but just in case.
+            Some(Editor::Hotkey { .. }) => return,
+            None => {}
+        }
         let waiting = self
             .confirming
             .as_ref()
@@ -549,18 +694,26 @@ impl Launcher {
         if self.selected_actions().is_empty() {
             self.hide(cx);
         } else {
-            self.run_action(action, cx);
+            self.run_action(action, window, cx);
         }
     }
 
     /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…).
-    fn secondary_action(&mut self, _: &SecondaryAction, _: &mut Window, cx: &mut Context<Self>) {
-        if self.panel.is_none() {
-            self.run_action(1, cx);
+    fn secondary_action(
+        &mut self,
+        _: &SecondaryAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel.is_none() && self.editor.is_none() {
+            self.run_action(1, window, cx);
         }
     }
 
     fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            return;
+        }
         self.panel = match self.panel {
             Some(_) => None,
             None if !self.selected_actions().is_empty() => Some(0),
@@ -570,37 +723,65 @@ impl Launcher {
         cx.notify();
     }
 
-    /// Runs action `ix` of the selected item. Most actions then hide the window.
-    fn run_action(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Runs action `ix` of the selected item. Commands then hide the window;
+    /// the launcher's own entries (alias, hotkey, ranking) keep it open.
+    fn run_action(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.results.get(self.selected).cloned() else {
             return;
         };
-        let Some(action) = self.actions_for(&row).into_iter().nth(ix) else {
+        let Some(entry) = self.actions_for(&row).into_iter().nth(ix) else {
             return;
         };
         let item = self.item(&row);
         let (id, title) = (item.id.clone(), item.title.clone());
         self.panel = None;
-        if action.command.needs_confirmation()
-            && self.confirming.as_ref() != Some(&(id.clone(), ix))
-        {
+        if entry.needs_confirmation() && self.confirming.as_ref() != Some(&(id.clone(), ix)) {
             self.confirming = Some((id, ix));
             cx.notify();
             return;
         }
         self.confirming = None;
 
+        let command = match entry.kind {
+            EntryKind::Command(command) => command,
+            EntryKind::ResetRanking => {
+                // The point is to see the item drop back.
+                self.reset_ranking(&id, cx);
+                self.show_toast(format!("Ranking reset for {title}").into(), cx);
+                return;
+            }
+            EntryKind::EditAlias => return self.open_alias_editor(id, title, window, cx),
+            EntryKind::RemoveAlias => {
+                self.set_alias(&id, None, cx);
+                self.show_toast(format!("Alias removed from {title}").into(), cx);
+                return;
+            }
+            EntryKind::RecordHotkey => return self.open_hotkey_editor(id, title, cx),
+            EntryKind::RemoveHotkey => {
+                if let Err(err) = self.hotkeys.set_item(&id, None) {
+                    eprintln!("[spotlight] could not remove the hotkey of {id:?}: {err}");
+                }
+                self.item_hotkeys.remove(&id);
+                self.persist_hotkey(&id, None, cx);
+                self.show_toast(format!("Hotkey removed from {title}").into(), cx);
+                return;
+            }
+        };
+        self.run_command(&command, cx);
+        // Only catalog items are ranked, so only their use is worth remembering.
+        if matches!(row, Row::Catalog(_)) {
+            self.record_visit(id, cx);
+        }
+    }
+
+    /// Carries out `command`, hides the window, and shows a HUD where the
+    /// result would otherwise be invisible.
+    fn run_command(&mut self, command: &Command, cx: &mut Context<Self>) {
         let mut hud: Option<SharedString> = None;
-        match &action.command {
+        match command {
             Command::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
-            }
-            Command::ResetRanking(id) => {
-                // Stays open: the point is to see the item drop back.
-                self.reset_ranking(id, cx);
-                self.show_toast(format!("Ranking reset for {title}").into(), cx);
-                return;
             }
             Command::System(SystemCommand::ToggleDarkMode) => {
                 // Read before the toggle runs on its own thread.
@@ -609,19 +790,230 @@ impl Launcher {
                 } else {
                     "Dark Mode"
                 };
-                commands::execute(&action.command);
+                commands::execute(command);
                 hud = Some(next.into());
             }
             command => commands::execute(command),
-        }
-        // Only catalog items are ranked, so only their use is worth remembering.
-        if matches!(row, Row::Catalog(_)) {
-            self.record_visit(id, cx);
         }
         self.hide(cx);
         if let Some(text) = hud {
             self.show_hud(text, cx);
         }
+    }
+
+    /// An item hotkey was pressed: runs that item's primary action without
+    /// showing the launcher. One that asks for confirmation (Shut Down) opens
+    /// the launcher on just that item instead, waiting for Enter.
+    pub fn run_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.search.catalog().iter().position(|item| item.id == id) else {
+            eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)");
+            return;
+        };
+        let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {
+            return;
+        };
+        if action.command.needs_confirmation() {
+            self.show(Instant::now(), window, cx);
+            self.results = vec![Row::Catalog(ix)];
+            self.confirming = Some((id.to_owned(), 0));
+            cx.notify();
+            return;
+        }
+        self.run_command(&action.command, cx);
+        self.record_visit(id.to_owned(), cx);
+    }
+
+    fn open_alias_editor(
+        &mut self,
+        item_id: String,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.aliases.get(&item_id).cloned().unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new("Short name, e.g. vs", cx);
+            input.set_text(current, cx);
+            input
+        });
+        window.focus(&input.focus_handle(cx));
+        self.editor = Some(Editor::Alias {
+            item_id,
+            title,
+            input,
+        });
+        cx.notify();
+    }
+
+    /// Saves the alias being edited (an empty one removes it) and closes the editor.
+    fn save_alias(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Editor::Alias {
+            item_id,
+            title,
+            input,
+        }) = &self.editor
+        else {
+            return;
+        };
+        let (item_id, title) = (item_id.clone(), title.clone());
+        let alias = input.read(cx).text().trim().to_owned();
+        let message = if alias.is_empty() {
+            self.set_alias(&item_id, None, cx);
+            format!("Alias removed from {title}")
+        } else {
+            // One alias, one item: whoever had it loses it.
+            let taken: Vec<String> = self
+                .aliases
+                .iter()
+                .filter(|(other, existing)| {
+                    **other != item_id && existing.eq_ignore_ascii_case(&alias)
+                })
+                .map(|(other, _)| other.clone())
+                .collect();
+            for other in taken {
+                self.set_alias(&other, None, cx);
+            }
+            self.set_alias(&item_id, Some(alias.clone()), cx);
+            format!("Type “{alias}” to find {title}")
+        };
+        self.close_editor(Some(window), cx);
+        self.show_toast(message.into(), cx);
+    }
+
+    fn set_alias(&mut self, item_id: &str, alias: Option<String>, cx: &mut Context<Self>) {
+        match &alias {
+            Some(alias) => self.aliases.insert(item_id.to_owned(), alias.clone()),
+            None => self.aliases.remove(item_id),
+        };
+        let item_id = item_id.to_owned();
+        self.persist(cx, move |store| store.set_alias(&item_id, alias.as_deref()));
+    }
+
+    fn open_hotkey_editor(&mut self, item_id: String, title: String, cx: &mut Context<Self>) {
+        let recording = self.record_hotkey(cx);
+        self.editor = Some(Editor::Hotkey {
+            item_id,
+            title,
+            message: None,
+            _recording: recording,
+        });
+        cx.notify();
+    }
+
+    /// Starts the recorder hook and feeds what it sees to [`Self::recorded`].
+    /// While it runs no other app gets key presses, so it ends on Esc, on a
+    /// combination that's taken, and when the window hides.
+    fn record_hotkey(&self, cx: &mut Context<Self>) -> Task<()> {
+        let (tx, rx) = async_channel::unbounded();
+        self.hotkeys.record(tx);
+        cx.spawn(async move |this, cx| {
+            while let Ok(recorded) = rx.recv().await {
+                let keep = this.update(cx, |this, cx| this.recorded(recorded, cx));
+                if !keep.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// One key press from the recorder. Returns whether to keep recording.
+    fn recorded(&mut self, recorded: Recorded, cx: &mut Context<Self>) -> bool {
+        let Some(Editor::Hotkey {
+            item_id,
+            title,
+            message,
+            ..
+        }) = &mut self.editor
+        else {
+            return false;
+        };
+        let hotkey = match recorded {
+            Recorded::Cancel => {
+                self.close_editor(None, cx);
+                return false;
+            }
+            Recorded::NeedsModifier => {
+                *message = Some("Add Ctrl, Alt, Shift or Win to the key.".into());
+                cx.notify();
+                return true;
+            }
+            Recorded::Hotkey(hotkey) => hotkey,
+        };
+        let (item_id, title) = (item_id.clone(), title.clone());
+        // `set_item` ends recording, whatever the outcome.
+        match self.hotkeys.set_item(&item_id, Some(hotkey)) {
+            Ok(()) => {
+                self.item_hotkeys.insert(item_id.clone(), hotkey);
+                self.persist_hotkey(&item_id, Some(hotkey), cx);
+                self.editor = None;
+                self.show_toast(format!("{hotkey} now runs {title}").into(), cx);
+                false
+            }
+            Err(err) => {
+                let text = match err {
+                    SetError::InUse => format!("{hotkey} is already taken. Try another."),
+                    SetError::Other(err) => format!("Couldn't use {hotkey}: {err}"),
+                };
+                // Listen again for the next try; this task's loop ends.
+                let recording = self.record_hotkey(cx);
+                if let Some(Editor::Hotkey {
+                    message,
+                    _recording,
+                    ..
+                }) = &mut self.editor
+                {
+                    *message = Some(text.into());
+                    *_recording = recording;
+                }
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Closes the alias or hotkey editor, ending recording, and gives the
+    /// search field the keyboard again when there's a `window` to focus.
+    fn close_editor(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        match self.editor.take() {
+            Some(Editor::Hotkey { .. }) => self.hotkeys.resume(),
+            Some(Editor::Alias { .. }) => {}
+            None => return,
+        }
+        if let Some(window) = window {
+            window.focus(&self.input.focus_handle(cx));
+        }
+        cx.notify();
+    }
+
+    fn persist_hotkey(&self, item_id: &str, hotkey: Option<Hotkey>, cx: &mut Context<Self>) {
+        let item_id = item_id.to_owned();
+        let text = hotkey.map(|hotkey| hotkey.to_string());
+        self.persist(cx, move |store| {
+            store.set_item_hotkey(&item_id, text.as_deref())
+        });
+    }
+
+    /// Runs a database write on a background thread; without a database the
+    /// change lasts for this run only.
+    fn persist(
+        &self,
+        cx: &mut Context<Self>,
+        write: impl FnOnce(&Store) -> spotlight_store::Result<()> + Send + 'static,
+    ) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|store| write(&store).map_err(|err| err.to_string()));
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save: {err}");
+                }
+            })
+            .detach();
     }
 
     /// Turns the hidden window into the HUD for a moment. Showing the launcher
@@ -716,9 +1108,11 @@ impl Launcher {
             .detach();
     }
 
-    /// Esc closes the action panel first, then the window.
-    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.panel.take().is_some() {
+    /// Esc closes the alias editor or the action panel first, then the window.
+    fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            self.close_editor(Some(window), cx);
+        } else if self.panel.take().is_some() {
             cx.notify();
         } else {
             self.hide(cx);
@@ -769,6 +1163,22 @@ impl Launcher {
                         .truncate()
                         .child(SharedString::from(item.title.clone())),
                 )
+                .when_some(self.aliases.get(&item.id), |row, alias| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .px(px(6.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(rgba(theme::SURFACE_BORDER))
+                            .text_size(px(11.))
+                            .text_color(rgba(theme::TEXT_MUTED))
+                            .child(SharedString::from(alias.clone())),
+                    )
+                })
+                .when_some(self.item_hotkeys.get(&item.id), |row, hotkey| {
+                    row.child(keycaps(&hotkey_keys(*hotkey)))
+                })
                 .child(
                     div()
                         .flex_none()
@@ -852,7 +1262,9 @@ impl Launcher {
                     .when(ix != selected, |row| {
                         row.hover(|style| style.bg(rgba(0xffffff0f)))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.run_action(ix, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -886,6 +1298,75 @@ impl Launcher {
                     .child(title),
             )
             .children(rows)
+            .into_any_element()
+    }
+
+    /// The alias or hotkey editor: a card above the footer.
+    fn render_editor(&self, editor: &Editor) -> AnyElement {
+        let (heading, body, note, hint): (String, AnyElement, Option<SharedString>, &str) =
+            match editor {
+                Editor::Alias { title, input, .. } => (
+                    format!("Alias for {title}"),
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(rgba(theme::ACCENT))
+                        .bg(rgba(theme::SURFACE))
+                        .child(input.clone())
+                        .into_any_element(),
+                    None,
+                    "Enter saves (empty removes it) · Esc cancels",
+                ),
+                Editor::Hotkey { title, message, .. } => (
+                    format!("Hotkey for {title}"),
+                    div()
+                        .py_1()
+                        .text_size(px(15.))
+                        .child("Press a key combination…")
+                        .into_any_element(),
+                    message.clone(),
+                    "It works everywhere, even with the launcher closed · Esc cancels",
+                ),
+            };
+        div()
+            .absolute()
+            .left(px(10.))
+            .right(px(10.))
+            .bottom(px(38.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgba(theme::SURFACE_BORDER))
+            .bg(rgba(theme::PANEL))
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .truncate()
+                    .child(SharedString::from(heading)),
+            )
+            .child(body)
+            .when_some(note, |card, note| {
+                card.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgba(theme::ERROR))
+                        .child(note),
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_FAINT))
+                    .child(hint),
+            )
             .into_any_element()
     }
 
@@ -1078,6 +1559,9 @@ impl Render for Launcher {
             .when_some(self.panel, |root, selected| {
                 root.child(self.render_panel(selected, cx))
             })
+            .when_some(self.editor.as_ref(), |root, editor| {
+                root.child(self.render_editor(editor))
+            })
             // Last child, so it paints after everything else in the frame.
             .child(
                 canvas(|_, _, _| {}, move |_, _, _, _| paint.borrow_mut().painted())
@@ -1088,12 +1572,22 @@ impl Render for Launcher {
     }
 }
 
+/// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
+/// contain `+` (the plus key displays as `=`, the same key).
+fn hotkey_keys(hotkey: Hotkey) -> String {
+    hotkey.to_string().replace('+', " ")
+}
+
 /// Key caps for a shortcut such as `"Ctrl K"`, one per key.
-fn keycaps(shortcut: &'static str) -> impl IntoElement {
+fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
+    let keys: Vec<SharedString> = shortcut
+        .split(' ')
+        .map(|key| SharedString::from(key.to_owned()))
+        .collect();
     div()
         .flex()
         .gap(px(3.))
-        .children(shortcut.split(' ').map(|key| {
+        .children(keys.into_iter().map(|key| {
             div()
                 .px(px(5.))
                 .rounded(px(4.))
@@ -1145,3 +1639,16 @@ const FILLER: &[&str] = &[
     "image viewer",
     "journal",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkeys_split_into_key_caps() {
+        let caps = |text| hotkey_keys(Hotkey::parse(text).unwrap());
+        assert_eq!(caps("Ctrl+Alt+K"), "Ctrl Alt K");
+        assert_eq!(caps("Win+F12"), "Win F12");
+        assert_eq!(caps("Ctrl++"), "Ctrl =");
+    }
+}

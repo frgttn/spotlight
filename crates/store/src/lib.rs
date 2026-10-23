@@ -1,4 +1,4 @@
-//! SQLite persistence: settings and frecency.
+//! SQLite persistence: settings, frecency, aliases and item hotkeys.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -13,7 +13,8 @@ pub type Result<T> = rusqlite::Result<T>;
 
 /// Schema changes, applied in order. `PRAGMA user_version` records how many
 /// have run, so only append to this list; never edit an entry that shipped.
-const MIGRATIONS: &[&str] = &["CREATE TABLE settings (
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE settings (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
@@ -22,7 +23,16 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE settings (
         score     REAL NOT NULL,
         last_used INTEGER NOT NULL,
         count     INTEGER NOT NULL
-    );"];
+    );",
+    "CREATE TABLE aliases (
+        item_id TEXT PRIMARY KEY,
+        alias   TEXT NOT NULL
+    );
+    CREATE TABLE item_hotkeys (
+        item_id TEXT PRIMARY KEY,
+        hotkey  TEXT NOT NULL
+    );",
+];
 
 pub struct Store {
     conn: Connection,
@@ -122,6 +132,56 @@ impl Store {
         Ok(next)
     }
 
+    /// Item id → alias.
+    pub fn aliases(&self) -> Result<HashMap<String, String>> {
+        self.pairs("SELECT item_id, alias FROM aliases")
+    }
+
+    /// Sets or (with `None`) removes the alias of `item_id`.
+    pub fn set_alias(&self, item_id: &str, alias: Option<&str>) -> Result<()> {
+        self.set_pair("aliases", "alias", item_id, alias)
+    }
+
+    /// Item id → hotkey, in `Hotkey`'s display form.
+    pub fn item_hotkeys(&self) -> Result<HashMap<String, String>> {
+        self.pairs("SELECT item_id, hotkey FROM item_hotkeys")
+    }
+
+    /// Sets or (with `None`) removes the hotkey of `item_id`.
+    pub fn set_item_hotkey(&self, item_id: &str, hotkey: Option<&str>) -> Result<()> {
+        self.set_pair("item_hotkeys", "hotkey", item_id, hotkey)
+    }
+
+    fn pairs(&self, sql: &str) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    }
+
+    /// `table` and `column` are constants from this file, never user input.
+    fn set_pair(
+        &self,
+        table: &str,
+        column: &str,
+        item_id: &str,
+        value: Option<&str>,
+    ) -> Result<()> {
+        match value {
+            Some(value) => self.conn.execute(
+                &format!(
+                    "INSERT INTO {table} (item_id, {column}) VALUES (?1, ?2)
+                     ON CONFLICT (item_id) DO UPDATE SET {column} = excluded.{column}"
+                ),
+                params![item_id, value],
+            )?,
+            None => self.conn.execute(
+                &format!("DELETE FROM {table} WHERE item_id = ?1"),
+                [item_id],
+            )?,
+        };
+        Ok(())
+    }
+
     /// Forgets every use of `item_id`.
     pub fn forget(&self, item_id: &str) -> Result<()> {
         self.conn
@@ -144,6 +204,26 @@ mod tests {
             store.setting("hotkey").unwrap().as_deref(),
             Some("ctrl+space")
         );
+    }
+
+    #[test]
+    fn aliases_and_item_hotkeys_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_alias("apps:code", Some("vs")).unwrap();
+        store.set_alias("apps:code", Some("code")).unwrap();
+        store.set_alias("system:lock", Some("l")).unwrap();
+        store.set_alias("system:lock", None).unwrap();
+        assert_eq!(
+            store.aliases().unwrap(),
+            HashMap::from([("apps:code".to_owned(), "code".to_owned())])
+        );
+
+        store
+            .set_item_hotkey("system:lock", Some("Ctrl+Alt+L"))
+            .unwrap();
+        assert_eq!(store.item_hotkeys().unwrap()["system:lock"], "Ctrl+Alt+L");
+        store.set_item_hotkey("system:lock", None).unwrap();
+        assert!(store.item_hotkeys().unwrap().is_empty());
     }
 
     #[test]

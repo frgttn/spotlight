@@ -90,8 +90,6 @@ pub enum Command {
     OpenUrl(String),
     /// Puts text on the clipboard.
     Copy(String),
-    /// Forgets how often and how recently this item (by id) was used.
-    ResetRanking(String),
     System(SystemCommand),
 }
 

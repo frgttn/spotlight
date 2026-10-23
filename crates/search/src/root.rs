@@ -3,7 +3,7 @@
 //! The list is, in order: answers computed from the query (calculator, URL),
 //! catalog items ranked by [`Searcher`], then fallbacks (web search).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use spotlight_core::{item::SearchItem, provider::Provider};
 
@@ -53,8 +53,14 @@ impl RootSearch {
         &self.catalog
     }
 
-    /// `frecency` maps an item id to its current (decayed) score.
-    pub fn search(&mut self, query: &str, frecency: impl Fn(&str) -> f64) -> Vec<Row> {
+    /// `frecency` maps an item id to its current (decayed) score; `aliases`
+    /// maps item ids to the user's aliases.
+    pub fn search(
+        &mut self,
+        query: &str,
+        frecency: impl Fn(&str) -> f64,
+        aliases: &HashMap<String, String>,
+    ) -> Vec<Row> {
         let query = query.trim();
         let mut rows: Vec<Row> = self
             .providers
@@ -66,6 +72,7 @@ impl RootSearch {
         let candidates = self.catalog.iter().map(|item| Candidate {
             title: &item.title,
             keywords: &item.keywords,
+            alias: aliases.get(&item.id).map(String::as_str),
             frecency: frecency(&item.id),
         });
         rows.extend(
@@ -148,17 +155,17 @@ mod tests {
     fn answers_first_then_ranked_then_fallbacks() {
         let mut search = search_with(&[&["Calculator", "Paint"]]);
 
-        let rows = search.search("paint", |_| 0.);
+        let rows = search.search("paint", |_| 0., &HashMap::new());
         assert_eq!(titles(&search, &rows), ["Paint", "Search paint"]);
 
-        let rows = search.search("1+1", |_| 0.);
+        let rows = search.search("1+1", |_| 0., &HashMap::new());
         assert_eq!(titles(&search, &rows), ["2", "Search 1+1"]);
     }
 
     #[test]
     fn empty_query_lists_catalog_without_fallbacks() {
         let mut search = search_with(&[&["Calculator", "Paint"]]);
-        let rows = search.search("  ", |_| 0.);
+        let rows = search.search("  ", |_| 0., &HashMap::new());
         assert_eq!(titles(&search, &rows), ["Calculator", "Paint"]);
     }
 
@@ -178,7 +185,11 @@ mod tests {
     #[test]
     fn frecency_reorders_catalog() {
         let mut search = search_with(&[&["Calculator", "Paint"]]);
-        let rows = search.search("", |id| if id == "fixed:Paint" { 1. } else { 0. });
+        let rows = search.search(
+            "",
+            |id| if id == "fixed:Paint" { 1. } else { 0. },
+            &HashMap::new(),
+        );
         assert_eq!(titles(&search, &rows), ["Paint", "Calculator"]);
     }
 }

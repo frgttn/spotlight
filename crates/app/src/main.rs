@@ -112,8 +112,9 @@ fn main() {
         hotkey
     });
     let (presses_tx, presses_rx) = async_channel::unbounded::<Instant>();
-    let (hotkeys, registered) =
-        hotkey::spawn(saved_hotkey, presses_tx.clone()).expect("failed to start the hotkey thread");
+    let (item_presses_tx, item_presses_rx) = async_channel::unbounded::<String>();
+    let (hotkeys, registered) = hotkey::spawn(saved_hotkey, presses_tx.clone(), item_presses_tx)
+        .expect("failed to start the hotkey thread");
     let hotkey = match registered {
         Ok(hotkey) => {
             if saved_hotkey.is_some_and(|saved| saved != hotkey) {
@@ -138,6 +139,7 @@ fn main() {
         let (width, height) = launcher::WINDOW_SIZE;
         let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
         let launcher_store = store.clone();
+        let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
         let window = cx
             .open_window(
@@ -159,6 +161,7 @@ fn main() {
                     cx.new(|cx| {
                         Launcher::new(
                             label,
+                            launcher_hotkeys,
                             spotlight_providers::all(),
                             synthetic,
                             launcher_store,
@@ -176,6 +179,18 @@ fn main() {
                 window
                     .update(cx, |launcher, window, cx| {
                         launcher.toggle(pressed_at, window, cx)
+                    })
+                    .ok();
+            }
+        })
+        .detach();
+
+        // Item hotkeys run their item's primary action.
+        cx.spawn(async move |cx| {
+            while let Ok(item_id) = item_presses_rx.recv().await {
+                window
+                    .update(cx, |launcher, window, cx| {
+                        launcher.run_by_id(&item_id, window, cx)
                     })
                     .ok();
             }
