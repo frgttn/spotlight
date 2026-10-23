@@ -37,11 +37,6 @@ pub const PRESETS: &[Preset] = &[
         template: "https://www.ecosia.org/search?q={query}",
     },
     Preset {
-        id: "yandex",
-        name: "Yandex",
-        template: "https://yandex.com/search/?text={query}",
-    },
-    Preset {
         id: "perplexity",
         name: "Perplexity",
         template: "https://www.perplexity.ai/search?q={query}",
