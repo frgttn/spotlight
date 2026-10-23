@@ -644,6 +644,7 @@ impl Launcher {
 
     pub fn set_smooth_scrolling(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.scroll.set_enabled(enabled);
+        self.set_detail_smooth_scrolling(enabled);
         cx.notify();
     }
 
@@ -2201,7 +2202,9 @@ impl Render for Launcher {
                 .into_any_element();
         }
         self.drop_stale_images(window);
-        if self.scroll.tick() {
+        // Both run, so neither waits on the other's frame.
+        let detail_moving = self.tick_detail_scroll();
+        if self.scroll.tick() || detail_moving {
             window.request_animation_frame();
         }
 

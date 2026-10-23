@@ -9,7 +9,12 @@ use gpui::{
 use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, View};
 
 use super::{Launcher, Row, keycaps};
-use crate::{markdown, text_input::TextInput, theme};
+use crate::{
+    markdown,
+    smooth_scroll::{Scroller, capture_wheel},
+    text_input::TextInput,
+    theme,
+};
 
 /// Tiles per grid row.
 pub(super) const GRID_COLUMNS: usize = 5;
@@ -31,7 +36,8 @@ pub(super) enum Screen {
     },
     Detail {
         view: DetailView,
-        scroll: ScrollHandle,
+        /// Eased like the result list while smooth scrolling is on.
+        scroll: Scroller,
     },
     Form(FormState),
 }
@@ -83,7 +89,8 @@ impl FieldInput {
 }
 
 impl Screen {
-    fn new(view: View, cx: &mut Context<Launcher>) -> Self {
+    /// `smooth`: whether scrolling it animates (the Smooth Scrolling setting).
+    fn new(view: View, smooth: bool, cx: &mut Context<Launcher>) -> Self {
         match view {
             View::List(view) => Screen::List {
                 view,
@@ -99,7 +106,7 @@ impl Screen {
             },
             View::Detail(view) => Screen::Detail {
                 view,
-                scroll: ScrollHandle::new(),
+                scroll: Scroller::new(ScrollHandle::new(), smooth),
             },
             View::Form(view) => {
                 let inputs = view
@@ -165,7 +172,7 @@ impl Screen {
 impl Launcher {
     /// Opens `view` on top of the current screen.
     pub(super) fn push_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
-        let screen = Screen::new(view, cx);
+        let screen = Screen::new(view, self.scroll.is_enabled(), cx);
         self.screens.push(screen);
         self.enter_screen(window, cx);
     }
@@ -320,12 +327,28 @@ impl Launcher {
 
     /// ↑/↓ in a detail view scroll it.
     pub(super) fn detail_scroll(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(Screen::Detail { scroll, .. }) = self.screens.last() {
-            let mut offset = scroll.offset();
-            // Offsets are negative: scrolling down makes `y` smaller.
-            offset.y += px(if down { -DETAIL_STEP } else { DETAIL_STEP });
-            scroll.set_offset(offset);
+        if let Some(Screen::Detail { scroll, .. }) = self.screens.last_mut() {
+            // Positive deltas move the content down, as for the wheel.
+            scroll.scroll_by(px(if down { -DETAIL_STEP } else { DETAIL_STEP }));
             cx.notify();
+        }
+    }
+
+    /// Advances the open detail view's scrolling by a frame; returns whether
+    /// another frame is needed.
+    pub(super) fn tick_detail_scroll(&mut self) -> bool {
+        match self.screens.last_mut() {
+            Some(Screen::Detail { scroll, .. }) => scroll.tick(),
+            _ => false,
+        }
+    }
+
+    /// Turns smooth scrolling on or off in every open detail view.
+    pub(super) fn set_detail_smooth_scrolling(&mut self, enabled: bool) {
+        for screen in &mut self.screens {
+            if let Screen::Detail { scroll, .. } = screen {
+                scroll.set_enabled(enabled);
+            }
         }
     }
 
@@ -446,7 +469,7 @@ impl Launcher {
         match self.screens.last()? {
             Screen::List { grid: true, .. } => Some(self.render_grid(cx)),
             Screen::List { grid: false, .. } => None,
-            Screen::Detail { view, scroll } => Some(render_detail(view, scroll)),
+            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, cx)),
             Screen::Form(form) => Some(self.render_form(form, window, cx)),
         }
     }
@@ -722,23 +745,41 @@ impl Launcher {
 /// change the choice (elsewhere Space types a space).
 pub(super) const CHOICE_CONTEXT: &str = "FormChoice";
 
-fn render_detail(view: &DetailView, scroll: &ScrollHandle) -> AnyElement {
+fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher>) -> AnyElement {
     let text = div()
         .id("detail")
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .size_full()
         .overflow_y_scroll()
-        .track_scroll(scroll)
+        .track_scroll(&scroll.handle())
         .px_5()
         .py_4()
         .text_size(px(14.))
         .child(markdown::render(&view.markdown));
+    // Wheel notches are animated instead; everything else falls through to GPUI.
+    let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Launcher, delta, cx| {
+        let Some(Screen::Detail { scroll, .. }) = this.screens.last_mut() else {
+            return false;
+        };
+        if !scroll.is_enabled() {
+            return false;
+        }
+        scroll.scroll_by(delta);
+        cx.notify();
+        true
+    });
     div()
         .flex_1()
         .min_h_0()
         .flex()
-        .child(text)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(text)
+                .child(wheel),
+        )
         .when(!view.metadata.is_empty(), |body| {
             body.child(
                 div()
