@@ -2,7 +2,6 @@
 //! runs their actions (see `spotlight_core::item::Command`).
 
 pub mod apps;
-pub mod bangs;
 pub mod calc;
 pub mod clipboard;
 pub mod control_panel;
@@ -96,10 +95,7 @@ pub fn all(
         Arc::new(system::System),
         clipboard.clone(),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
-        Arc::new(quicklinks::Quicklinks::new(
-            store.clone(),
-            bangs::Bangs::new(data_dir),
-        )),
+        Arc::new(quicklinks::Quicklinks::new(store.clone())),
         Arc::new(snippets::Snippets::new(store)),
         web.clone(),
         Arc::new(selection::Selection::new(

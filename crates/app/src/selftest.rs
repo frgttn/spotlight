@@ -212,7 +212,6 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("form", form_round_trip(window, cx).await),
         ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
-        ("bangs", bangs_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
@@ -1056,72 +1055,5 @@ async fn snippet_paste(window: WindowHandle<Launcher>, target: isize, cx: &mut A
         format!("pasted into {target:#x}")
     } else {
         format!("copied only: {previous:#x} was in front, not {target:#x}")
-    }
-}
-
-/// The bangs list (downloaded on first use, so it waits for it): `!reddit
-/// rust` fills Reddit's bang, Enter on `!reddi` completes it to `!reddit `,
-/// and Search Bangs lists them all. Nothing is opened.
-async fn bangs_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
-    let executor = cx.background_executor().clone();
-    let first = |cx: &mut AsyncApp| {
-        window
-            .update(cx, |launcher, _, _| {
-                launcher.result_titles().into_iter().next()
-            })
-            .ok()
-            .flatten()
-    };
-    let mut found = None;
-    for _ in 0..50 {
-        press(window, "ctrl-a", cx);
-        window
-            .update(cx, |launcher, window, cx| {
-                launcher.type_text("!reddit rust", window, cx)
-            })
-            .ok();
-        executor.timer(Duration::from_millis(200)).await;
-        found = first(cx);
-        if found.as_deref() == Some("Reddit “rust”") {
-            break;
-        }
-    }
-    if found.as_deref() != Some("Reddit “rust”") {
-        return format!("bangs not loaded, offline? ({found:?})");
-    }
-
-    press(window, "ctrl-a", cx);
-    window
-        .update(cx, |launcher, window, cx| {
-            launcher.type_text("!reddi", window, cx)
-        })
-        .ok();
-    executor.timer(Duration::from_millis(SETTLE_MS)).await;
-    if first(cx).as_deref() != Some("Reddit") {
-        return format!("!reddi doesn't suggest Reddit ({:?})", first(cx));
-    }
-    press(window, "enter", cx);
-    executor.timer(Duration::from_millis(SETTLE_MS)).await;
-    let query = window
-        .update(cx, |launcher, _, cx| launcher.query(cx))
-        .unwrap_or_default();
-    if query != "!reddit " {
-        return format!("Enter completed to {query:?}");
-    }
-
-    if let Err(why) = open_from_search(window, "search bangs", "Search Bangs", cx).await {
-        return why;
-    }
-    let (title, rows) = window
-        .update(cx, |launcher, _, _| {
-            (launcher.screen_title(), launcher.result_titles().len())
-        })
-        .unwrap_or_default();
-    if title.as_deref() != Some("Bangs") || rows < 5000 {
-        return format!("list gave {title:?} with {rows} rows");
-    }
-    match back_to_search(window, cx).await {
-        Ok(()) => format!("!reddit filled in, !reddi completed, {rows} listed, back to search"),
-        Err(why) => why,
     }
 }

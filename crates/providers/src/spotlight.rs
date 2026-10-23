@@ -39,8 +39,8 @@ const SHORTCUTS: &str = "\
 
 ## Quicklinks
 
-- **!gh tokio** (or **tokio !gh**) opens the quicklink with keyword *gh* with “tokio” filled in, or else one of ~10,000 search bangs (Kagi's, as in Helium)
-- **!g** lists the keywords starting with *g*; **Enter** completes one; *Search Bangs* lists them all
+- **!gh tokio** (or **tokio !gh**) opens the quicklink with keyword *gh* with “tokio” filled in
+- **!g** lists the keywords starting with *g*; **Enter** completes one; *Search Quicklinks* lists them all
 - *Create Quicklink* saves a link of your own: put **{query}** where the text goes, or **{argument name=\"Repo\"}** for several values
 - **{date}**, **{time}** and **{uuid}** are filled in when the link opens
 ";

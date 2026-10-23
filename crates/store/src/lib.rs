@@ -90,11 +90,86 @@ const MIGRATIONS: &[&str] = &[
         keyword    TEXT UNIQUE,
         created_at INTEGER NOT NULL
     );",
+    // No schema change: swaps the first nine default quicklinks for the
+    // current `quicklink::DEFAULTS`; see `refresh_default_quicklinks`.
+    "SELECT 1;",
 ];
 
 /// The migration that creates `quicklinks`: databases created before it get
 /// the default quicklinks once too, and deleting them later sticks.
 const QUICKLINKS_MIGRATION: usize = 3;
+
+/// The migration that replaces [`LEGACY_DEFAULTS`] with the current defaults.
+const QUICKLINKS_REFRESH_MIGRATION: usize = 6;
+
+/// The quicklinks the first databases were seeded with (name, keyword, link).
+/// Removed, if still as they were saved, when the defaults were replaced.
+const LEGACY_DEFAULTS: &[(&str, &str, &str)] = &[
+    ("Search GitHub", "gh", "https://github.com/search?q={query}"),
+    (
+        "Search YouTube",
+        "yt",
+        "https://www.youtube.com/results?search_query={query}",
+    ),
+    (
+        "Search Wikipedia",
+        "w",
+        "https://en.wikipedia.org/w/index.php?search={query}",
+    ),
+    (
+        "Search Google Maps",
+        "maps",
+        "https://www.google.com/maps/search/{query}",
+    ),
+    (
+        "Translate",
+        "tr",
+        "https://translate.google.com/?sl=auto&text={argument name=\"Text\"}&tl={argument name=\"To\" options=\"en,ru,uk,de,fr,es\"}",
+    ),
+    (
+        "Search Stack Overflow",
+        "so",
+        "https://stackoverflow.com/search?q={query}",
+    ),
+    (
+        "Search crates.io",
+        "crates",
+        "https://crates.io/search?q={query}",
+    ),
+    (
+        "Search docs.rs",
+        "docs",
+        "https://docs.rs/releases/search?query={query}",
+    ),
+    (
+        "Search MDN",
+        "mdn",
+        "https://developer.mozilla.org/en-US/search?q={query}",
+    ),
+];
+
+/// Drops the legacy defaults the user hasn't changed, then adds every current
+/// default whose keyword or name and link isn't already taken (so the user's
+/// own quicklinks, and edited old ones, are left alone).
+fn refresh_default_quicklinks(tx: &rusqlite::Transaction) -> Result<()> {
+    for (name, keyword, link) in LEGACY_DEFAULTS {
+        tx.execute(
+            "DELETE FROM quicklinks
+             WHERE name = ?1 AND link = ?2 AND keyword = ?3 AND open_with IS NULL",
+            params![name, link, keyword],
+        )?;
+    }
+    for (name, keyword, link) in quicklink::DEFAULTS {
+        tx.execute(
+            "INSERT INTO quicklinks (name, link, keyword)
+             SELECT ?1, ?2, ?3
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM quicklinks WHERE keyword = ?3 OR (name = ?1 AND link = ?2))",
+            params![name, link, keyword],
+        )?;
+    }
+    Ok(())
+}
 
 /// How many calculations the history keeps; older ones go.
 const CALCULATIONS_KEPT: i64 = 200;
@@ -202,6 +277,9 @@ impl Store {
                             params![name, link, keyword],
                         )?;
                     }
+                }
+                if ix == QUICKLINKS_REFRESH_MIGRATION {
+                    refresh_default_quicklinks(&tx)?;
                 }
             }
             tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
@@ -731,6 +809,54 @@ mod tests {
             history[0].expression,
             format!("{}+0", CALCULATIONS_KEPT + 4)
         );
+    }
+
+    #[test]
+    fn old_databases_swap_their_stock_quicklinks_for_the_new_defaults() {
+        // A database from before the defaults were replaced.
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..QUICKLINKS_REFRESH_MIGRATION] {
+            conn.execute_batch(migration).unwrap();
+        }
+        for (name, keyword, link) in LEGACY_DEFAULTS {
+            conn.execute(
+                "INSERT INTO quicklinks (name, link, keyword) VALUES (?1, ?2, ?3)",
+                params![name, link, keyword],
+            )
+            .unwrap();
+        }
+        // The user edited one stock link, and has their own using a new default's keyword.
+        conn.execute(
+            "UPDATE quicklinks SET name = 'My YouTube' WHERE keyword = 'yt'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO quicklinks (name, link, keyword) VALUES ('Mine', 'https://x.com/{query}', 'g')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", QUICKLINKS_REFRESH_MIGRATION as i64)
+            .unwrap();
+
+        let store = Store::init(conn).unwrap();
+        let links = store.quicklinks().unwrap();
+        let names: Vec<_> = links.iter().map(|link| link.name.as_str()).collect();
+        // Stock ones gone, replaced by the new GitHub; edited and own ones kept.
+        assert!(!names.contains(&"Search GitHub"));
+        assert!(names.contains(&"GitHub"));
+        assert!(names.contains(&"My YouTube"));
+        assert!(!names.contains(&"YouTube"), "its keyword is taken");
+        assert!(names.contains(&"Mine"));
+        assert!(!names.contains(&"Google"), "its keyword is taken");
+        let keywords: Vec<_> = links.iter().filter_map(|l| l.keyword.as_deref()).collect();
+        let mut unique = keywords.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keywords.len());
+        // Fresh databases end up with exactly the defaults.
+        let fresh = Store::open_in_memory().unwrap().quicklinks().unwrap();
+        assert_eq!(fresh.len(), quicklink::DEFAULTS.len());
     }
 
     #[test]

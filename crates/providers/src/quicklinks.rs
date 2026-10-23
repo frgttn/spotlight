@@ -1,14 +1,8 @@
 //! Quicklinks: links the user saved under a name, as root-search commands.
 //! A link with arguments opens a form for them first; `!keyword text` in
 //! root search opens it straight away with `text` filled in.
-//!
-//! `!keyword` also reaches the ten thousand search bangs of [`Bangs`] when no
-//! quicklink of the user's has that keyword.
 
-use std::{
-    sync::{Arc, Mutex, OnceLock, RwLock},
-    thread,
-};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use spotlight_core::{
     item::{Action, Command, Icon, SearchItem},
@@ -20,18 +14,11 @@ use spotlight_core::{
 use spotlight_platform_win::links::{self, Browser};
 use spotlight_store::Store;
 
-use crate::{
-    bangs::{self, Bang, Bangs},
-    glyph,
-};
+use crate::glyph;
 
 pub const ID: &str = "quicklinks";
-/// Item ids of bang rows: this, then the bang's trigger.
-const BANG_ITEM: &str = "bangs";
-/// The view id of the list of every bang, for `Command::OpenProviderView`.
-const BANGS_VIEW: &str = "bangs";
 
-/// How many quicklinks and bangs `!` followed by part of a keyword lists.
+/// How many quicklinks `!` followed by part of a keyword lists.
 const BANG_SUGGESTIONS: usize = 8;
 
 pub struct Quicklinks {
@@ -41,16 +28,14 @@ pub struct Quicklinks {
     links: RwLock<Vec<Quicklink>>,
     /// Looked up once, for the Open With choice.
     browsers: OnceLock<Vec<Browser>>,
-    bangs: Arc<Bangs>,
 }
 
 impl Quicklinks {
-    pub fn new(store: Option<Arc<Mutex<Store>>>, bangs: Bangs) -> Self {
+    pub fn new(store: Option<Arc<Mutex<Store>>>) -> Self {
         Self {
             store,
             links: RwLock::new(Vec::new()),
             browsers: OnceLock::new(),
-            bangs: Arc::new(bangs),
         }
     }
 
@@ -196,20 +181,10 @@ impl Provider for Quicklinks {
     }
 
     fn description(&self) -> &'static str {
-        "Your saved links and !bang searches. Off, it downloads no bangs."
+        "Your saved links and !keyword searches."
     }
 
     fn catalog(&self) -> Vec<SearchItem> {
-        // Reading and refreshing the bangs (a 1.4 MB download) mustn't hold
-        // up the user's own quicklinks.
-        let bangs = self.bangs.clone();
-        let loading = thread::Builder::new()
-            .name("bangs".into())
-            .spawn(move || bangs.load());
-        if let Err(err) = loading {
-            eprintln!("[quicklinks] could not start loading bangs: {err}");
-        }
-
         let links = self.load();
         // The stock quicklinks are too many for root search: they're reached
         // with `!keyword` or through Search Quicklinks. Any the user has
@@ -231,22 +206,9 @@ impl Provider for Quicklinks {
         items.push(
             SearchItem::new(item_id(ID, "search"), "Search Quicklinks")
                 .subtitle("Quicklinks")
-                .keywords(&["bookmarks", "bangs"])
+                .keywords(&["bookmarks", "keywords", "!"])
                 .icon(Icon::Glyph(glyph::LINK))
                 .action("Show Quicklinks", Command::PushView(Box::new(list))),
-        );
-        items.push(
-            SearchItem::new(item_id(ID, "search-bangs"), "Search Bangs")
-                .subtitle("Quicklinks")
-                .keywords(&["bangs", "!", "kagi", "helium", "duckduckgo"])
-                .icon(Icon::Glyph(glyph::SEARCH))
-                .action(
-                    "Show Bangs",
-                    Command::OpenProviderView {
-                        provider: ID.into(),
-                        view: BANGS_VIEW.into(),
-                    },
-                ),
         );
         if self.editable() {
             let blank = Quicklink {
@@ -260,7 +222,7 @@ impl Provider for Quicklinks {
             items.push(
                 SearchItem::new(item_id(ID, "create"), "Create Quicklink")
                     .subtitle("Quicklinks")
-                    .keywords(&["new quicklink", "add link", "bookmark", "bang"])
+                    .keywords(&["new quicklink", "add link", "bookmark"])
                     .icon(Icon::Glyph(glyph::ADD))
                     .action("Create Quicklink", Command::PushView(Box::new(create))),
             );
@@ -272,8 +234,8 @@ impl Provider for Quicklinks {
     }
 
     /// `!gh tokio` (or `tokio !gh`): the quicklink with keyword "gh" with
-    /// "tokio" filled in, or else the bang "gh". While the keyword is typed,
-    /// `!g` lists those starting with "g"; Enter completes one to `!gh `.
+    /// "tokio" filled in. While the keyword is typed, `!g` lists those
+    /// starting with "g"; Enter completes one to `!gh `.
     fn answers(&self, query: &str) -> Vec<SearchItem> {
         let Some((keyword, text)) = quicklink::parse_bang(query) else {
             return Vec::new();
@@ -282,16 +244,10 @@ impl Provider for Quicklinks {
             return Vec::new();
         };
         if let Some(text) = text {
-            if let Some(link) = links
+            return links
                 .iter()
                 .find(|link| link.keyword.as_deref() == Some(keyword.as_str()))
-            {
-                return vec![self.filled(link, &keyword, text)];
-            }
-            return self
-                .bangs
-                .find(&keyword)
-                .map(|bang| self.bang_answer(&keyword, &bang, text))
+                .map(|link| self.filled(link, &keyword, text))
                 .into_iter()
                 .collect();
         }
@@ -305,7 +261,7 @@ impl Provider for Quicklinks {
                 known.starts_with(&keyword)
             }
         };
-        let mut items: Vec<SearchItem> = links
+        links
             .iter()
             .filter(|link| link.keyword.as_deref().is_some_and(matches))
             .take(BANG_SUGGESTIONS)
@@ -317,49 +273,7 @@ impl Provider for Quicklinks {
                 }
                 item
             })
-            .collect();
-        let taken = |trigger: &str| {
-            links
-                .iter()
-                .any(|link| link.keyword.as_deref() == Some(trigger))
-        };
-        if complete {
-            if !taken(&keyword)
-                && let Some(bang) = self.bangs.find(&keyword)
-            {
-                items.push(self.bang_suggestion(&keyword, &bang, true));
-            }
-        } else {
-            let room = BANG_SUGGESTIONS.saturating_sub(items.len());
-            items.extend(
-                self.bangs
-                    .starting_with(&keyword, room, taken)
-                    .into_iter()
-                    .map(|(trigger, bang)| self.bang_suggestion(&trigger, &bang, false)),
-            );
-        }
-        items
-    }
-
-    /// Every bang, to browse like Helium's bangs page.
-    fn view(&self, id: &str) -> Option<View> {
-        if id != BANGS_VIEW {
-            return None;
-        }
-        let bangs = self.bangs.all();
-        Some(View::List(ListView {
-            title: "Bangs".into(),
-            placeholder: Some(format!(
-                "Search {} bangs by site or trigger · {}",
-                bangs.len(),
-                bangs::ATTRIBUTION
-            )),
-            items: bangs.iter().map(bang_row).collect(),
-            empty: Some(
-                "The bangs haven't been downloaded yet. Check the connection and try again.".into(),
-            ),
-            filters: Vec::new(),
-        }))
+            .collect()
     }
 }
 
@@ -377,59 +291,6 @@ impl Quicklinks {
         .action("Open", open_action(link, &values).command)
         .action("Copy Link", Command::Copy(filled))
     }
-
-    /// The bang `trigger` opened with `text`.
-    fn bang_answer(&self, trigger: &str, bang: &Bang, text: &str) -> SearchItem {
-        let url = bang.url(text);
-        let mut item = SearchItem::new(
-            item_id(BANG_ITEM, trigger),
-            format!("{} “{text}”", bang.name),
-        )
-        .subtitle(format!("!{trigger}  ·  {}", bang.host()))
-        .icon(Icon::Glyph(glyph::LINK))
-        // A list from the web may only open web pages, unlike the user's own links.
-        .action("Open", Command::OpenUrl(url.clone()))
-        .action("Copy Link", Command::Copy(url));
-        self.add_save_action(&mut item, trigger, bang);
-        item
-    }
-
-    /// A bang whose trigger is being typed (Enter completes it) or is
-    /// complete (Enter opens the site).
-    fn bang_suggestion(&self, trigger: &str, bang: &Bang, complete: bool) -> SearchItem {
-        let mut item = SearchItem::new(item_id(BANG_ITEM, trigger), bang.name.clone())
-            .subtitle(format!("!{trigger}  ·  {}", bang.host()))
-            .icon(Icon::Glyph(glyph::LINK));
-        if !complete {
-            item.actions.push(complete_action(trigger));
-        }
-        let mut item = item.action(
-            format!("Open {}", bang.host()),
-            Command::OpenUrl(bang.home()),
-        );
-        self.add_save_action(&mut item, trigger, bang);
-        item
-    }
-
-    /// "Save as Quicklink…": the bang as a quicklink of the user's, to
-    /// change, under the same keyword.
-    fn add_save_action(&self, item: &mut SearchItem, trigger: &str, bang: &Bang) {
-        if !self.editable() {
-            return;
-        }
-        let link = Quicklink {
-            id: 0,
-            name: bang.name.clone(),
-            link: bang.quicklink(),
-            keyword: Some(trigger.to_owned()),
-            open_with: None,
-        };
-        let form = self.edit_form("Save Bang as Quicklink", &link);
-        item.actions.push(Action {
-            title: "Save as Quicklink…".into(),
-            command: Command::PushView(Box::new(form)),
-        });
-    }
 }
 
 /// Enter on a suggestion: `!g` becomes `!gh `, ready for the text.
@@ -438,32 +299,6 @@ fn complete_action(trigger: &str) -> Action {
         title: format!("Use !{trigger}"),
         command: Command::Complete(format!("!{trigger} ")),
     }
-}
-
-/// A row of the bangs list, found by name, trigger or site.
-fn bang_row(bang: &Bang) -> SearchItem {
-    let trigger = &bang.triggers[0];
-    let shown: Vec<String> = bang
-        .triggers
-        .iter()
-        .take(3)
-        .map(|trigger| format!("!{trigger}"))
-        .collect();
-    let mut item = SearchItem::new(item_id(BANG_ITEM, trigger), bang.name.clone())
-        .subtitle(shown.join("  "))
-        .icon(Icon::Glyph(glyph::LINK))
-        .action(
-            format!("Use !{trigger}"),
-            Command::Complete(format!("!{trigger} ")),
-        )
-        .action(
-            format!("Open {}", bang.host()),
-            Command::OpenUrl(bang.home()),
-        )
-        .action("Copy Bang", Command::Copy(format!("!{trigger}")));
-    item.keywords = bang.triggers.clone();
-    item.keywords.push(bang.host().to_owned());
-    item
 }
 
 /// Opens `link`, or its form when an argument is still missing: `values` are
@@ -562,16 +397,9 @@ mod tests {
 
     use super::*;
 
-    /// GitHub's bang loses "gh" to the default quicklink, but keeps "git".
-    const BANGS: &str = r#"[
-        {"s": "GitHub", "ts": ["gh", "git", "github"], "u": "https://github.com/search?q={searchTerms}"},
-        {"s": "Startpage", "ts": ["sp", "startpage"], "u": "https://www.startpage.com/do/search?q={searchTerms}"},
-        {"s": "Wikipedia", "ts": ["wiki"], "u": "https://wikipedia.org/w/index.php?search={searchTerms}"}
-    ]"#;
-
     fn provider() -> Quicklinks {
         let store = Store::open_in_memory().unwrap();
-        let provider = Quicklinks::new(Some(Arc::new(Mutex::new(store))), Bangs::from_json(BANGS));
+        let provider = Quicklinks::new(Some(Arc::new(Mutex::new(store))));
         // Let tests not depend on the browsers of the machine.
         provider.browsers.set(Vec::new()).unwrap();
         provider
@@ -603,10 +431,7 @@ mod tests {
     fn stock_quicklinks_stay_out_of_root_search() {
         let provider = provider();
         let items = provider.catalog();
-        assert_eq!(
-            titles(&items),
-            ["Search Quicklinks", "Search Bangs", "Create Quicklink"]
-        );
+        assert_eq!(titles(&items), ["Search Quicklinks", "Create Quicklink"]);
         assert_eq!(all_links(&items).len(), DEFAULTS.len());
 
         // Changing one (or adding one) brings it to root search.
@@ -623,14 +448,14 @@ mod tests {
             .unwrap();
         let items = provider.catalog();
         assert_eq!(titles(&items)[0], "My GitHub");
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 3);
     }
 
     #[test]
     fn catalog_has_the_defaults_and_commands() {
         let provider = provider();
         let catalog = provider.catalog();
-        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog.len(), 2);
         let items = all_links(&catalog);
         assert_eq!(items.len(), DEFAULTS.len());
         let github = find(&items, "GitHub");
@@ -662,11 +487,10 @@ mod tests {
             ]
         );
         find(&catalog, "Create Quicklink");
-        find(&catalog, "Search Bangs");
     }
 
     #[test]
-    fn bangs_open_with_the_text() {
+    fn keywords_open_with_the_text() {
         let provider = provider();
         provider.catalog();
         let items = provider.answers("!GH tokio rt");
@@ -697,71 +521,27 @@ mod tests {
     }
 
     #[test]
-    fn bangs_reach_every_other_site() {
+    fn a_partial_keyword_lists_matching_quicklinks() {
         let provider = provider();
         provider.catalog();
-        for query in ["!sp rust gpui", "rust gpui !SP"] {
-            let items = provider.answers(query);
-            assert_eq!(titles(&items), ["Startpage “rust gpui”"], "{query}");
-            assert_eq!(
-                items[0].actions[0].command,
-                Command::OpenUrl("https://www.startpage.com/do/search?q=rust+gpui".into())
-            );
-            assert_eq!(items[0].actions[2].title, "Save as Quicklink…");
-        }
-        // The user's quicklink keeps its keyword; the bang its other triggers.
-        let items = provider.answers("!gh x");
-        assert_eq!(titles(&items), ["GitHub “x”"]);
-        assert_eq!(items[0].subtitle.as_deref(), Some("!gh  ·  Quicklink"));
-        let items = provider.answers("!git x");
-        assert_eq!(titles(&items), ["GitHub “x”"]);
-        assert_eq!(items[0].subtitle.as_deref(), Some("!git  ·  github.com"));
-    }
-
-    #[test]
-    fn a_partial_bang_lists_matching_keywords() {
-        let provider = provider();
-        provider.catalog();
-        let items = provider.answers("!sp");
-        assert_eq!(titles(&items), ["Spotify", "Startpage"]);
-        // Enter completes the keyword, ready for the text.
+        // By name; Enter completes the keyword, ready for the text.
+        let items = provider.answers("!gi");
+        assert_eq!(titles(&items), ["Giphy", "Google Images"]);
         assert_eq!(
             items[0].actions[0].command,
-            Command::Complete("!spotify ".into())
+            Command::Complete("!giphy ".into())
         );
         assert_eq!(
             items[1].actions[0].command,
-            Command::Complete("!sp ".into())
+            Command::Complete("!gi ".into())
         );
-        // Quicklinks first (by name), then the bangs no quicklink took.
-        assert_eq!(
-            titles(&provider.answers("!gi")),
-            ["Giphy", "Google Images", "GitHub"]
-        );
-        assert_eq!(items[1].subtitle.as_deref(), Some("!sp  ·  startpage.com"));
+        assert_eq!(titles(&provider.answers("!sp")), ["Spotify"]);
+        assert!(provider.answers("!zzz").is_empty());
 
-        // With the space typed, only that keyword, and Enter opens the site.
-        let items = provider.answers("!sp ");
-        assert_eq!(titles(&items), ["Startpage"]);
-        assert_eq!(
-            items[0].actions[0].command,
-            Command::OpenUrl("https://www.startpage.com/".into())
-        );
-    }
-
-    #[test]
-    fn lists_every_bang() {
-        let provider = provider();
-        let Some(View::List(list)) = provider.view("bangs") else {
-            panic!("expected a list");
-        };
-        assert_eq!(titles(&list.items), ["GitHub", "Startpage", "Wikipedia"]);
-        assert_eq!(
-            list.items[0].subtitle.as_deref(),
-            Some("!gh  !git  !github")
-        );
-        assert!(list.items[0].keywords.contains(&"github.com".to_owned()));
-        assert_eq!(provider.view("other"), None);
+        // With the space typed, only that keyword, and Enter opens its form.
+        let items = provider.answers("!gh ");
+        assert_eq!(titles(&items), ["GitHub"]);
+        assert_eq!(items[0].actions[0].title, "Open Quicklink");
     }
 
     #[test]
@@ -812,10 +592,10 @@ mod tests {
 
     #[test]
     fn without_a_database_the_defaults_are_read_only() {
-        let provider = Quicklinks::new(None, Bangs::from_json(BANGS));
+        let provider = Quicklinks::new(None);
         provider.browsers.set(Vec::new()).unwrap();
         let catalog = provider.catalog();
-        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.len(), 1);
         let items = all_links(&catalog);
         assert_eq!(items.len(), DEFAULTS.len());
         let titles: Vec<_> = items[0].actions.iter().map(|a| a.title.as_str()).collect();
