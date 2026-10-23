@@ -15,7 +15,9 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
   - **System commands:** Lock Screen, Sleep, Restart, Shut Down, Sign Out, Empty Recycle Bin, Toggle Dark Mode, Toggle Mute, also found by keywords ("reboot", "trash"). Restart, Shut Down and Sign Out ask for a second Enter.
   - **Web search** for the query (Google) as the last row.
 - **Frecency:** apps and commands you use often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
-- **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+, for settings, Ctrl+Q to quit.
+- **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to run the primary action, Ctrl+Enter for the second one, Ctrl+, for settings, Ctrl+Q to quit.
+- **Action panel (Ctrl+K):** every action of the selected item. Apps: Open, Run as Administrator, Show in Explorer, Copy Path (Win32 apps with a file on disk), Uninstall… (opens Installed apps in Settings). Calculator: Copy Answer, Copy Calculation. URLs: Open, Copy URL. Anything you've used also gets Reset Ranking. Esc closes the panel; the footer shows what Enter does.
+- **HUD:** after copying or switching the theme, a short message appears at the bottom of the screen without taking focus. It is the launcher window itself, shrunk, so it costs no extra memory.
 - **Search field** edits like any Windows text box: Ctrl+←/→ moves by word, Shift selects (also with Home/End), Ctrl+Backspace / Ctrl+Delete delete a word, Ctrl+A/C/X/V, double click selects a word and triple click everything.
 - **Text input** with IME support.
 - **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).

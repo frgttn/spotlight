@@ -13,6 +13,8 @@ pub const HAIRLINE: u32 = 0xffffff14;
 pub const SURFACE: u32 = 0xffffff0a;
 pub const SURFACE_HOVER: u32 = 0xffffff1a;
 pub const SURFACE_BORDER: u32 = 0xffffff14;
+/// Popovers over the window (the action panel): opaque, so the list doesn't show through.
+pub const PANEL: u32 = 0x2a2a2eff;
 pub const ACCENT: u32 = 0x4f7cffff;
 pub const ACCENT_SOFT: u32 = 0x4f7cff2e;
 pub const SUCCESS: u32 = 0x7fd4a0ff;

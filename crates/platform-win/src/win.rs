@@ -16,8 +16,8 @@ use windows::Win32::{
         HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
         WindowsAndMessaging::{
             GetCursorPos, GetWindowRect, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
-            SW_HIDE, SW_SHOW, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
-            ShowWindow,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+            SetWindowPos, ShowWindow,
         },
     },
 };
@@ -87,6 +87,41 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
         }
         // Allowed because our process just received the hotkey input event.
         let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Shows the window topmost, horizontally centered near the bottom of the work
+/// area of the monitor under the mouse cursor, without activating it: focus
+/// stays with whatever window has it. `logical_size` is in 96-DPI units.
+pub fn show_without_focus_near_bottom(raw: isize, logical_size: (f32, f32)) {
+    unsafe {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let scale = dpi_x as f32 / 96.;
+        let width = (logical_size.0 * scale).round() as i32;
+        let height = (logical_size.1 * scale).round() as i32;
+        let work = info.rcWork;
+        let x = work.left + (work.right - work.left - width) / 2;
+        let y = work.bottom - height - (64. * scale).round() as i32;
+        let _ = SetWindowPos(
+            hwnd(raw),
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
     }
 }
 

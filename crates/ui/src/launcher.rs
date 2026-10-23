@@ -23,14 +23,14 @@ use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
-    item::{Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, SystemCommand},
     item_id,
     provider::Provider,
 };
 use spotlight_platform_win::{
     commands, icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    win,
+    system, win,
 };
 use spotlight_search::{RootSearch, Row};
 use spotlight_store::Store;
@@ -43,7 +43,16 @@ use crate::{
 
 actions!(
     launcher,
-    [SelectNext, SelectPrev, Confirm, Dismiss, Quit, OpenSettings]
+    [
+        SelectNext,
+        SelectPrev,
+        Confirm,
+        SecondaryAction,
+        ToggleActions,
+        Dismiss,
+        Quit,
+        OpenSettings
+    ]
 );
 
 const CONTEXT: &str = "Launcher";
@@ -57,6 +66,11 @@ pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
+/// How long a footer toast stays.
+const TOAST_DURATION: Duration = Duration::from_millis(2500);
+/// HUD size in logical pixels, and how long it stays.
+const HUD_SIZE: (f32, f32) = (300., 44.);
+const HUD_DURATION: Duration = Duration::from_millis(1500);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -65,6 +79,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
         KeyBinding::new("ctrl-p", SelectPrev, Some(CONTEXT)),
         KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+        KeyBinding::new("ctrl-enter", SecondaryAction, Some(CONTEXT)),
+        KeyBinding::new("ctrl-k", ToggleActions, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
         // Not handled here: it bubbles up to the app, which owns the settings window.
@@ -114,9 +130,21 @@ pub struct Launcher {
     loading: usize,
     results: Vec<Row>,
     selected: usize,
-    /// Set by a first Enter on a command that asks for confirmation (restart,
-    /// shut down): that item's id. Moving the selection or typing clears it.
-    confirming: Option<String>,
+    /// The action panel (Ctrl+K) is open, with this action selected.
+    panel: Option<usize>,
+    /// Set by a first Enter on an action that asks for confirmation (restart,
+    /// shut down): that item's id and the action's index. Moving the selection
+    /// or typing clears it.
+    confirming: Option<(String, usize)>,
+    /// A short message in the footer, for actions that keep the window open.
+    toast: Option<SharedString>,
+    /// Bumped on every toast, so an older toast's timer doesn't clear a newer one.
+    toast_generation: usize,
+    /// While set, the (otherwise hidden) window is the HUD: a small message at
+    /// the bottom of the screen, shown without focus. A second window would
+    /// cost ~30 MB of GPU state for something on screen 1.5 s at a time.
+    hud: Option<SharedString>,
+    hud_generation: usize,
     scroll: SmoothScroll,
     /// Extracted shell icons by item id. Items without one show a badge.
     icons: HashMap<String, Arc<RenderImage>>,
@@ -181,7 +209,12 @@ impl Launcher {
             search: RootSearch::new(providers),
             results: Vec::new(),
             selected: 0,
+            panel: None,
             confirming: None,
+            toast: None,
+            toast_generation: 0,
+            hud: None,
+            hud_generation: 0,
             scroll: {
                 let mut scroll =
                     SmoothScroll::new(UniformListScrollHandle::new(), ROW_HEIGHT, LIST_PADDING);
@@ -334,9 +367,23 @@ impl Launcher {
             frecency.get(id).map_or(0., |used| used.score_at(now))
         });
         self.selected = 0;
+        self.panel = None;
         self.confirming = None;
         self.scroll.reset();
         ms(started.elapsed())
+    }
+
+    /// The selected item's actions: its own, then the ones the launcher adds.
+    fn actions_for(&self, row: &Row) -> Vec<Action> {
+        let item = self.item(row);
+        let mut actions = item.actions.clone();
+        if matches!(row, Row::Catalog(_)) && self.frecency.contains_key(&item.id) {
+            actions.push(Action {
+                title: "Reset Ranking".into(),
+                command: Command::ResetRanking(item.id.clone()),
+            });
+        }
+        actions
     }
 
     fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
@@ -366,6 +413,22 @@ impl Launcher {
     /// Every catalog, apps included, has loaded.
     pub fn apps_loaded(&self) -> bool {
         self.loading == 0
+    }
+
+    /// Action titles in the open action panel, or `None` when it's closed.
+    /// For the self-test.
+    pub fn panel_actions(&self) -> Option<Vec<String>> {
+        self.panel?;
+        Some(
+            self.selected_actions()
+                .into_iter()
+                .map(|action| action.title)
+                .collect(),
+        )
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
     }
 
     /// Titles of the current results, top first. For the self-test.
@@ -399,6 +462,7 @@ impl Launcher {
     }
 
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        self.hud = None;
         self.input.update(cx, |input, cx| input.clear(cx));
         self.stats.filter_ms = Some(self.refilter(""));
         // Explicit size: with `show: false` GPUI defers its own placement to
@@ -434,6 +498,12 @@ impl Launcher {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = self.panel {
+            let count = self.selected_actions().len();
+            self.panel = Some((action + 1).min(count.saturating_sub(1)));
+            cx.notify();
+            return;
+        }
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
             self.confirming = None;
@@ -443,6 +513,11 @@ impl Launcher {
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = self.panel {
+            self.panel = Some(action.saturating_sub(1));
+            cx.notify();
+            return;
+        }
         if self.selected > 0 {
             self.selected -= 1;
             self.confirming = None;
@@ -451,34 +526,170 @@ impl Launcher {
         }
     }
 
-    /// Runs the selected item's primary action.
+    fn selected_actions(&self) -> Vec<Action> {
+        self.results
+            .get(self.selected)
+            .map(|row| self.actions_for(row))
+            .unwrap_or_default()
+    }
+
+    /// Enter: the action picked in the panel, the one waiting for a second
+    /// Enter, or the primary action.
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(row) = self.results.get(self.selected) else {
+        let waiting = self
+            .confirming
+            .as_ref()
+            .filter(|(id, _)| {
+                self.results
+                    .get(self.selected)
+                    .is_some_and(|row| &self.item(row).id == id)
+            })
+            .map(|&(_, action)| action);
+        let action = self.panel.or(waiting).unwrap_or(0);
+        if self.selected_actions().is_empty() {
             self.hide(cx);
+        } else {
+            self.run_action(action, cx);
+        }
+    }
+
+    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…).
+    fn secondary_action(&mut self, _: &SecondaryAction, _: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_none() {
+            self.run_action(1, cx);
+        }
+    }
+
+    fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
+        self.panel = match self.panel {
+            Some(_) => None,
+            None if !self.selected_actions().is_empty() => Some(0),
+            None => None,
+        };
+        self.confirming = None;
+        cx.notify();
+    }
+
+    /// Runs action `ix` of the selected item. Most actions then hide the window.
+    fn run_action(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.results.get(self.selected).cloned() else {
             return;
         };
-        let item = self.item(row);
-        let Some(action) = item.primary_action() else {
-            self.hide(cx);
+        let Some(action) = self.actions_for(&row).into_iter().nth(ix) else {
             return;
         };
-        if action.command.needs_confirmation() && self.confirming.as_ref() != Some(&item.id) {
-            self.confirming = Some(item.id.clone());
+        let item = self.item(&row);
+        let (id, title) = (item.id.clone(), item.title.clone());
+        self.panel = None;
+        if action.command.needs_confirmation()
+            && self.confirming.as_ref() != Some(&(id.clone(), ix))
+        {
+            self.confirming = Some((id, ix));
             cx.notify();
             return;
         }
+        self.confirming = None;
 
-        let command = action.command.clone();
-        // Only catalog items are ranked, so only their use is worth remembering.
-        let visited = matches!(row, Row::Catalog(_)).then(|| item.id.clone());
-        match &command {
-            Command::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text.clone())),
+        let mut hud: Option<SharedString> = None;
+        match &action.command {
+            Command::Copy(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                hud = Some("Copied to Clipboard".into());
+            }
+            Command::ResetRanking(id) => {
+                // Stays open: the point is to see the item drop back.
+                self.reset_ranking(id, cx);
+                self.show_toast(format!("Ranking reset for {title}").into(), cx);
+                return;
+            }
+            Command::System(SystemCommand::ToggleDarkMode) => {
+                // Read before the toggle runs on its own thread.
+                let next = if system::dark_mode() {
+                    "Light Mode"
+                } else {
+                    "Dark Mode"
+                };
+                commands::execute(&action.command);
+                hud = Some(next.into());
+            }
             command => commands::execute(command),
         }
-        if let Some(id) = visited {
+        // Only catalog items are ranked, so only their use is worth remembering.
+        if matches!(row, Row::Catalog(_)) {
             self.record_visit(id, cx);
         }
         self.hide(cx);
+        if let Some(text) = hud {
+            self.show_hud(text, cx);
+        }
+    }
+
+    /// Turns the hidden window into the HUD for a moment. Showing the launcher
+    /// (hotkey, tray) ends it early.
+    fn show_hud(&mut self, text: SharedString, cx: &mut Context<Self>) {
+        self.hud = Some(text);
+        self.hud_generation += 1;
+        let generation = self.hud_generation;
+        win::show_without_focus_near_bottom(self.hwnd, HUD_SIZE);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HUD_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.hud_generation == generation && this.hud.take().is_some() {
+                    win::hide(this.hwnd);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn reset_ranking(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.frecency.remove(id);
+        let query = self.query(cx);
+        self.refilter(&query);
+        // Keep the same item selected where it now ranks.
+        if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
+            self.selected = row;
+            self.scroll.reveal(row, self.results.len());
+        }
+        cx.notify();
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = id.to_owned();
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|store| store.forget(&id).map_err(|err| err.to_string()));
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not reset the ranking of {id:?}: {err}");
+                }
+            })
+            .detach();
+    }
+
+    fn show_toast(&mut self, message: SharedString, cx: &mut Context<Self>) {
+        self.toast = Some(message);
+        self.toast_generation += 1;
+        let generation = self.toast_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_DURATION).await;
+            this.update(cx, |this, cx| {
+                if this.toast_generation == generation {
+                    this.toast = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Updates frecency in memory right away and in the database on a background thread.
@@ -505,14 +716,23 @@ impl Launcher {
             .detach();
     }
 
+    /// Esc closes the action panel first, then the window.
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        self.hide(cx);
+        if self.panel.take().is_some() {
+            cx.notify();
+        } else {
+            self.hide(cx);
+        }
     }
 
     fn render_row(&self, row: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let item = self.item(&self.results[row]);
         let selected = row == self.selected;
-        let confirming = self.confirming.as_ref() == Some(&item.id);
+        let confirming = selected
+            && self
+                .confirming
+                .as_ref()
+                .is_some_and(|(id, _)| id == &item.id);
         let subtitle: SharedString = if confirming {
             "Press Enter again to confirm".into()
         } else {
@@ -539,6 +759,7 @@ impl Launcher {
                         this.selected = row;
                         this.confirming = None;
                     }
+                    this.panel = None;
                     this.confirm(&Confirm, window, cx);
                 }))
                 .child(self.render_icon(item))
@@ -601,6 +822,106 @@ impl Launcher {
         }
     }
 
+    /// The Ctrl+K panel: the selected item's actions, above the footer's right end.
+    fn render_panel(&self, selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .results
+            .get(self.selected)
+            .map(|row| SharedString::from(self.item(row).title.clone()))
+            .unwrap_or_default();
+        let rows = self
+            .selected_actions()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, action)| {
+                let shortcut = match ix {
+                    0 => Some("Enter"),
+                    1 => Some("Ctrl Enter"),
+                    _ => None,
+                };
+                div()
+                    .id(ix)
+                    .h(px(32.))
+                    .px_2()
+                    .mx_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .when(ix == selected, |row| row.bg(rgba(0xffffff1f)))
+                    .when(ix != selected, |row| {
+                        row.hover(|style| style.bg(rgba(0xffffff0f)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.run_action(ix, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(action.title)),
+                    )
+                    .children(shortcut.map(keycaps))
+            });
+        div()
+            .absolute()
+            .right(px(10.))
+            .bottom(px(38.))
+            .w(px(300.))
+            .py_1()
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgba(theme::SURFACE_BORDER))
+            .bg(rgba(theme::PANEL))
+            .shadow_lg()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .px_3()
+                    .pt_1()
+                    .pb_1()
+                    .text_size(px(11.))
+                    .text_color(rgba(theme::TEXT_MUTED))
+                    .truncate()
+                    .child(title),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// Right side of the footer: what Enter does, and how to see the rest.
+    fn footer_hints(&self) -> impl IntoElement {
+        let primary = self
+            .selected_actions()
+            .into_iter()
+            .next()
+            .map(|action| SharedString::from(action.title));
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .when_some(primary, |hints, primary| {
+                hints
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_color(rgba(theme::TEXT)).child(primary))
+                            .child(keycaps("Enter")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child("Actions")
+                            .child(keycaps("Ctrl K")),
+                    )
+            })
+    }
+
     /// Paint-probe values here lag one frame (they are recorded while painting).
     fn footer(&self) -> String {
         let memory = metrics::memory();
@@ -624,6 +945,19 @@ impl Launcher {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(text) = &self.hud {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_4()
+                .bg(rgba(theme::BACKGROUND_TINT))
+                .text_color(rgba(theme::TEXT))
+                .text_size(px(14.))
+                .child(div().truncate().child(text.clone()))
+                .into_any_element();
+        }
         if self.scroll.tick() {
             window.request_animation_frame();
         }
@@ -701,6 +1035,8 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_action))
+            .on_action(cx.listener(Self::toggle_actions))
             .on_action(cx.listener(Self::dismiss))
             .size_full()
             .flex()
@@ -720,21 +1056,52 @@ impl Render for Launcher {
             .child(results)
             .child(
                 div()
+                    .h(px(30.))
                     .px_4()
-                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_4()
                     .bg(rgba(0x00000033))
                     .text_size(px(11.))
                     .text_color(rgba(0xffffff80))
-                    .truncate()
-                    .child(self.footer()),
+                    .child(match &self.toast {
+                        Some(toast) => div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgba(theme::SUCCESS))
+                            .child(toast.clone()),
+                        None => div().flex_1().min_w_0().truncate().child(self.footer()),
+                    })
+                    .child(self.footer_hints()),
             )
+            .when_some(self.panel, |root, selected| {
+                root.child(self.render_panel(selected, cx))
+            })
             // Last child, so it paints after everything else in the frame.
             .child(
                 canvas(|_, _, _| {}, move |_, _, _, _| paint.borrow_mut().painted())
                     .absolute()
                     .size_full(),
             )
+            .into_any_element()
     }
+}
+
+/// Key caps for a shortcut such as `"Ctrl K"`, one per key.
+fn keycaps(shortcut: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .gap(px(3.))
+        .children(shortcut.split(' ').map(|key| {
+            div()
+                .px(px(5.))
+                .rounded(px(4.))
+                .bg(rgba(theme::SURFACE_HOVER))
+                .text_size(px(10.))
+                .text_color(rgba(theme::TEXT_MUTED))
+                .child(key)
+        }))
 }
 
 /// Windows 11's icon font, or its Windows 10 predecessor (same code points).

@@ -121,6 +121,13 @@ impl Store {
         tx.commit()?;
         Ok(next)
     }
+
+    /// Forgets every use of `item_id`.
+    pub fn forget(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM frecency WHERE item_id = ?1", [item_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +144,17 @@ mod tests {
             store.setting("hotkey").unwrap().as_deref(),
             Some("ctrl+space")
         );
+    }
+
+    #[test]
+    fn forget_removes_one_item() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.record_visit("apps:a", 1).unwrap();
+        store.record_visit("apps:b", 1).unwrap();
+        store.forget("apps:a").unwrap();
+        store.forget("apps:never-used").unwrap();
+        let left: Vec<_> = store.frecency().unwrap().into_keys().collect();
+        assert_eq!(left, ["apps:b"]);
     }
 
     #[test]

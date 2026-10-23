@@ -1,53 +1,76 @@
-//! Runs the [`Command`]s that search items carry. `Copy` is the exception: the
-//! UI framework owns the clipboard, so the UI handles it.
+//! Runs the [`Command`]s that search items carry, except `Copy` and
+//! `ResetRanking`: the UI owns the clipboard and the ranking, so it handles those.
 
-use std::thread;
+use std::{os::windows::process::CommandExt, process, thread};
 
 use spotlight_core::item::Command;
 use windows::{
     Win32::{
-        System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
+        System::{
+            Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
+            Threading::CREATE_NO_WINDOW,
+        },
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     },
-    core::{HSTRING, PCWSTR, w},
+    core::{HSTRING, PCWSTR},
 };
 
 use crate::system;
 
+/// What `OpenUrl` may open. `ShellExecute` would just as happily run a
+/// program, so anything else is refused.
+const URL_SCHEMES: &[&str] = &["https://", "http://", "ms-settings:"];
+
 /// Starts `command` and returns at once; anything slow runs on its own thread.
 pub fn execute(command: &Command) {
     match command {
-        Command::LaunchApp(launch_id) => shell_open(format!("shell:AppsFolder\\{launch_id}")),
-        Command::OpenUrl(url) => {
-            // Only web URLs: `ShellExecute` would just as happily run a program.
-            let lower = url.to_ascii_lowercase();
-            if lower.starts_with("https://") || lower.starts_with("http://") {
-                shell_open(url.clone());
-            } else {
-                eprintln!("[commands] refusing to open {url:?}: not an http(s) URL");
+        Command::LaunchApp(launch_id) => {
+            shell_execute("open", format!("shell:AppsFolder\\{launch_id}"))
+        }
+        Command::RunAsAdmin(path) => shell_execute("runas", path.clone()),
+        Command::ShowInFolder(path) => {
+            // `/select,` takes the rest of the argument as the path, spaces included.
+            let spawned = process::Command::new("explorer.exe")
+                .raw_arg(format!("/select,\"{path}\""))
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .spawn();
+            if let Err(err) = spawned {
+                eprintln!("[commands] could not show {path:?} in Explorer: {err}");
             }
         }
-        Command::Copy(_) => eprintln!("[commands] Copy must be handled by the UI"),
+        Command::OpenUrl(url) => {
+            let lower = url.to_ascii_lowercase();
+            if URL_SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
+                shell_execute("open", url.clone());
+            } else {
+                eprintln!("[commands] refusing to open {url:?}: not an allowed URL");
+            }
+        }
+        Command::Copy(_) | Command::ResetRanking(_) => {
+            eprintln!("[commands] {command:?} must be handled by the UI")
+        }
         Command::System(command) => system::run(*command),
     }
 }
 
-/// `ShellExecute` "open" on a short-lived thread, so a slow shell never blocks the UI.
-fn shell_open(target: String) {
+/// `ShellExecute` with `verb` on a short-lived thread, so a slow shell (or a
+/// UAC prompt) never blocks the UI.
+fn shell_execute(verb: &'static str, target: String) {
     thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         let result = ShellExecuteW(
             None,
-            w!("open"),
+            &HSTRING::from(verb),
             &HSTRING::from(target.as_str()),
             PCWSTR::null(),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
-        // ShellExecute reports success as a value greater than 32.
+        // ShellExecute reports success as a value greater than 32. Declining
+        // the UAC prompt also ends up here (code 5, access denied).
         if (result.0 as isize) <= 32 {
             eprintln!(
-                "[commands] failed to open {target:?} (code {})",
+                "[commands] {verb} {target:?} failed (code {})",
                 result.0 as isize
             );
         }

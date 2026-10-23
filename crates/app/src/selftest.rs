@@ -127,6 +127,30 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    // Ctrl+K opens the action panel on that row; Esc closes the panel, not the window.
+    press(window, "ctrl-k", cx);
+    sleep(SETTLE_MS).await;
+    let panel = window
+        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .ok()
+        .flatten();
+    press(window, "escape", cx);
+    sleep(SETTLE_MS).await;
+    let (closed, visible) = window
+        .update(cx, |launcher, _, _| {
+            (launcher.panel_actions().is_none(), launcher.is_visible())
+        })
+        .unwrap_or_default();
+    let expected = ["Copy Answer", "Copy Calculation"].map(String::from);
+    eprintln!(
+        "[selftest] action panel: {panel:?}, esc closes it: {closed}, window stays: {visible} {}",
+        if panel.as_deref() == Some(&expected[..]) && closed && visible {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
     sleep(IDLE_MS).await;
@@ -136,4 +160,14 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         summary.print(startup, idle);
     }
     cx.update(|cx| cx.quit()).ok();
+}
+
+/// Sends `keystroke` through GPUI's key dispatch, as a real key press arrives.
+/// `update_window` doesn't lease the launcher view, so its handlers can run.
+fn press(window: WindowHandle<Launcher>, keystroke: &str, cx: &mut AsyncApp) -> bool {
+    let keystroke = Keystroke::parse(keystroke).expect("valid keystroke");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_keystroke(keystroke, cx)
+    })
+    .unwrap_or(false)
 }

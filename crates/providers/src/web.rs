@@ -39,7 +39,8 @@ impl Provider for Web {
             SearchItem::new(item_id(ID, "url"), format!("Open {url}"))
                 .subtitle("URL")
                 .icon(Icon::Glyph(glyph::GLOBE))
-                .action("Open in Browser", Command::OpenUrl(url)),
+                .action("Open in Browser", Command::OpenUrl(url.clone()))
+                .action("Copy URL", Command::Copy(url)),
         ]
     }
 

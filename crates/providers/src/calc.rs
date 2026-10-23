@@ -57,7 +57,11 @@ impl Provider for Calculator {
             SearchItem::new(item_id(ID, "answer"), answer.clone())
                 .subtitle("Calculator")
                 .icon(Icon::Glyph(glyph::CALCULATOR))
-                .action("Copy Answer", Command::Copy(answer)),
+                .action("Copy Answer", Command::Copy(answer.clone()))
+                .action(
+                    "Copy Calculation",
+                    Command::Copy(format!("{} = {answer}", query.trim())),
+                ),
         ]
     }
 }

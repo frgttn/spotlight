@@ -3,7 +3,7 @@
 //! `shell:AppsFolder` is what the Start menu's "All apps" list is built from, so
 //! one enumeration covers classic Win32 shortcuts and MSIX/UWP packages alike.
 
-use std::ffi::c_void;
+use std::{ffi::c_void, path::Path};
 
 use windows::{
     Win32::{
@@ -12,10 +12,11 @@ use windows::{
         },
         UI::Shell::{
             BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
-            SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+            SHGetKnownFolderItem, SHGetKnownFolderPath, SIGDN, SIGDN_NORMALDISPLAY,
+            SIGDN_PARENTRELATIVEPARSING,
         },
     },
-    core::Result,
+    core::{GUID, Result},
 };
 
 #[derive(Clone, Debug)]
@@ -24,6 +25,9 @@ pub struct AppEntry {
     pub name: String,
     /// AppsFolder parsing name: an AUMID for packaged apps, a (known-folder relative) path otherwise.
     pub launch_id: String,
+    /// The program or shortcut on disk, for Win32 apps whose parsing name is a
+    /// path. `None` for packaged apps and apps known only by an AUMID.
+    pub path: Option<String>,
 }
 
 /// Enumerates all apps. Blocking and COM-heavy: call it from a dedicated thread.
@@ -48,7 +52,12 @@ pub fn discover() -> Result<Vec<AppEntry>> {
                     continue;
                 };
                 if !name.is_empty() && !launch_id.is_empty() {
-                    apps.push(AppEntry { name, launch_id });
+                    let path = file_path(&launch_id);
+                    apps.push(AppEntry {
+                        name,
+                        launch_id,
+                        path,
+                    });
                 }
             }
             // `Next` maps S_FALSE (last, partial batch) to Ok, so a short batch marks the end.
@@ -61,6 +70,29 @@ pub fn discover() -> Result<Vec<AppEntry>> {
         apps.dedup_by(|a, b| a.launch_id == b.launch_id);
         Ok(apps)
     }
+}
+
+/// The parsing name as a file path, when it is one: absolute
+/// (`C:\Tools\app.exe`) or relative to a known folder
+/// (`{6D809377-6AF0-444B-8957-A3773F02200E}\App\app.exe`, i.e. Program Files).
+/// Only paths to existing files are returned.
+fn file_path(launch_id: &str) -> Option<String> {
+    let path = match launch_id.strip_prefix('{') {
+        Some(rest) => {
+            let (guid, relative) = rest.split_once("}\\")?;
+            let folder = GUID::try_from(guid).ok()?;
+            let base = unsafe {
+                let raw = SHGetKnownFolderPath(&folder, KF_FLAG_DEFAULT, None).ok()?;
+                let base = raw.to_string().ok();
+                CoTaskMemFree(Some(raw.0 as *const c_void));
+                base?
+            };
+            format!("{base}\\{relative}")
+        }
+        None => launch_id.to_owned(),
+    };
+    let file = Path::new(&path);
+    (file.is_absolute() && file.is_file()).then_some(path)
 }
 
 unsafe fn display_name(item: &IShellItem, sigdn: SIGDN) -> Result<String> {

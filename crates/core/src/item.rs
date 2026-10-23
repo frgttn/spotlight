@@ -81,10 +81,17 @@ pub struct Action {
 pub enum Command {
     /// Starts an `AppsFolder` item by its parsing name (AUMID or path).
     LaunchApp(String),
-    /// Opens an `http`/`https` URL in the default browser.
+    /// Starts a program or shortcut (a file path) elevated, after the UAC prompt.
+    RunAsAdmin(String),
+    /// Opens an Explorer window on the folder holding this file, with the file selected.
+    ShowInFolder(String),
+    /// Opens an `http`/`https` URL in the default browser, or an `ms-settings:`
+    /// page in the Settings app.
     OpenUrl(String),
     /// Puts text on the clipboard.
     Copy(String),
+    /// Forgets how often and how recently this item (by id) was used.
+    ResetRanking(String),
     System(SystemCommand),
 }
 
