@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Patched dependencies, built but not linted or tested as ours.
+exclude = ["vendor"]
 default-members = ["crates/app"]
 
 [workspace.package]
@@ -29,13 +31,22 @@ nucleo-matcher = "0.3.1"
 # Markdown in detail views; no HTML output needed.
 pulldown-cmark = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"
-# `bundled` compiles SQLite from source, so there is no system library to install.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `bundled-sqlcipher` compiles SQLCipher (SQLite with encryption) from source,
+# so there is no system library to install; its crypto is Windows CNG, see
+# the patch below.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde_json = "1"
 tray-icon = "0.24"
 unicode-segmentation = "1"
 # Same major as gpui 0.2.2 uses, so there is only one copy of the bindings.
 windows = "0.61"
+
+# libsqlite3-sys with one change: on Windows, SQLCipher's crypto comes from
+# CNG (bcrypt.dll, `sqlcipher/crypto_cng.c`) instead of OpenSSL, so building
+# needs no OpenSSL or Perl. Its unused plain-SQLite sources are left out.
+# Keep its version equal to the one rusqlite asks for.
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
 
 [profile.release]
 debug = "line-tables-only"

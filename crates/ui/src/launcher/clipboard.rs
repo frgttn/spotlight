@@ -3,7 +3,7 @@
 //! deleting entries, and the preview beside the list. The clipboard provider
 //! lists the entries; after a change its view is built again.
 
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, Context, ObjectFit, RenderImage, SharedString, Window, div, img, prelude::*, px,
@@ -15,7 +15,10 @@ use spotlight_core::{
     item::SearchItem,
     view::{Preview, PreviewBody},
 };
-use spotlight_platform_win::clipboard::{self, Content, Image};
+use spotlight_platform_win::{
+    clipboard::{self, Content, Image},
+    vault,
+};
 use spotlight_store::Clip;
 
 use super::{Launcher, views::Screen};
@@ -379,16 +382,16 @@ fn content_of(clip: &Clip) -> Option<Content> {
         ClipKind::Text => Content::Text(clip.content.clone()),
         ClipKind::Files => Content::Files(clip.content.lines().map(str::to_owned).collect()),
         ClipKind::Image => Content::Image(Image {
-            png: fs::read(&clip.content).ok()?,
+            png: vault::read_file(clip.content.as_ref()).ok()?,
             width: clip.width.unwrap_or_default(),
             height: clip.height.unwrap_or_default(),
         }),
     })
 }
 
-/// Decodes a PNG for GPUI, which wants BGRA.
+/// Decodes a (possibly encrypted) PNG for GPUI, which wants BGRA.
 fn decode(path: &str) -> Option<Arc<RenderImage>> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = vault::read_file(path.as_ref()).ok()?;
     let mut image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
         .ok()?
         .into_rgba8();

@@ -3,7 +3,8 @@
 //! preview of the selected entry.
 //!
 //! Text and file lists live in the database. Images are PNG files in the
-//! `clipboard` folder of the data folder, with a smaller copy for the preview.
+//! `clipboard` folder of the data folder, with a smaller copy for the preview;
+//! both are encrypted (`vault::write_file`), and read with `vault::read_file`.
 
 use std::{
     fs,
@@ -23,7 +24,10 @@ use spotlight_core::{
     provider::Provider,
     view::{ListFilter, ListView, Preview, PreviewBody, View},
 };
-use spotlight_platform_win::clipboard::{Content, Copied};
+use spotlight_platform_win::{
+    clipboard::{Content, Copied},
+    vault,
+};
 use spotlight_store::{Clip, Store};
 
 use crate::{glyph, web};
@@ -180,7 +184,7 @@ impl ClipboardHistory {
             return Some(path_text);
         }
         let saved = fs::create_dir_all(dir)
-            .and_then(|()| fs::write(&path, png))
+            .and_then(|()| vault::write_file(&path, png))
             .map_err(|err| err.to_string())
             .and_then(|()| {
                 let image = image::load_from_memory_with_format(png, ImageFormat::Png)
@@ -188,9 +192,12 @@ impl ClipboardHistory {
                 if image.width().max(image.height()) <= THUMBNAIL_SIZE {
                     return Ok(());
                 }
+                let mut thumbnail = Vec::new();
                 image
                     .resize(THUMBNAIL_SIZE, THUMBNAIL_SIZE, FilterType::Triangle)
-                    .save_with_format(clip::thumbnail_path(&path_text), ImageFormat::Png)
+                    .write_to(&mut std::io::Cursor::new(&mut thumbnail), ImageFormat::Png)
+                    .map_err(|err| err.to_string())?;
+                vault::write_file(clip::thumbnail_path(&path_text).as_ref(), &thumbnail)
                     .map_err(|err| err.to_string())
             });
         match saved {
@@ -199,6 +206,16 @@ impl ClipboardHistory {
                 eprintln!("[clipboard] could not save an image: {err}");
                 let _ = fs::remove_file(&path);
                 None
+            }
+        }
+    }
+
+    /// Encrypts the images saved before encryption was on. Blocking.
+    pub fn seal_old_images(&self) {
+        if let Some(dir) = &self.images {
+            let sealed = vault::seal_folder(dir);
+            if sealed > 0 {
+                eprintln!("[clipboard] encrypted {sealed} image files");
             }
         }
     }

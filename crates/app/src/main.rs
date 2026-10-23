@@ -38,10 +38,10 @@ use spotlight_platform_win::{
     clipboard,
     hotkey::{self, Hotkey},
     instance::{self, Instance},
-    metrics, win,
+    metrics, vault, win,
 };
 use spotlight_providers::{Builtins, clipboard::ClipboardHistory, web::Web};
-use spotlight_store::Store;
+use spotlight_store::{Key, Store};
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
@@ -596,7 +596,8 @@ fn set_win_v(hotkeys: &hotkey::Service, enabled: bool) {
 }
 
 /// Starts the clipboard listener and keeps what it reports in `history`, on
-/// a thread of its own (images are written to disk). Expired entries go first.
+/// a thread of its own (images are written to disk). Expired entries go
+/// first, and images saved before encryption are encrypted.
 fn record_clipboard(history: Arc<ClipboardHistory>) {
     let (copied_tx, copied_rx) = async_channel::unbounded();
     if let Err(err) = clipboard::listen(copied_tx) {
@@ -607,6 +608,7 @@ fn record_clipboard(history: Arc<ClipboardHistory>) {
         .name("clipboard-history".into())
         .spawn(move || {
             history.trim();
+            history.seal_old_images();
             while let Ok(copied) = copied_rx.recv_blocking() {
                 history.record(copied);
             }
@@ -664,20 +666,74 @@ fn data_dir() -> Option<PathBuf> {
         .or_else(|| env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("spotlight")))
 }
 
-/// `spotlight.db` in the data folder ([`data_dir`]). Without a database the
-/// launcher still works; it just doesn't remember usage or settings.
-/// Also returns the path for display.
+/// `spotlight.db` in the data folder ([`data_dir`]), encrypted with the key
+/// in Credential Manager; a plain one from before is encrypted on the way.
+/// Without a database the launcher still works; it just doesn't remember
+/// usage or settings. Also returns the path for display.
 fn open_store(dir: Option<&Path>) -> (Option<Store>, SharedString) {
     let Some(dir) = dir else {
         return (None, "unavailable (APPDATA is not set)".into());
     };
     let path = dir.join("spotlight.db");
     let shown: SharedString = path.display().to_string().into();
-    match Store::open(&path) {
+    let key = database_key(&path);
+    let opened = match Store::open(&path, key.as_ref()) {
+        // Encrypted with some other key: unreadable too, so the same as
+        // a key that is gone.
+        Err(spotlight_store::Error::SqliteFailure(err, _))
+            if key.is_some() && err.code == spotlight_store::ErrorCode::NotADatabase =>
+        {
+            set_aside(&path);
+            Store::open(&path, key.as_ref())
+        }
+        opened => opened,
+    };
+    match opened {
         Ok(store) => (Some(store), shown),
         Err(err) => {
             eprintln!("[spotlight] could not open {}: {err}", path.display());
             (None, format!("{shown} (could not open)").into())
         }
     }
+}
+
+/// The database key, which also unlocks the clipboard images. `None` when
+/// Credential Manager can't keep one: the database then stays unencrypted.
+fn database_key(path: &Path) -> Option<Key> {
+    let (key, new) = vault::database_key()
+        .inspect_err(|err| {
+            eprintln!("[spotlight] no database key, so the database is not encrypted: {err}")
+        })
+        .ok()?;
+    // Encrypted with a key that is gone (another Windows account, a reset
+    // profile): it can't be read, so it is kept aside and a new one starts.
+    let unreadable =
+        path.metadata().is_ok_and(|meta| meta.len() > 0) && !spotlight_store::is_plain(path);
+    if new && unreadable {
+        set_aside(path);
+    }
+    vault::unlock_files(&key);
+    Some(key)
+}
+
+/// Renames the database at `path` (with its log files) out of the way.
+fn set_aside(path: &Path) {
+    let stamp = spotlight_core::frecency::now();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut from = path.as_os_str().to_owned();
+        from.push(suffix);
+        let mut to = path
+            .with_extension(format!("unreadable-{stamp}.db"))
+            .into_os_string();
+        to.push(suffix);
+        if Path::new(&from).exists()
+            && let Err(err) = std::fs::rename(&from, &to)
+        {
+            eprintln!("[spotlight] could not move the unreadable database aside: {err}");
+        }
+    }
+    eprintln!(
+        "[spotlight] {} can't be read with the saved key; kept as unreadable-{stamp}.db",
+        path.display()
+    );
 }

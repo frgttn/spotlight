@@ -1,13 +1,21 @@
 //! SQLite persistence: settings, frecency, aliases, item hotkeys, the
 //! calculator history, quicklinks, the clipboard history and snippets.
 //!
+//! The database is SQLCipher: encrypted with a 256-bit key the caller keeps
+//! (see `spotlight_platform_win::vault`). Without a key it is plain SQLite.
+//!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-pub use rusqlite::Error;
 use rusqlite::{Connection, OptionalExtension, params};
+pub use rusqlite::{Error, ErrorCode};
 use spotlight_core::{
     clip::{self, ClipKind, Retention},
     frecency::Frecency,
@@ -16,6 +24,12 @@ use spotlight_core::{
 };
 
 pub type Result<T> = rusqlite::Result<T>;
+
+/// A raw SQLCipher key: used as it is, with no passphrase stretching.
+pub type Key = [u8; 32];
+
+/// The first bytes of every plain SQLite file; SQLCipher files look random.
+const PLAIN_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 /// Schema changes, applied in order. `PRAGMA user_version` records how many
 /// have run, so only append to this list; never edit an entry that shipped.
@@ -148,13 +162,24 @@ pub struct Store {
 
 impl Store {
     /// Opens (creating if needed) the database at `path`, including its parent
-    /// directory, and brings the schema up to date.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// directory, and brings the schema up to date. With a `key` the database
+    /// is encrypted, and a plain one from before is encrypted first; a wrong
+    /// key fails with `SQLITE_NOTADB`.
+    pub fn open(path: &Path, key: Option<&Key>) -> Result<Self> {
         if let Some(dir) = path.parent() {
             // A missing directory surfaces as SQLITE_CANTOPEN from `open` below.
             let _ = fs::create_dir_all(dir);
         }
+        if let Some(key) = key
+            && is_plain(path)
+        {
+            encrypt(path, key)?;
+        }
         let conn = Connection::open(path)?;
+        if let Some(key) = key {
+            conn.pragma_update(None, "key", key_value(key))?;
+        }
+        // The first read of the file: with the wrong key, this is what fails.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::init(conn)
     }
@@ -582,6 +607,63 @@ impl Store {
     }
 }
 
+/// Whether `path` is a plain SQLite database (so not encrypted yet). An empty
+/// or missing file isn't one: it becomes whatever it is opened as.
+pub fn is_plain(path: &Path) -> bool {
+    let mut header = [0u8; 16];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| &header == PLAIN_HEADER)
+}
+
+/// `x'…'`: tells SQLCipher the key is raw bytes, not a passphrase.
+fn key_value(key: &Key) -> String {
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("x'{hex}'")
+}
+
+/// Replaces the plain database at `path` with an encrypted copy. The copy is
+/// made next to it and moved over it only when complete, so a failure leaves
+/// the plain database as it was.
+fn encrypt(path: &Path, key: &Key) -> Result<()> {
+    let copy = with_suffix(path, ".encrypting");
+    let _ = fs::remove_file(&copy);
+    {
+        let conn = Connection::open(path)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        conn.execute(
+            "ATTACH DATABASE ?1 AS encrypted KEY ?2",
+            params![copy.to_string_lossy(), key_value(key)],
+        )?;
+        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
+        conn.pragma_update(Some("encrypted"), "user_version", version)?;
+        conn.execute("DETACH DATABASE encrypted", [])?;
+        // Closing checkpoints the write-ahead log into the plain file and
+        // deletes it, so none of it is left to replay into the new one.
+        conn.close().map_err(|(_, err)| err)?;
+    }
+    for leftover in ["-wal", "-shm"] {
+        let _ = fs::remove_file(with_suffix(path, leftover));
+    }
+    fs::rename(&copy, path).map_err(|err| {
+        let _ = fs::remove_file(&copy);
+        io_error(err)
+    })
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn io_error(err: std::io::Error) -> Error {
+    Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+        Some(err.to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,7 +926,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         {
-            let mut store = Store::open(&path).unwrap();
+            let mut store = Store::open(&path, None).unwrap();
             store.record_visit("apps:calc", 100).unwrap();
             let second = store.record_visit("apps:calc", 100).unwrap();
             assert_eq!(second.count, 2);
@@ -852,11 +934,74 @@ mod tests {
         }
 
         // Reopening runs no migrations twice and keeps the data.
-        let store = Store::open(&path).unwrap();
+        let store = Store::open(&path, None).unwrap();
         let all = store.frecency().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all["apps:calc"], Frecency::default().visit(100).visit(100));
         assert_eq!(store.quicklinks().unwrap().len(), quicklink::DEFAULTS.len());
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn not_a_database(result: Result<Store>) -> bool {
+        matches!(
+            result,
+            Err(Error::SqliteFailure(err, _)) if err.code == rusqlite::ErrorCode::NotADatabase
+        )
+    }
+
+    #[test]
+    fn a_plain_database_is_encrypted_with_its_data() {
+        let dir =
+            std::env::temp_dir().join(format!("spotlight-cipher-test-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let _ = fs::remove_dir_all(&dir);
+        let key = [42u8; 32];
+
+        {
+            let store = Store::open(&path, None).unwrap();
+            store.set_setting("hotkey", "alt+space").unwrap();
+        }
+        assert!(is_plain(&path));
+
+        {
+            let store = Store::open(&path, Some(&key)).unwrap();
+            assert_eq!(
+                store.setting("hotkey").unwrap().as_deref(),
+                Some("alt+space")
+            );
+            // The schema version came along, so no migration ran again.
+            assert_eq!(store.quicklinks().unwrap().len(), quicklink::DEFAULTS.len());
+            store.set_setting("theme", "dark").unwrap();
+        }
+        assert!(!is_plain(&path));
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes.windows(9).any(|w| w == b"alt+space"));
+        assert!(!fs::exists(with_suffix(&path, ".encrypting")).unwrap());
+
+        // Reopening with the key reads it; without it, or with another, fails.
+        let store = Store::open(&path, Some(&key)).unwrap();
+        assert_eq!(store.setting("theme").unwrap().as_deref(), Some("dark"));
+        drop(store);
+        assert!(not_a_database(Store::open(&path, Some(&[1u8; 32]))));
+        assert!(not_a_database(Store::open(&path, None)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_database_is_encrypted_from_the_start() {
+        let dir = std::env::temp_dir().join(format!("spotlight-cipher-new-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let _ = fs::remove_dir_all(&dir);
+        let key = [9u8; 32];
+        Store::open(&path, Some(&key))
+            .unwrap()
+            .set_setting("a", "b")
+            .unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 0);
+        assert!(!is_plain(&path));
+        let store = Store::open(&path, Some(&key)).unwrap();
+        assert_eq!(store.setting("a").unwrap().as_deref(), Some("b"));
         drop(store);
         let _ = fs::remove_dir_all(&dir);
     }
