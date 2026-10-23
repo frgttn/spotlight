@@ -713,7 +713,7 @@ async fn quicklink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp)
         })
         .ok()
         .flatten();
-    if first.as_deref() != Some("Search GitHub “rust gpui”") {
+    if first.as_deref() != Some("GitHub “rust gpui”") {
         return format!("!gh not filled in ({first:?})");
     }
     if let Err(why) = open_from_search(window, "create quicklink", "Create Quicklink", cx).await {

@@ -25,48 +25,511 @@ pub struct Quicklink {
 }
 
 /// Saved the first time the database is created, so there is something to
-/// start from (and to delete). Name, keyword, link.
+/// start from (and to delete). Name, keyword, link. Mirrors
+/// `quicklinks/quicklinks-curated.csv`, one section per category.
 pub const DEFAULTS: &[(&str, &str, &str)] = &[
-    ("Search GitHub", "gh", "https://github.com/search?q={query}"),
+    // Search
+    ("Google", "g", "https://www.google.com/search?q={query}"),
     (
-        "Search YouTube",
-        "yt",
-        "https://www.youtube.com/results?search_query={query}",
+        "Google Images",
+        "gi",
+        "https://www.google.com/search?tbm=isch&q={query}",
+    ),
+    ("DuckDuckGo", "ddg", "https://duckduckgo.com/?q={query}"),
+    ("Bing", "b", "https://bing.com/search?q={query}"),
+    ("Kagi", "kagi", "https://kagi.com/search?q={query}"),
+    (
+        "Brave Search",
+        "brave",
+        "https://search.brave.com/search?q={query}",
     ),
     (
-        "Search Wikipedia",
+        "Internet Archive",
+        "ia",
+        "https://archive.org/search?query={query}",
+    ),
+    (
+        "Wayback Machine",
+        "wb",
+        "https://web.archive.org/web/*/{query}",
+    ),
+    (
+        "Wolfram Alpha",
+        "wa",
+        "https://wolframalpha.com/input?i={query}",
+    ),
+    // AI
+    ("ChatGPT", "chatgpt", "https://chatgpt.com/?prompt={query}"),
+    ("Claude", "claude", "https://claude.ai/new?q={query}"),
+    ("Perplexity", "pplx", "https://perplexity.ai/?q={query}"),
+    (
+        "Hugging Face",
+        "hf",
+        "https://huggingface.co/models?search={query}",
+    ),
+    (
+        "Kaggle",
+        "kaggle",
+        "https://www.kaggle.com/search?q={query}",
+    ),
+    // Reference
+    (
+        "Wikipedia",
         "w",
         "https://en.wikipedia.org/w/index.php?search={query}",
     ),
     (
-        "Search Google Maps",
-        "maps",
-        "https://www.google.com/maps/search/{query}",
+        "Wiktionary",
+        "wt",
+        "https://en.wiktionary.org/w/index.php?search={query}&title=Special:Search&go=Go",
     ),
     (
-        "Translate",
+        "Wikidata",
+        "wd",
+        "https://www.wikidata.org/w/index.php?search={query}",
+    ),
+    (
+        "Merriam-Webster",
+        "mw",
+        "https://www.merriam-webster.com/dictionary/{query}",
+    ),
+    (
+        "Cambridge Dictionary",
+        "cam",
+        "https://dictionary.cambridge.org/search/english/direct/?q={query}",
+    ),
+    (
+        "Etymonline",
+        "etym",
+        "https://www.etymonline.com/search?q={query}",
+    ),
+    (
+        "Urban Dictionary",
+        "ud",
+        "https://www.urbandictionary.com/define.php?term={query}",
+    ),
+    (
+        "Thesaurus.com",
+        "thesaurus",
+        "https://thesaurus.com/browse/{query}",
+    ),
+    (
+        "Google Translate",
         "tr",
         "https://translate.google.com/?sl=auto&text={argument name=\"Text\"}&tl={argument name=\"To\" options=\"en,ru,uk,de,fr,es\"}",
     ),
     (
-        "Search Stack Overflow",
+        "DeepL",
+        "deepl",
+        "https://www.deepl.com/translator#auto/en/{query}",
+    ),
+    // Maps & Travel
+    (
+        "Google Maps",
+        "maps",
+        "https://www.google.com/maps/search/{query}",
+    ),
+    (
+        "OpenStreetMap",
+        "osm",
+        "https://www.openstreetmap.org/search?query={query}",
+    ),
+    (
+        "Booking.com",
+        "booking",
+        "https://www.booking.com/searchresults.html?ss={query}&si=ai",
+    ),
+    ("Airbnb", "airbnb", "https://www.airbnb.com/s/{query}"),
+    (
+        "Tripadvisor",
+        "ta",
+        "https://www.tripadvisor.com/Search?q={query}",
+    ),
+    (
+        "Kayak",
+        "kayak",
+        "https://www.kayak.com/sherlock/opensearch/search?q={query}",
+    ),
+    (
+        "Flightradar24",
+        "fr24",
+        "https://www.flightradar24.com/data/flights/{query}",
+    ),
+    ("Weather (wttr.in)", "wttr", "https://wttr.in/{query}"),
+    // Dev Q&A
+    ("GitHub", "gh", "https://github.com/search?q={query}"),
+    (
+        "Stack Overflow",
         "so",
         "https://stackoverflow.com/search?q={query}",
     ),
+    ("Super User", "su", "https://superuser.com/search?q={query}"),
     (
-        "Search crates.io",
-        "crates",
-        "https://crates.io/search?q={query}",
+        "Server Fault",
+        "sf",
+        "https://serverfault.com/search?q={query}",
+    ),
+    ("Hacker News", "hn", "https://hn.algolia.com/?q={query}"),
+    ("Reddit", "r", "https://www.reddit.com/search?q={query}"),
+    ("DEV Community", "devto", "https://dev.to/search?q={query}"),
+    ("Medium", "medium", "https://medium.com/search?q={query}"),
+    ("GitLab", "gl", "https://gitlab.com/search?search={query}"),
+    // Dev Docs
+    (
+        "MDN Web Docs",
+        "mdn",
+        "https://developer.mozilla.org/en-US/search?q={query}",
+    ),
+    ("DevDocs", "dd", "https://devdocs.io/#q={query}"),
+    (
+        "Microsoft Learn",
+        "msdn",
+        "https://learn.microsoft.com/en-us/search?terms={query}",
     ),
     (
-        "Search docs.rs",
+        "docs.rs",
         "docs",
         "https://docs.rs/releases/search?query={query}",
     ),
     (
-        "Search MDN",
-        "mdn",
-        "https://developer.mozilla.org/en-US/search?q={query}",
+        "Rust std docs",
+        "rust",
+        "https://doc.rust-lang.org/std/?search={query}",
+    ),
+    (
+        "Python Docs",
+        "py",
+        "https://docs.python.org/3/search.html?q={query}",
+    ),
+    ("Kotlin Docs", "kotlin", "https://kotlinlang.org/?q={query}"),
+    (
+        "Android Developers",
+        "android",
+        "https://developer.android.com/s/results/?q={query}",
+    ),
+    ("Go packages", "go", "https://pkg.go.dev/search?q={query}"),
+    ("React Docs", "react", "https://react.dev/?q={query}"),
+    (
+        "Can I use",
+        "caniuse",
+        "https://caniuse.com/?search={query}",
+    ),
+    (
+        "tldr pages",
+        "tldr",
+        "https://tldr.inbrowser.app/search?query={query}",
+    ),
+    (
+        "Man pages (Arch)",
+        "man",
+        "https://man.archlinux.org/search?q={query}&go=Go",
+    ),
+    (
+        "Arch Wiki",
+        "aw",
+        "https://wiki.archlinux.org/index.php?title=Special:Search&search={query}",
+    ),
+    // Packages
+    ("crates.io", "crates", "https://crates.io/search?q={query}"),
+    ("lib.rs", "librs", "https://lib.rs/search?q={query}"),
+    ("npm", "npm", "https://www.npmjs.com/search?q={query}"),
+    ("PyPI", "pypi", "https://pypi.org/search/?q={query}"),
+    (
+        "NuGet",
+        "nuget",
+        "https://nuget.org/packages?q={query}&sortOrder=package-download-count",
+    ),
+    (
+        "Maven Repository",
+        "mvn",
+        "https://mvnrepository.com/search?q={query}",
+    ),
+    (
+        "Packagist",
+        "packagist",
+        "https://packagist.org/search/?q={query}",
+    ),
+    (
+        "RubyGems",
+        "gem",
+        "https://rubygems.org/search?query={query}",
+    ),
+    (
+        "Docker Hub",
+        "docker",
+        "https://hub.docker.com/search?q={query}",
+    ),
+    (
+        "Homebrew",
+        "brew",
+        "https://formulae.brew.sh/search?q={query}",
+    ),
+    (
+        "Chocolatey",
+        "choco",
+        "https://chocolatey.org/packages?q={query}",
+    ),
+    (
+        "winget.run",
+        "winget",
+        "https://winget.run/search?query={query}",
+    ),
+    (
+        "Flathub",
+        "flathub",
+        "https://flathub.org/apps/search?q={query}",
+    ),
+    (
+        "Arch User Repository",
+        "aur",
+        "https://aur.archlinux.org/packages/?K={query}",
+    ),
+    (
+        "Debian Packages",
+        "deb",
+        "https://packages.debian.org/search?keywords={query}",
+    ),
+    (
+        "Fedora Packages",
+        "fedora",
+        "https://packages.fedoraproject.org/search?query={query}",
+    ),
+    (
+        "Arch Packages",
+        "archpkg",
+        "https://archlinux.org/packages/?q={query}",
+    ),
+    // Science
+    (
+        "Google Scholar",
+        "scholar",
+        "https://scholar.google.com/scholar?&q={query}",
+    ),
+    (
+        "arXiv",
+        "arxiv",
+        "https://arxiv.org/search?query={query}&searchtype=all",
+    ),
+    (
+        "PubMed",
+        "pubmed",
+        "https://pubmed.ncbi.nlm.nih.gov/?term={query}",
+    ),
+    ("DOI", "doi", "https://doi.org/{query}"),
+    // Media
+    (
+        "YouTube",
+        "yt",
+        "https://www.youtube.com/results?search_query={query}",
+    ),
+    (
+        "YouTube Music",
+        "ytm",
+        "https://music.youtube.com/search?q={query}",
+    ),
+    (
+        "Spotify",
+        "spotify",
+        "https://open.spotify.com/search/{query}",
+    ),
+    (
+        "Genius Lyrics",
+        "genius",
+        "https://genius.com/search?q={query}",
+    ),
+    (
+        "Discogs",
+        "discogs",
+        "https://www.discogs.com/search?q={query}&type=all",
+    ),
+    ("IMDb", "imdb", "https://www.imdb.com/find?s=all&q={query}"),
+    (
+        "TMDB",
+        "tmdb",
+        "https://www.themoviedb.org/search?query={query}",
+    ),
+    (
+        "Rotten Tomatoes",
+        "rt",
+        "https://www.rottentomatoes.com/search/?search={query}",
+    ),
+    (
+        "MyAnimeList",
+        "mal",
+        "https://myanimelist.net/anime.php?q={query}",
+    ),
+    (
+        "Goodreads",
+        "gr",
+        "https://www.goodreads.com/search?q={query}",
+    ),
+    ("Cobalt", "co", "https://cobalt.tools/#{query}"),
+    // Design
+    (
+        "Unsplash",
+        "unsplash",
+        "https://unsplash.com/search?utf8=%E2%9C%93&keyword={query}",
+    ),
+    ("Pexels", "pexels", "https://www.pexels.com/search/{query}/"),
+    ("Giphy", "giphy", "https://giphy.com/search/{query}"),
+    (
+        "Flaticon",
+        "flaticon",
+        "https://www.flaticon.com/search?word={query}",
+    ),
+    (
+        "SVG Repo",
+        "svgrepo",
+        "https://www.svgrepo.com/vectors/{query}/",
+    ),
+    (
+        "The Noun Project",
+        "noun",
+        "https://thenounproject.com/search/?q={query}",
+    ),
+    (
+        "Dribbble",
+        "dribbble",
+        "https://dribbble.com/search?q={query}",
+    ),
+    (
+        "Google Fonts",
+        "gf",
+        "https://fonts.google.com/?query={query}",
+    ),
+    // Shopping
+    ("Amazon", "a", "https://www.amazon.com/s?k={query}"),
+    (
+        "eBay",
+        "ebay",
+        "https://www.ebay.com/sch/items/?_nkw={query}",
+    ),
+    (
+        "AliExpress",
+        "ali",
+        "https://www.aliexpress.com/wholesale?SearchText={query}",
+    ),
+    ("Etsy", "etsy", "https://www.etsy.com/search?q={query}"),
+    (
+        "Newegg",
+        "newegg",
+        "https://www.newegg.com/Product/ProductList.aspx?Submit=ENE&DEPA=0&Description={query}",
+    ),
+    // Games
+    (
+        "Steam",
+        "steam",
+        "https://store.steampowered.com/search/?term={query}",
+    ),
+    (
+        "Steam DB",
+        "steamdb",
+        "https://steamdb.info/search/?a=app&q={query}",
+    ),
+    ("GOG", "gog", "https://www.gog.com/games?query={query}"),
+    ("itch.io", "itch", "https://itch.io/search?q={query}"),
+    (
+        "HowLongToBeat",
+        "hltb",
+        "https://howlongtobeat.com/?q={query}",
+    ),
+    // Finance
+    (
+        "Yahoo Finance",
+        "yf",
+        "https://finance.yahoo.com/quote/{query}",
+    ),
+    (
+        "CoinMarketCap",
+        "cmc",
+        "https://coinmarketcap.com/search/?q={query}",
+    ),
+    (
+        "CoinGecko",
+        "coingecko",
+        "https://www.coingecko.com/en/search/bang?query={query}",
+    ),
+    (
+        "Investing.com",
+        "investing",
+        "https://www.investing.com/search/?q={query}",
+    ),
+    // Social
+    ("X", "x", "https://x.com/search?q={query}"),
+    (
+        "LinkedIn",
+        "li",
+        "https://www.linkedin.com/search/results/all/?keywords={query}",
+    ),
+    ("Quora", "quora", "https://www.quora.com/search?q={query}"),
+    (
+        "Product Hunt",
+        "ph",
+        "https://www.producthunt.com/search?q={query}",
+    ),
+    (
+        "AlternativeTo",
+        "alternativeto",
+        "https://alternativeto.net/browse/search/?q={query}",
+    ),
+    // Google Workspace
+    (
+        "Gmail",
+        "gmail",
+        "https://mail.google.com/mail/#search/{query}",
+    ),
+    (
+        "Google Docs",
+        "gd",
+        "https://docs.google.com/document/u/0/?q={query}",
+    ),
+    (
+        "Google Calendar",
+        "gcal",
+        "https://calendar.google.com/calendar/b/0/r/search?q={query}",
+    ),
+    (
+        "Google Drive",
+        "drive",
+        "https://drive.google.com/drive/search?q={query}",
+    ),
+    // Security
+    (
+        "VirusTotal",
+        "vt",
+        "https://www.virustotal.com/gui/search?query={query}",
+    ),
+    (
+        "Shodan",
+        "shodan",
+        "https://www.shodan.io/search?query={query}",
+    ),
+    ("crt.sh", "crt", "https://crt.sh/?q={query}"),
+    (
+        "urlscan.io",
+        "urlscan",
+        "https://urlscan.io/search/#{query}",
+    ),
+    (
+        "NVD",
+        "nvd",
+        "https://nvd.nist.gov/vuln/search/results?form_type=Basic&results_type=overview&query={query}&search_type=all",
+    ),
+    (
+        "CVE",
+        "cve",
+        "https://www.cve.org/CVERecord/SearchResults?query={query}",
+    ),
+    (
+        "Exploit-DB",
+        "edb",
+        "https://www.exploit-db.com/search/?action=search&description={query}",
+    ),
+    ("WHOIS", "whois", "https://whois.domaintools.com/{query}"),
+    (
+        "MXToolbox DNS",
+        "dns",
+        "https://mxtoolbox.com/SuperTool.aspx?action=a:{query}&run=toolpage",
     ),
 ];
 

@@ -211,11 +211,20 @@ impl Provider for Quicklinks {
         }
 
         let links = self.load();
-        let mut items: Vec<SearchItem> = links.iter().map(|link| self.item(link)).collect();
+        // The stock quicklinks are too many for root search: they're reached
+        // with `!keyword` or through Search Quicklinks. Any the user has
+        // changed, and their own, are listed in root search as usual.
+        let rows: Vec<SearchItem> = links.iter().map(|link| self.item(link)).collect();
+        let mut items: Vec<SearchItem> = links
+            .iter()
+            .zip(&rows)
+            .filter(|(link, _)| !is_stock(link))
+            .map(|(_, row)| row.clone())
+            .collect();
         let list = View::List(ListView {
             title: "Quicklinks".into(),
             placeholder: Some("Search quicklinks…".into()),
-            items: items.clone(),
+            items: rows,
             empty: Some("No quicklinks yet. Create one with Create Quicklink.".into()),
             filters: Vec::new(),
         });
@@ -527,6 +536,14 @@ fn arguments_form(link: &Quicklink, arguments: &[Argument], values: &[String]) -
     })
 }
 
+/// Still exactly as [`DEFAULTS`] saved it.
+fn is_stock(link: &Quicklink) -> bool {
+    link.open_with.is_none()
+        && DEFAULTS.iter().any(|(name, keyword, url)| {
+            link.name == *name && link.link == *url && link.keyword.as_deref() == Some(*keyword)
+        })
+}
+
 /// The browser it opens in, the folder or file it opens, or a link symbol.
 fn icon(link: &Quicklink) -> Icon {
     if let Some(app) = &link.open_with {
@@ -571,12 +588,52 @@ mod tests {
             .unwrap_or_else(|| panic!("no {title:?}"))
     }
 
+    /// What Search Quicklinks lists: every quicklink, root search or not.
+    fn all_links(catalog: &[SearchItem]) -> Vec<SearchItem> {
+        let Command::PushView(view) = &find(catalog, "Search Quicklinks").actions[0].command else {
+            panic!("expected a list");
+        };
+        let View::List(list) = view.as_ref() else {
+            panic!("expected a list");
+        };
+        list.items.clone()
+    }
+
+    #[test]
+    fn stock_quicklinks_stay_out_of_root_search() {
+        let provider = provider();
+        let items = provider.catalog();
+        assert_eq!(
+            titles(&items),
+            ["Search Quicklinks", "Search Bangs", "Create Quicklink"]
+        );
+        assert_eq!(all_links(&items).len(), DEFAULTS.len());
+
+        // Changing one (or adding one) brings it to root search.
+        let links = provider.links.read().unwrap().clone();
+        let mut github = links.iter().find(|l| l.name == "GitHub").unwrap().clone();
+        github.name = "My GitHub".into();
+        provider
+            .store
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .save_quicklink(&github)
+            .unwrap();
+        let items = provider.catalog();
+        assert_eq!(titles(&items)[0], "My GitHub");
+        assert_eq!(items.len(), 4);
+    }
+
     #[test]
     fn catalog_has_the_defaults_and_commands() {
         let provider = provider();
-        let items = provider.catalog();
-        assert_eq!(items.len(), DEFAULTS.len() + 3);
-        let github = find(&items, "Search GitHub");
+        let catalog = provider.catalog();
+        assert_eq!(catalog.len(), 3);
+        let items = all_links(&catalog);
+        assert_eq!(items.len(), DEFAULTS.len());
+        let github = find(&items, "GitHub");
         assert_eq!(github.subtitle.as_deref(), Some("!gh  ·  Quicklink"));
         assert!(github.keywords.contains(&"github.com".to_owned()));
         // It has an argument, so Enter opens a form for it.
@@ -604,8 +661,8 @@ mod tests {
                 "Delete Quicklink"
             ]
         );
-        find(&items, "Create Quicklink");
-        find(&items, "Search Bangs");
+        find(&catalog, "Create Quicklink");
+        find(&catalog, "Search Bangs");
     }
 
     #[test]
@@ -614,7 +671,7 @@ mod tests {
         provider.catalog();
         let items = provider.answers("!GH tokio rt");
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "Search GitHub “tokio rt”");
+        assert_eq!(items[0].title, "GitHub “tokio rt”");
         assert_eq!(
             items[0].actions[0].command,
             Command::OpenQuicklink {
@@ -623,7 +680,10 @@ mod tests {
             }
         );
         // The same id as the catalog row, so using it counts for its ranking.
-        assert_eq!(items[0].id, find(&provider.catalog(), "Search GitHub").id);
+        assert_eq!(
+            items[0].id,
+            find(&all_links(&provider.catalog()), "GitHub").id
+        );
 
         // Translate's language has a default, so it opens directly too.
         let items = provider.answers("!tr good morning");
@@ -650,26 +710,34 @@ mod tests {
             assert_eq!(items[0].actions[2].title, "Save as Quicklink…");
         }
         // The user's quicklink keeps its keyword; the bang its other triggers.
-        assert_eq!(titles(&provider.answers("!gh x")), ["Search GitHub “x”"]);
-        assert_eq!(titles(&provider.answers("!git x")), ["GitHub “x”"]);
+        let items = provider.answers("!gh x");
+        assert_eq!(titles(&items), ["GitHub “x”"]);
+        assert_eq!(items[0].subtitle.as_deref(), Some("!gh  ·  Quicklink"));
+        let items = provider.answers("!git x");
+        assert_eq!(titles(&items), ["GitHub “x”"]);
+        assert_eq!(items[0].subtitle.as_deref(), Some("!git  ·  github.com"));
     }
 
     #[test]
     fn a_partial_bang_lists_matching_keywords() {
         let provider = provider();
         provider.catalog();
-        let items = provider.answers("!s");
-        assert_eq!(titles(&items), ["Search Stack Overflow", "Startpage"]);
+        let items = provider.answers("!sp");
+        assert_eq!(titles(&items), ["Spotify", "Startpage"]);
         // Enter completes the keyword, ready for the text.
         assert_eq!(
             items[0].actions[0].command,
-            Command::Complete("!so ".into())
+            Command::Complete("!spotify ".into())
         );
         assert_eq!(
             items[1].actions[0].command,
             Command::Complete("!sp ".into())
         );
-        assert_eq!(titles(&provider.answers("!g")), ["Search GitHub", "GitHub"]);
+        // Quicklinks first (by name), then the bangs no quicklink took.
+        assert_eq!(
+            titles(&provider.answers("!gi")),
+            ["Giphy", "Google Images", "GitHub"]
+        );
         assert_eq!(items[1].subtitle.as_deref(), Some("!sp  ·  startpage.com"));
 
         // With the space typed, only that keyword, and Enter opens the site.
@@ -746,8 +814,10 @@ mod tests {
     fn without_a_database_the_defaults_are_read_only() {
         let provider = Quicklinks::new(None, Bangs::from_json(BANGS));
         provider.browsers.set(Vec::new()).unwrap();
-        let items = provider.catalog();
-        assert_eq!(items.len(), DEFAULTS.len() + 2);
+        let catalog = provider.catalog();
+        assert_eq!(catalog.len(), 2);
+        let items = all_links(&catalog);
+        assert_eq!(items.len(), DEFAULTS.len());
         let titles: Vec<_> = items[0].actions.iter().map(|a| a.title.as_str()).collect();
         assert_eq!(titles, ["Open Quicklink", "Copy Link"]);
     }
