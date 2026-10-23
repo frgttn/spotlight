@@ -131,6 +131,34 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    // Turning the calculator off in Settings takes its answer away at once;
+    // turning it back on brings it back.
+    let mut toggled = Vec::new();
+    for enabled in [false, true] {
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.set_provider_enabled("calc", enabled, window, cx)
+            })
+            .ok();
+        sleep(SETTLE_MS).await;
+        toggled.push(
+            window
+                .update(cx, |launcher, _, _| {
+                    launcher.result_titles().into_iter().next()
+                })
+                .ok()
+                .flatten(),
+        );
+    }
+    eprintln!(
+        "[selftest] calculator off, then on: {toggled:?} {}",
+        if toggled[0].as_deref() != Some("144") && toggled[1].as_deref() == Some("144") {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     // Ctrl+K opens the action panel on that row; Esc closes the panel, not the window.
     press(window, "ctrl-k", cx);
     sleep(SETTLE_MS).await;

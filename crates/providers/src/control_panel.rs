@@ -17,6 +17,14 @@ impl Provider for ControlPanel {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Control Panel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Control Panel items such as Device Manager and Credential Manager."
+    }
+
     /// Blocking and COM-heavy (tens of ms), like app discovery.
     fn catalog(&self) -> Vec<SearchItem> {
         let items = match apps::control_panel() {

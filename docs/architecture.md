@@ -187,6 +187,7 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
    The providers live in one `providers` crate (modules, not one crate each) until one needs heavy dependencies of its own.
    `Provider` is synchronous for now: catalogs load on background threads and per-keystroke answers are bounded (the calculator gives up after 30 ms). Async with cancellation comes with providers that do IO (files, plugins).
    Actions are data (`Command`: launch app, open URL, copy, system command) that the app runs, rather than a `Provider::run` callback, so scripts and plugins can only ask for this safe set.
+   Each provider can be turned off in Settings (`RootSearch::set_enabled`): it then has no catalog loaded and is skipped for answers and fallbacks. `Provider::name` / `description` label its switch.
 2. Root search core, part 2: ✅ action panel (Ctrl+K), ✅ view stack (List / Grid / Detail / Form, Esc goes back), ✅ HUD and toasts, ✅ aliases and per-item hotkeys, ✅ calculator currencies and history; ✅ more sources (Settings pages, Control Panel, Steam / Epic / GOG / Ubisoft games); still to do: frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
 4. Window management, file search.

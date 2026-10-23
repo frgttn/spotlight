@@ -117,6 +117,14 @@ impl Provider for System {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "System Commands"
+    }
+
+    fn description(&self) -> &'static str {
+        "Lock, sleep, restart, volume, Bluetooth, dark mode and more."
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         let mut items: Vec<SearchItem> = COMMANDS
             .iter()

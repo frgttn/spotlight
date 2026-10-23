@@ -117,6 +117,10 @@ impl Provider for Synthetic {
         "synthetic"
     }
 
+    fn name(&self) -> &'static str {
+        "Synthetic Rows"
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         (0..self.0)
             .map(|ix| {
@@ -176,6 +180,15 @@ pub struct Shortcut {
     pub hotkey: Option<Hotkey>,
 }
 
+/// A search provider, as the settings window lists it to turn it on or off.
+#[derive(Clone)]
+pub struct Source {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub enabled: bool,
+}
+
 /// A small card over the window for setting an item's alias or hotkey.
 enum Editor {
     Alias {
@@ -210,7 +223,7 @@ pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
     search: RootSearch,
-    /// Catalogs still loading.
+    /// Catalogs still loading at startup.
     loading: usize,
     results: Vec<Row>,
     selected: usize,
@@ -260,6 +273,7 @@ impl Launcher {
         hotkey: SharedString,
         hotkeys: hotkey::Service,
         mut providers: Vec<Arc<dyn Provider>>,
+        disabled_providers: &[String],
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
         smooth_scrolling: bool,
@@ -331,11 +345,19 @@ impl Launcher {
             })
             .collect();
 
+        let mut search = RootSearch::new(providers);
+        for ix in 0..search.providers().len() {
+            let id = search.providers()[ix].id();
+            if disabled_providers.iter().any(|disabled| disabled == id) {
+                search.set_enabled(ix, false);
+            }
+        }
+
         let mut this = Self {
             hwnd,
             input,
-            loading: providers.len(),
-            search: RootSearch::new(providers),
+            loading: 0,
+            search,
             results: Vec::new(),
             selected: 0,
             panel: None,
@@ -373,11 +395,16 @@ impl Launcher {
         this
     }
 
-    /// Loads every provider's catalog on its own thread (app discovery takes
-    /// ~200 ms of COM calls) and merges each one into the search as it arrives.
+    /// Loads every turned-on provider's catalog on its own thread (app
+    /// discovery takes ~200 ms of COM calls) and merges each one into the
+    /// search as it arrives.
     fn load_catalogs(&mut self, window_scale: f32, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::unbounded();
         for (ix, provider) in self.search.providers().iter().enumerate() {
+            if !self.search.is_enabled(ix) {
+                continue;
+            }
+            self.loading += 1;
             let provider = provider.clone();
             let tx = tx.clone();
             let spawned = thread::Builder::new()
@@ -396,6 +423,7 @@ impl Launcher {
         cx.spawn(async move |this, cx| {
             while let Ok((ix, items, elapsed)) = rx.recv().await {
                 let updated = this.update(cx, |this, cx| {
+                    this.loading = this.loading.saturating_sub(1);
                     this.catalog_loaded(ix, items, elapsed, window_scale, cx)
                 });
                 if updated.is_err() {
@@ -407,7 +435,7 @@ impl Launcher {
     }
 
     /// Loads one provider's catalog again, after the user changed what it
-    /// lists (a quicklink saved or deleted).
+    /// lists (a quicklink saved or deleted) or turned it on.
     fn reload_catalog(&mut self, id: &str, window_scale: f32, cx: &mut Context<Self>) {
         let Some(ix) = self
             .search
@@ -442,6 +470,10 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) {
         let id = self.search.providers()[provider].id();
+        if !self.search.is_enabled(provider) {
+            eprintln!("[spotlight] {id}: turned off while loading; catalog dropped");
+            return;
+        }
         eprintln!(
             "[spotlight] {id}: {} items in {:.1} ms",
             items.len(),
@@ -457,7 +489,6 @@ impl Launcher {
             .collect();
 
         self.search.set_catalog(provider, items);
-        self.loading = self.loading.saturating_sub(1);
         // Catalog indices moved, so the rows are rebuilt (and the selection resets).
         let query = self.query(cx);
         self.refilter(&query);
@@ -515,6 +546,59 @@ impl Launcher {
             }
         })
         .detach();
+    }
+
+    /// Every search provider, in search order, for the settings window.
+    pub fn sources(&self) -> Vec<Source> {
+        self.search
+            .providers()
+            .iter()
+            .enumerate()
+            .map(|(ix, provider)| Source {
+                id: provider.id(),
+                name: provider.name(),
+                description: provider.description(),
+                enabled: self.search.is_enabled(ix),
+            })
+            .collect()
+    }
+
+    /// The ids of the providers that are turned off, for saving.
+    pub fn disabled_providers(&self) -> Vec<&'static str> {
+        self.sources()
+            .into_iter()
+            .filter(|source| !source.enabled)
+            .map(|source| source.id)
+            .collect()
+    }
+
+    /// Turns provider `id` on (loading its catalog again) or off (dropping it).
+    pub fn set_provider_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == id)
+        else {
+            return;
+        };
+        if self.search.is_enabled(ix) == enabled {
+            return;
+        }
+        self.search.set_enabled(ix, enabled);
+        if enabled {
+            self.reload_catalog(id, window.scale_factor(), cx);
+        }
+        // Catalog indices moved (or answers changed), so the rows are rebuilt.
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
     }
 
     pub fn set_smooth_scrolling(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1108,7 +1192,19 @@ impl Launcher {
     /// the launcher on just that item instead, waiting for Enter.
     pub fn run_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.search.catalog().iter().position(|item| item.id == id) else {
-            eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)");
+            // Item ids start with their provider's id.
+            let provider = id.split(':').next().unwrap_or_default();
+            let off = self
+                .sources()
+                .into_iter()
+                .find(|source| source.id == provider && !source.enabled);
+            match off {
+                Some(source) => self.show_hud(
+                    format!("{} is turned off in Settings", source.name).into(),
+                    cx,
+                ),
+                None => eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)"),
+            }
             return;
         };
         let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {

@@ -1,5 +1,6 @@
 //! The settings window: launcher hotkey, web search engine, smooth scrolling,
-//! start at login, and every alias and item hotkey.
+//! which search sources are on, start at login, and every alias and item
+//! hotkey.
 //!
 //! The window has no system frame. The header is the drag area and carries
 //! its own close button, so it matches the launcher instead of a stock
@@ -20,7 +21,11 @@ use spotlight_platform_win::{
     win,
 };
 
-use crate::{launcher::Shortcut, text_input::TextInput, theme};
+use crate::{
+    launcher::{Shortcut, Source},
+    text_input::TextInput,
+    theme,
+};
 
 actions!(settings, [Close, Save]);
 
@@ -35,8 +40,18 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Reads the launcher's current aliases and item hotkeys.
-pub type ShortcutSource = Rc<dyn Fn(&App) -> Vec<Shortcut>>;
+/// What the settings window shows from the launcher.
+#[derive(Default)]
+pub struct LauncherState {
+    /// Items with an alias or a hotkey.
+    pub shortcuts: Vec<Shortcut>,
+    /// Search providers and whether each is on.
+    pub sources: Vec<Source>,
+}
+
+/// Reads the launcher's current state; `None` while the launcher can't be
+/// read (it is mid-update, as when its Ctrl+, opens this window).
+pub type LauncherReader = Rc<dyn Fn(&App) -> Option<LauncherState>>;
 
 pub enum SettingsEvent {
     /// The launcher hotkey is now this one; persist it and update labels.
@@ -46,6 +61,11 @@ pub enum SettingsEvent {
     SearchEngineChanged(SearchEngine),
     /// Start at login was turned on or off here.
     AutostartChanged,
+    /// The search provider with this id was turned on or off.
+    SourceToggled {
+        id: &'static str,
+        enabled: bool,
+    },
     /// The alias of this item was edited here (`None`: removed).
     AliasChanged {
         item_id: String,
@@ -67,7 +87,7 @@ pub struct Settings {
     message: Option<(SharedString, bool)>,
     /// What the recorder is recording for: the launcher (`None`) or this item.
     recording_for: Option<String>,
-    shortcut_source: ShortcutSource,
+    launcher: LauncherReader,
     /// Aliases and item hotkeys as last read from the launcher.
     shortcuts: Vec<Shortcut>,
     /// The alias being edited in place: item id and the field.
@@ -81,6 +101,8 @@ pub struct Settings {
     custom_engine: Option<Entity<TextInput>>,
     /// Why the custom URL wasn't taken, or that it was.
     engine_message: Option<(SharedString, bool)>,
+    /// Search providers and whether each is on, as last read from the launcher.
+    sources: Vec<Source>,
     autostart: bool,
     data_path: SharedString,
     focus: FocusHandle,
@@ -98,7 +120,7 @@ impl Settings {
         smooth_scrolling: bool,
         search_engine: SearchEngine,
         data_path: SharedString,
-        shortcut_source: ShortcutSource,
+        launcher: LauncherReader,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -116,8 +138,10 @@ impl Settings {
             cx.on_blur(&recorder, window, |this, _, cx| this.stop_recording(cx)),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    // Aliases and hotkeys may have changed in the launcher meanwhile.
-                    this.refresh_shortcuts(cx);
+                    // Aliases and hotkeys may have changed in the launcher
+                    // meanwhile, and on the first activation it may not
+                    // have been readable yet.
+                    this.refresh_from_launcher(cx);
                 } else {
                     this.stop_recording(cx);
                 }
@@ -125,14 +149,15 @@ impl Settings {
         ];
         let focus = cx.focus_handle();
         window.focus(&focus);
+        let LauncherState { shortcuts, sources } = launcher(cx).unwrap_or_default();
         Self {
             hotkeys,
             hotkey,
             recording: None,
             message: None,
             recording_for: None,
-            shortcuts: shortcut_source(cx),
-            shortcut_source,
+            shortcuts,
+            launcher,
             editing_alias: None,
             shortcut_message: None,
             smooth_scrolling,
@@ -142,6 +167,7 @@ impl Settings {
             },
             search_engine,
             engine_message: None,
+            sources,
             autostart: autostart::is_enabled(),
             data_path,
             focus,
@@ -156,8 +182,12 @@ impl Settings {
         cx.notify();
     }
 
-    fn refresh_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.shortcuts = (self.shortcut_source)(cx);
+    fn refresh_from_launcher(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = (self.launcher)(cx) else {
+            return;
+        };
+        self.shortcuts = state.shortcuts;
+        self.sources = state.sources;
         cx.notify();
     }
 
@@ -445,6 +475,34 @@ impl Settings {
         self.smooth_scrolling = !self.smooth_scrolling;
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
         cx.notify();
+    }
+
+    fn toggle_source(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(source) = self.sources.get_mut(ix) else {
+            return;
+        };
+        source.enabled = !source.enabled;
+        cx.emit(SettingsEvent::SourceToggled {
+            id: source.id,
+            enabled: source.enabled,
+        });
+        cx.notify();
+    }
+
+    /// One row per search provider, each with its switch.
+    fn source_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.sources.iter().enumerate().map(|(ix, source)| {
+            div()
+                .flex()
+                .flex_col()
+                .when(ix > 0, |row| row.child(divider()))
+                .child(row(source.name, source.description).child(switch(
+                    ("source", ix),
+                    source.enabled,
+                    cx.listener(move |this, _, _, cx| this.toggle_source(ix, cx)),
+                )))
+        });
+        card().children(rows)
     }
 
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
@@ -854,6 +912,9 @@ impl Render for Settings {
                     .gap_2()
                     .child(section_label("Launcher"))
                     .child(launcher)
+                    .child(div().h(px(6.)))
+                    .child(section_label("Search sources"))
+                    .child(self.source_list(cx))
                     .child(div().h(px(6.)))
                     .child(section_label("System"))
                     .child(system)

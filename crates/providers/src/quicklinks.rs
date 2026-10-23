@@ -191,6 +191,14 @@ impl Provider for Quicklinks {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Quicklinks"
+    }
+
+    fn description(&self) -> &'static str {
+        "Your saved links and !bang searches. Off, it downloads no bangs."
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         // Reading and refreshing the bangs (a 1.4 MB download) mustn't hold
         // up the user's own quicklinks.

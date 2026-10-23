@@ -39,7 +39,7 @@ use spotlight_providers::web::Web;
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
-    settings::{self, Settings, SettingsEvent, ShortcutSource},
+    settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
     text_input,
 };
 
@@ -51,6 +51,9 @@ const HOTKEY_SETTING: &str = "hotkey";
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
+/// `settings` key: ids of the turned-off search providers, comma-separated;
+/// missing means all on.
+const DISABLED_PROVIDERS_SETTING: &str = "disabled_providers";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
@@ -121,6 +124,15 @@ fn main() {
             engine
         })
         .unwrap_or_default();
+    let disabled_providers: Vec<String> = setting(DISABLED_PROVIDERS_SETTING)
+        .map(|ids| {
+            ids.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let saved_hotkey = setting(HOTKEY_SETTING).and_then(|text| {
         let hotkey = Hotkey::parse(&text);
         if hotkey.is_none() {
@@ -182,6 +194,7 @@ fn main() {
                             label,
                             launcher_hotkeys,
                             providers,
+                            &disabled_providers,
                             synthetic,
                             launcher_store,
                             smooth_scrolling,
@@ -349,7 +362,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.smooth_scrolling.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.data_path.clone(),
-                shortcut_source(view_state.launcher),
+                launcher_reader(view_state.launcher),
                 window,
                 cx,
             )
@@ -397,6 +410,18 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .ok();
             save_setting(state, SMOOTH_SCROLLING_SETTING, enabled.to_string(), cx);
         }
+        SettingsEvent::SourceToggled { id, enabled } => {
+            let disabled = state
+                .launcher
+                .update(cx, |launcher, window, cx| {
+                    launcher.set_provider_enabled(id, *enabled, window, cx);
+                    launcher.disabled_providers().join(",")
+                })
+                .ok();
+            if let Some(disabled) = disabled {
+                save_setting(state, DISABLED_PROVIDERS_SETTING, disabled, cx);
+            }
+        }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
                 tray.sync_autostart();
@@ -422,13 +447,15 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
     }
 }
 
-/// How the settings window reads the launcher's aliases and item hotkeys.
-fn shortcut_source(launcher: WindowHandle<Launcher>) -> ShortcutSource {
+/// How the settings window reads the launcher's aliases, item hotkeys and
+/// search sources.
+fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
     Rc::new(move |cx: &App| {
-        launcher
-            .read(cx)
-            .map(|launcher| launcher.shortcuts())
-            .unwrap_or_default()
+        let launcher = launcher.read(cx).ok()?;
+        Some(LauncherState {
+            shortcuts: launcher.shortcuts(),
+            sources: launcher.sources(),
+        })
     })
 }
 

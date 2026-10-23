@@ -21,6 +21,9 @@ pub enum Row {
 pub struct RootSearch {
     searcher: Searcher,
     providers: Vec<Arc<dyn Provider>>,
+    /// Whether each provider takes part, by provider index. A turned-off one
+    /// keeps no catalog and adds no answers or fallbacks.
+    enabled: Vec<bool>,
     /// Each provider's catalog, by provider index, as last loaded.
     catalogs: Vec<Vec<SearchItem>>,
     /// `catalogs` flattened in provider order, so empty-query order is stable
@@ -32,6 +35,7 @@ impl RootSearch {
     pub fn new(providers: Vec<Arc<dyn Provider>>) -> Self {
         Self {
             searcher: Searcher::default(),
+            enabled: vec![true; providers.len()],
             catalogs: vec![Vec::new(); providers.len()],
             providers,
             catalog: Vec::new(),
@@ -42,11 +46,37 @@ impl RootSearch {
         &self.providers
     }
 
+    pub fn is_enabled(&self, provider: usize) -> bool {
+        self.enabled[provider]
+    }
+
+    /// Turns provider `provider` on or off. Turning it off drops its catalog;
+    /// turning it on leaves the catalog empty until [`Self::set_catalog`].
+    pub fn set_enabled(&mut self, provider: usize, enabled: bool) {
+        self.enabled[provider] = enabled;
+        if !enabled {
+            self.set_catalog(provider, Vec::new());
+        }
+    }
+
     /// Replaces provider `provider`'s catalog (an index into [`Self::providers`]).
-    /// Indices in earlier [`Row::Catalog`]s are invalid afterwards.
+    /// Ignored for a turned-off provider, so a load that finishes after it was
+    /// turned off adds nothing. Indices in earlier [`Row::Catalog`]s are
+    /// invalid afterwards.
     pub fn set_catalog(&mut self, provider: usize, items: Vec<SearchItem>) {
-        self.catalogs[provider] = items;
+        self.catalogs[provider] = if self.enabled[provider] {
+            items
+        } else {
+            Vec::new()
+        };
         self.catalog = self.catalogs.iter().flatten().cloned().collect();
+    }
+
+    fn enabled_providers(&self) -> impl Iterator<Item = &Arc<dyn Provider>> {
+        self.providers
+            .iter()
+            .zip(&self.enabled)
+            .filter_map(|(provider, enabled)| enabled.then_some(provider))
     }
 
     pub fn catalog(&self) -> &[SearchItem] {
@@ -63,8 +93,7 @@ impl RootSearch {
     ) -> Vec<Row> {
         let query = query.trim();
         let mut rows: Vec<Row> = self
-            .providers
-            .iter()
+            .enabled_providers()
             .flat_map(|provider| provider.answers(query))
             .map(Row::Computed)
             .collect();
@@ -84,8 +113,7 @@ impl RootSearch {
 
         if !query.is_empty() {
             rows.extend(
-                self.providers
-                    .iter()
+                self.enabled_providers()
                     .flat_map(|provider| provider.fallbacks(query))
                     .map(Row::Computed),
             );
@@ -180,6 +208,33 @@ mod tests {
         search.set_catalog(0, providers[0].catalog());
         let titles: Vec<_> = search.catalog().iter().map(|item| &item.title).collect();
         assert_eq!(titles, ["Apps", "Lock"]);
+    }
+
+    #[test]
+    fn turned_off_provider_adds_nothing() {
+        let providers: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(Fixed { catalog: &["Apps"] }),
+            Arc::new(Fixed { catalog: &["Lock"] }),
+        ];
+        let mut search = RootSearch::new(providers.clone());
+        search.set_catalog(0, providers[0].catalog());
+        search.set_enabled(1, false);
+        // A load that was already running when it was turned off.
+        search.set_catalog(1, providers[1].catalog());
+
+        let rows = search.search("", |_| 0., &HashMap::new());
+        assert_eq!(titles(&search, &rows), ["Apps"]);
+        // Answers and fallbacks come from the provider still on, once each.
+        let rows = search.search("1+1", |_| 0., &HashMap::new());
+        assert_eq!(titles(&search, &rows), ["2", "Search 1+1"]);
+
+        search.set_enabled(0, false);
+        assert!(search.search("1+1", |_| 0., &HashMap::new()).is_empty());
+
+        search.set_enabled(1, true);
+        search.set_catalog(1, providers[1].catalog());
+        let rows = search.search("", |_| 0., &HashMap::new());
+        assert_eq!(titles(&search, &rows), ["Lock"]);
     }
 
     #[test]

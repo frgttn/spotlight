@@ -11,6 +11,16 @@ use crate::{item::SearchItem, view::View};
 pub trait Provider: Send + Sync {
     fn id(&self) -> &'static str;
 
+    /// How Settings names this source, where it can be turned off.
+    fn name(&self) -> &'static str {
+        self.id()
+    }
+
+    /// One line under the name in Settings: what this source adds to search.
+    fn description(&self) -> &'static str {
+        ""
+    }
+
     /// Items that root search ranks against the query by fuzzy match and
     /// frecency (apps, commands). May block.
     fn catalog(&self) -> Vec<SearchItem> {

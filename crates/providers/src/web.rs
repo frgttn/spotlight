@@ -57,6 +57,14 @@ impl Provider for Web {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Web Search and URLs"
+    }
+
+    fn description(&self) -> &'static str {
+        "Opens typed addresses, and offers a web search as the last result."
+    }
+
     /// "Search the Web…": a form to search with any engine, not only the
     /// one chosen in Settings (listed first, as it was at startup).
     fn catalog(&self) -> Vec<SearchItem> {

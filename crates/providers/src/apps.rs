@@ -19,6 +19,14 @@ impl Provider for Apps {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Applications"
+    }
+
+    fn description(&self) -> &'static str {
+        "Installed apps, desktop and Microsoft Store alike."
+    }
+
     /// Blocking and COM-heavy (~200 ms): the shell enumerates every app.
     fn catalog(&self) -> Vec<SearchItem> {
         let apps = match apps::discover() {

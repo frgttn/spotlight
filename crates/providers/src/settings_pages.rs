@@ -316,6 +316,14 @@ impl Provider for SettingsPages {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Settings Pages"
+    }
+
+    fn description(&self) -> &'static str {
+        "Pages of the Windows Settings app: Bluetooth, Display, Sound…"
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         PAGES
             .iter()

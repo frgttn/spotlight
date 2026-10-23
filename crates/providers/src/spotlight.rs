@@ -50,6 +50,14 @@ impl Provider for Spotlight {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Spotlight Commands"
+    }
+
+    fn description(&self) -> &'static str {
+        "Commands about Spotlight itself, such as Keyboard Shortcuts."
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         let shortcuts = View::Detail(DetailView {
             title: "Keyboard Shortcuts".into(),
