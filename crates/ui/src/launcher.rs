@@ -1096,7 +1096,7 @@ impl Launcher {
 
     /// Turns the hidden window into the HUD for a moment. Showing the launcher
     /// (hotkey, tray) ends it early.
-    fn show_hud(&mut self, text: SharedString, cx: &mut Context<Self>) {
+    pub fn show_hud(&mut self, text: SharedString, cx: &mut Context<Self>) {
         self.hud = Some(text);
         self.hud_generation += 1;
         let generation = self.hud_generation;
@@ -1505,8 +1505,13 @@ impl Launcher {
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(text) = &self.hud {
+            // An explicit size from the top left, not `size_full`: GPUI can
+            // still think the window has the launcher's size when the HUD's
+            // first frame is laid out, which would centre the text off screen.
+            let (width, height) = HUD_SIZE;
             return div()
-                .size_full()
+                .w(px(width))
+                .h(px(height))
                 .flex()
                 .items_center()
                 .justify_center()

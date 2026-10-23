@@ -163,6 +163,17 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
 
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
+    // The HUD, for a look from outside: the line below says when it's up.
+    sleep(SETTLE_MS).await;
+    window
+        .update(cx, |launcher, _, cx| {
+            launcher.show_hud("Self-test HUD".into(), cx)
+        })
+        .ok();
+    sleep(SETTLE_MS).await;
+    eprintln!("[selftest] hud shown");
+    sleep(1000).await;
+
     sleep(IDLE_MS).await;
     let idle = metrics::memory();
 
