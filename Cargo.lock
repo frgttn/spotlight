@@ -1731,6 +1731,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fend-core"
+version = "1.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bf10938a7681e32b5b7d82ada720a04837f120e671c1e653309053e92c9e1e2"
+
+[[package]]
 name = "field-offset"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5532,6 +5538,7 @@ dependencies = [
  "gpui",
  "raw-window-handle",
  "spotlight-platform-win",
+ "spotlight-providers",
  "spotlight-store",
  "spotlight-ui",
  "tray-icon",
@@ -5546,7 +5553,17 @@ name = "spotlight-platform-win"
 version = "0.0.0"
 dependencies = [
  "async-channel 2.5.0",
+ "spotlight-core",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "spotlight-providers"
+version = "0.0.0"
+dependencies = [
+ "fend-core",
+ "spotlight-core",
+ "spotlight-platform-win",
 ]
 
 [[package]]
@@ -5554,6 +5571,7 @@ name = "spotlight-search"
 version = "0.0.0"
 dependencies = [
  "nucleo-matcher",
+ "spotlight-core",
 ]
 
 [[package]]

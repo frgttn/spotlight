@@ -74,6 +74,28 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    // Root search end to end: the calculator's answer is the first row.
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("12*12", window, cx)
+        })
+        .ok();
+    sleep(SETTLE_MS).await;
+    let first = window
+        .update(cx, |launcher, _, _| {
+            launcher.result_titles().into_iter().next()
+        })
+        .ok()
+        .flatten();
+    eprintln!(
+        "[selftest] calculator: 12*12 -> {first:?} {}",
+        if first.as_deref() == Some("144") {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
     sleep(IDLE_MS).await;

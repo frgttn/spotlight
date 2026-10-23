@@ -2,14 +2,19 @@
 
 A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlight. Written in pure Rust with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
-> **Status: early.** The stack is validated and the code is split into the workspace planned in [docs/architecture.md](docs/architecture.md). So far: global hotkey, prewarmed window, fuzzy app search with frecency, launching apps, built-in latency and memory measurements.
+> **Status: early.** The stack is validated and the code is split into the workspace planned in [docs/architecture.md](docs/architecture.md). So far: global hotkey, prewarmed window, root search over apps and system commands with frecency, an inline calculator, URLs and web search, built-in latency and memory measurements.
 
 ## What works today
 
 - **Global hotkey:** Alt+Space by default, falling back to Ctrl+Shift+Space if another app already owns it. Change it in Settings.
 - **Window:** frameless, topmost, prewarmed, DPI-aware, opens on the monitor under the mouse. It hides on Esc or when it loses focus.
-- **Search:** fuzzy search ([nucleo](https://github.com/helix-editor/nucleo)) over all installed apps (Win32 and Microsoft Store/MSIX, via `shell:AppsFolder`).
-- **Frecency:** apps you launch often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
+- **Root search** merges built-in providers into one list:
+  - **Calculator** ([fend](https://github.com/printfn/fend)) at the top when the query reads as a calculation: `12*12`, `1 km to mi`, `0xff to decimal`. Enter copies the answer.
+  - **URLs:** `github.com`, `localhost:3000` or `http://…` get an *Open* row at the top.
+  - **Apps:** fuzzy search ([nucleo](https://github.com/helix-editor/nucleo)) over all installed apps (Win32 and Microsoft Store/MSIX, via `shell:AppsFolder`).
+  - **System commands:** Lock Screen, Sleep, Restart, Shut Down, Sign Out, Empty Recycle Bin, Toggle Dark Mode, Toggle Mute, also found by keywords ("reboot", "trash"). Restart, Shut Down and Sign Out ask for a second Enter.
+  - **Web search** for the query (Google) as the last row.
+- **Frecency:** apps and commands you use often and recently rank higher, and with an empty query they are listed first. A launch counts half as much after a week. Usage is stored in SQLite at `%APPDATA%\spotlight\spotlight.db`.
 - **Keys:** ↑/↓ or Ctrl+N/P to move, Enter or a click to launch, Ctrl+Backspace to clear the query, Ctrl+, for settings, Ctrl+Q to quit.
 - **Text input** with IME support.
 - **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).
@@ -63,10 +68,11 @@ Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](
 |---|---|
 | `crates/app` | The `spotlight` binary: wiring, window lifecycle, tray icon, self-test, GPUI baseline example |
 | `crates/ui` | GPUI views: launcher (search field, result list, metrics footer), settings and text input |
-| `crates/core` | Domain types: item ids, frecency |
-| `crates/search` | Ranking: fuzzy score, prefix bonus, frecency |
+| `crates/core` | Domain types: `SearchItem`, actions and commands, the `Provider` trait, frecency |
+| `crates/search` | Root search: merges providers; ranking by fuzzy score (title and keywords), prefix bonus, frecency |
+| `crates/providers` | Built-in providers: apps, system commands, calculator, web |
 | `crates/store` | SQLite (`rusqlite`, bundled): settings and frecency, with schema migrations |
-| `crates/platform-win` | Windows code: hotkey thread, single instance, app discovery, launch and icons, autostart, window placement, measurements |
+| `crates/platform-win` | Windows code: hotkey thread, single instance, app discovery and icons, running commands (launch, open URL, system commands), autostart, window placement, measurements |
 | `docs/` | Architecture plan and the UI framework decision |
 
 ## License

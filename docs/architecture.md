@@ -174,8 +174,12 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
 0. ✅ **Spike**: hotkey, prewarmed window, fuzzy app search, launch, measurements. See [ui-framework-decision.md](ui-framework-decision.md).
 1. ✅ Workspace (`app`, `ui`, `core`, `search`, `store`, `platform-win`), SQLite store, frecency ranking, app icons, tray, single instance, start at login.
    Settings window with a hotkey recorder (conflicts reported) and start at login.
-   Still to do: the `Provider` trait and `providers/` (apps, system, calc, web); searchable settings; icon disk cache.
-2. Action panel (Ctrl+K), aliases, per-item hotkeys, frecency tuning.
+   Still to do: searchable settings; icon disk cache.
+1.5 ✅ Root search core, part 1: `Provider` trait, `SearchItem`/`Action`/`Command` in `core`, `RootSearch` in `search` (answers, then ranked catalog, then fallbacks), providers for apps, system commands, calculator (`fend-core`) and web/URLs.
+   The providers live in one `providers` crate (modules, not one crate each) until one needs heavy dependencies of its own.
+   `Provider` is synchronous for now: catalogs load on background threads and per-keystroke answers are bounded (the calculator gives up after 30 ms). Async with cancellation comes with providers that do IO (files, plugins).
+   Actions are data (`Command`: launch app, open URL, copy, system command) that the app runs, rather than a `Provider::run` callback, so scripts and plugins can only ask for this safe set.
+2. Root search core, part 2: action panel (Ctrl+K), view stack (List / Detail / Form, Esc goes back), HUD and toasts, aliases, per-item hotkeys, more sources (Settings pages, Control Panel, game launchers), frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
 4. Window management, file search.
 5. Script commands.

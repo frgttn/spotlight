@@ -3,17 +3,19 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    env,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    App, Context, DispatchPhase, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding,
-    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler, Focusable,
+    Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
     UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
     uniform_list,
 };
@@ -21,15 +23,16 @@ use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
+    item::{Command, Icon, SearchItem},
     item_id,
+    provider::Provider,
 };
 use spotlight_platform_win::{
-    apps::{self, AppEntry},
-    icons::{self, Icon},
+    commands, icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     win,
 };
-use spotlight_search::{Candidate, Searcher};
+use spotlight_search::{RootSearch, Row};
 use spotlight_store::Store;
 
 use crate::{
@@ -51,6 +54,9 @@ const LIST_PADDING: f32 = 4.;
 const ICON_SIZE: f32 = 26.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+/// The apps provider's id; its catalog load time is the "apps" figure in the
+/// footer and the self-test summary.
+const APPS_PROVIDER: &str = "apps";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -66,20 +72,25 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-enum Target {
-    App(AppEntry),
-    /// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
-    Synthetic,
-}
+/// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
+struct Synthetic(usize);
 
-struct Item {
-    /// Frecency key; `None` for items that aren't tracked (synthetic rows).
-    id: Option<String>,
-    title: SharedString,
-    subtitle: SharedString,
-    /// `None` until extracted (or when there is none): a letter badge is drawn instead.
-    icon: Option<Arc<RenderImage>>,
-    target: Target,
+impl Provider for Synthetic {
+    fn id(&self) -> &'static str {
+        "synthetic"
+    }
+
+    fn catalog(&self) -> Vec<SearchItem> {
+        (0..self.0)
+            .map(|ix| {
+                SearchItem::new(
+                    item_id("synthetic", &ix.to_string()),
+                    format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]),
+                )
+                .subtitle("Synthetic")
+            })
+            .collect()
+    }
 }
 
 /// Measurements, shown in the footer and logged to stderr.
@@ -98,12 +109,17 @@ struct Stats {
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
-    items: Vec<Item>,
-    /// Indices into `items`, best match first.
-    results: Vec<usize>,
+    search: RootSearch,
+    /// Catalogs still loading.
+    loading: usize,
+    results: Vec<Row>,
     selected: usize,
+    /// Set by a first Enter on a command that asks for confirmation (restart,
+    /// shut down): that item's id. Moving the selection or typing clears it.
+    confirming: Option<String>,
     scroll: SmoothScroll,
-    searcher: Searcher,
+    /// Extracted shell icons by item id. Items without one show a badge.
+    icons: HashMap<String, Arc<RenderImage>>,
     /// In-memory copy of the store's frecency table, updated on every launch.
     frecency: HashMap<String, Frecency>,
     /// `None` when the database couldn't be opened; usage is then not remembered.
@@ -116,6 +132,7 @@ pub struct Launcher {
 impl Launcher {
     pub fn new(
         hotkey: SharedString,
+        mut providers: Vec<Arc<dyn Provider>>,
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
         smooth_scrolling: bool,
@@ -128,7 +145,7 @@ impl Launcher {
         };
         win::round_corners(hwnd);
 
-        let input = cx.new(|cx| TextInput::new("Search apps…", cx));
+        let input = cx.new(|cx| TextInput::new("Search apps and commands, or calculate…", cx));
         let subscriptions = vec![
             cx.subscribe_in(
                 &input,
@@ -142,15 +159,9 @@ impl Launcher {
             }),
         ];
 
-        let items = (0..synthetic)
-            .map(|ix| Item {
-                id: None,
-                title: format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]).into(),
-                subtitle: "Synthetic".into(),
-                icon: None,
-                target: Target::Synthetic,
-            })
-            .collect();
+        if synthetic > 0 {
+            providers.push(Arc::new(Synthetic(synthetic)));
+        }
 
         let frecency = store
             .as_ref()
@@ -166,16 +177,18 @@ impl Launcher {
         let mut this = Self {
             hwnd,
             input,
-            items,
+            loading: providers.len(),
+            search: RootSearch::new(providers),
             results: Vec::new(),
             selected: 0,
+            confirming: None,
             scroll: {
                 let mut scroll =
                     SmoothScroll::new(UniformListScrollHandle::new(), ROW_HEIGHT, LIST_PADDING);
                 scroll.set_enabled(smooth_scrolling);
                 scroll
             },
-            searcher: Searcher::default(),
+            icons: HashMap::new(),
             frecency,
             store,
             visible: false,
@@ -186,66 +199,90 @@ impl Launcher {
             _subscriptions: subscriptions,
         };
         this.refilter("");
-        this.load_apps(window.scale_factor(), cx);
+        this.load_catalogs(window.scale_factor(), cx);
         this
     }
 
-    /// Discovers apps on a dedicated COM thread and prepends them to the items.
-    fn load_apps(&mut self, window_scale: f32, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded(1);
-        thread::spawn(move || {
-            let started = Instant::now();
-            let result = apps::discover();
-            let _ = tx.send_blocking((result, started.elapsed()));
-        });
+    /// Loads every provider's catalog on its own thread (app discovery takes
+    /// ~200 ms of COM calls) and merges each one into the search as it arrives.
+    fn load_catalogs(&mut self, window_scale: f32, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        for (ix, provider) in self.search.providers().iter().enumerate() {
+            let provider = provider.clone();
+            let tx = tx.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("catalog-{}", provider.id()))
+                .spawn(move || {
+                    let started = Instant::now();
+                    let items = provider.catalog();
+                    let _ = tx.send_blocking((ix, items, started.elapsed()));
+                });
+            if let Err(err) = spawned {
+                eprintln!("[spotlight] could not start a catalog thread: {err}");
+                self.loading -= 1;
+            }
+        }
 
         cx.spawn(async move |this, cx| {
-            let Ok((result, elapsed)) = rx.recv().await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(apps) => {
-                        this.stats.apps = apps.len();
-                        let items = apps.into_iter().map(|app| Item {
-                            id: Some(item_id("apps", &app.launch_id)),
-                            title: app.name.clone().into(),
-                            subtitle: "Application".into(),
-                            icon: None,
-                            target: Target::App(app),
-                        });
-                        this.items.splice(0..0, items);
-                        this.load_icons(window_scale, cx);
-                    }
-                    Err(err) => eprintln!("[spotlight] app discovery failed: {err}"),
+            while let Ok((ix, items, elapsed)) = rx.recv().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.catalog_loaded(ix, items, elapsed, window_scale, cx)
+                });
+                if updated.is_err() {
+                    return;
                 }
-                this.stats.discover_ms = Some(ms(elapsed));
-                eprintln!(
-                    "[spotlight] discovered {} apps in {:.1} ms",
-                    this.stats.apps,
-                    ms(elapsed)
-                );
-                let query = this.query(cx);
-                this.refilter(&query);
-                cx.notify();
-            })
-            .ok();
+            }
         })
         .detach();
     }
 
-    /// Extracts app icons in the background; rows switch from badges to icons as they arrive.
-    /// Apps are at the front of `items` right after discovery, so an app's index
-    /// in the request is also its index in `items`.
-    fn load_icons(&mut self, window_scale: f32, cx: &mut Context<Self>) {
-        let launch_ids: Vec<String> = self
-            .items
+    fn catalog_loaded(
+        &mut self,
+        provider: usize,
+        items: Vec<SearchItem>,
+        elapsed: Duration,
+        window_scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.search.providers()[provider].id();
+        eprintln!(
+            "[spotlight] {id}: {} items in {:.1} ms",
+            items.len(),
+            ms(elapsed)
+        );
+        if id == APPS_PROVIDER {
+            self.stats.apps = items.len();
+            self.stats.discover_ms = Some(ms(elapsed));
+        }
+        let app_icons: Vec<(String, String)> = items
             .iter()
-            .map_while(|item| match &item.target {
-                Target::App(app) => Some(app.launch_id.clone()),
-                Target::Synthetic => None,
+            .filter_map(|item| match &item.icon {
+                Icon::App(launch_id) => Some((item.id.clone(), launch_id.clone())),
+                _ => None,
             })
             .collect();
+
+        self.search.set_catalog(provider, items);
+        self.loading = self.loading.saturating_sub(1);
+        // Catalog indices moved, so the rows are rebuilt (and the selection resets).
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.load_icons(app_icons, window_scale, cx);
+        cx.notify();
+    }
+
+    /// Extracts shell icons in the background; rows switch from badges to icons
+    /// as they arrive. `items` holds (item id, `AppsFolder` parsing name) pairs.
+    fn load_icons(
+        &mut self,
+        items: Vec<(String, String)>,
+        window_scale: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let (ids, launch_ids): (Vec<String>, Vec<String>) = items.into_iter().unzip();
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
         let size = (ICON_SIZE * window_scale).ceil() as u32;
         let (tx, rx) = async_channel::unbounded();
@@ -259,8 +296,8 @@ impl Launcher {
                     .collect();
                 let updated = this.update(cx, |this, cx| {
                     for (ix, icon) in batch {
-                        if let Some(item) = this.items.get_mut(ix) {
-                            item.icon = render_image(icon);
+                        if let Some(image) = render_image(icon) {
+                            this.icons.insert(ids[ix].clone(), image);
                         }
                     }
                     cx.notify();
@@ -288,22 +325,25 @@ impl Launcher {
         self.input.read(cx).text().to_owned()
     }
 
-    /// Re-runs the fuzzy filter and resets the selection. Returns the filter time in ms.
+    /// Re-runs root search and resets the selection. Returns the search time in ms.
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
-        let candidates = self.items.iter().map(|item| Candidate {
-            title: item.title.as_ref(),
-            frecency: item
-                .id
-                .as_ref()
-                .and_then(|id| self.frecency.get(id))
-                .map_or(0., |used| used.score_at(now)),
+        let frecency = &self.frecency;
+        self.results = self.search.search(query, |id| {
+            frecency.get(id).map_or(0., |used| used.score_at(now))
         });
-        self.results = self.searcher.filter(query, candidates);
         self.selected = 0;
+        self.confirming = None;
         self.scroll.reset();
         ms(started.elapsed())
+    }
+
+    fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
+        match row {
+            Row::Catalog(ix) => &self.search.catalog()[*ix],
+            Row::Computed(item) => item,
+        }
     }
 
     fn query_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -323,15 +363,24 @@ impl Launcher {
         });
     }
 
+    /// Every catalog, apps included, has loaded.
     pub fn apps_loaded(&self) -> bool {
-        self.stats.discover_ms.is_some()
+        self.loading == 0
+    }
+
+    /// Titles of the current results, top first. For the self-test.
+    pub fn result_titles(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .map(|row| self.item(row).title.clone())
+            .collect()
     }
 
     pub fn summary(&self) -> Summary {
         let paint = self.stats.paint.borrow();
         Summary {
             apps: self.stats.apps,
-            items: self.items.len(),
+            items: self.search.catalog().len(),
             discover_ms: self.stats.discover_ms,
             first_show_ms: paint.first_show_ms,
             show: Percentiles::of(&paint.show_samples),
@@ -387,6 +436,7 @@ impl Launcher {
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
+            self.confirming = None;
             self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
@@ -395,20 +445,38 @@ impl Launcher {
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected > 0 {
             self.selected -= 1;
+            self.confirming = None;
             self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
 
+    /// Runs the selected item's primary action.
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&ix) = self.results.get(self.selected) {
-            let item = &self.items[ix];
-            if let Target::App(app) = &item.target {
-                app.launch();
-            }
-            if let Some(id) = item.id.clone() {
-                self.record_visit(id, cx);
-            }
+        let Some(row) = self.results.get(self.selected) else {
+            self.hide(cx);
+            return;
+        };
+        let item = self.item(row);
+        let Some(action) = item.primary_action() else {
+            self.hide(cx);
+            return;
+        };
+        if action.command.needs_confirmation() && self.confirming.as_ref() != Some(&item.id) {
+            self.confirming = Some(item.id.clone());
+            cx.notify();
+            return;
+        }
+
+        let command = action.command.clone();
+        // Only catalog items are ranked, so only their use is worth remembering.
+        let visited = matches!(row, Row::Catalog(_)).then(|| item.id.clone());
+        match &command {
+            Command::Copy(text) => cx.write_to_clipboard(ClipboardItem::new_string(text.clone())),
+            command => commands::execute(command),
+        }
+        if let Some(id) = visited {
+            self.record_visit(id, cx);
         }
         self.hide(cx);
     }
@@ -442,16 +510,15 @@ impl Launcher {
     }
 
     fn render_row(&self, row: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let item = &self.items[self.results[row]];
-        let initial: SharedString = item
-            .title
-            .chars()
-            .next()
-            .map(|ch| ch.to_uppercase().collect::<String>())
-            .unwrap_or_default()
-            .into();
-
+        let item = self.item(&self.results[row]);
         let selected = row == self.selected;
+        let confirming = self.confirming.as_ref() == Some(&item.id);
+        let subtitle: SharedString = if confirming {
+            "Press Enter again to confirm".into()
+        } else {
+            item.subtitle.clone().unwrap_or_default().into()
+        };
+
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
         div().id(row).w_full().h(px(ROW_HEIGHT)).px_2().child(
@@ -468,35 +535,70 @@ impl Launcher {
                     row.hover(|style| style.bg(rgba(0xffffff0f)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.selected = row;
+                    if this.selected != row {
+                        this.selected = row;
+                        this.confirming = None;
+                    }
                     this.confirm(&Confirm, window, cx);
                 }))
-                .child(match &item.icon {
-                    Some(icon) => img(icon.clone())
-                        .size(px(ICON_SIZE))
-                        .flex_none()
-                        .into_any_element(),
-                    None => div()
-                        .size(px(ICON_SIZE))
-                        .flex_none()
-                        .rounded(px(6.))
-                        .bg(badge_color(&item.title))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.))
-                        .child(initial)
-                        .into_any_element(),
-                })
-                .child(div().flex_1().truncate().child(item.title.clone()))
+                .child(self.render_icon(item))
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(SharedString::from(item.title.clone())),
+                )
                 .child(
                     div()
                         .flex_none()
                         .text_size(px(12.))
-                        .text_color(rgba(0xffffff70))
-                        .child(item.subtitle.clone()),
+                        .text_color(if confirming {
+                            rgba(theme::ERROR)
+                        } else {
+                            rgba(0xffffff70)
+                        })
+                        .child(subtitle),
                 ),
         )
+    }
+
+    fn render_icon(&self, item: &SearchItem) -> AnyElement {
+        if let Some(icon) = self.icons.get(&item.id) {
+            return img(icon.clone())
+                .size(px(ICON_SIZE))
+                .flex_none()
+                .into_any_element();
+        }
+        let badge = div()
+            .size(px(ICON_SIZE))
+            .flex_none()
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .justify_center();
+        match item.icon {
+            Icon::Glyph(glyph) => badge
+                .bg(rgba(0xffffff1a))
+                .font_family(icon_font())
+                .text_size(px(15.))
+                .child(SharedString::from(glyph.to_string()))
+                .into_any_element(),
+            // Plain items, and apps whose icon hasn't arrived or doesn't exist.
+            Icon::App(_) | Icon::None => {
+                let initial: SharedString = item
+                    .title
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_uppercase().collect::<String>())
+                    .unwrap_or_default()
+                    .into();
+                badge
+                    .bg(badge_color(&item.title))
+                    .text_size(px(13.))
+                    .child(initial)
+                    .into_any_element()
+            }
+        }
     }
 
     /// Paint-probe values here lag one frame (they are recorded while painting).
@@ -508,7 +610,7 @@ impl Launcher {
             "{hotkey} · {results}/{items} items · apps {discover} ms · hotkey→paint first {first} / last {last} ms · filter {filter} ms · key→paint {key} ms · RAM ws {ws:.0} MB / private {private:.0} MB",
             hotkey = self.stats.hotkey,
             results = self.results.len(),
-            items = self.items.len(),
+            items = self.search.catalog().len(),
             discover = fmt(self.stats.discover_ms),
             first = fmt(paint.first_show_ms),
             last = fmt(paint.last_show_ms),
@@ -526,7 +628,7 @@ impl Render for Launcher {
             window.request_animation_frame();
         }
 
-        let results: gpui::AnyElement = if self.results.is_empty() {
+        let results: AnyElement = if self.results.is_empty() {
             div()
                 .flex_1()
                 .flex()
@@ -635,9 +737,23 @@ impl Render for Launcher {
     }
 }
 
+/// Windows 11's icon font, or its Windows 10 predecessor (same code points).
+fn icon_font() -> &'static str {
+    static FONT: OnceLock<&'static str> = OnceLock::new();
+    FONT.get_or_init(|| {
+        let windows =
+            env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        if windows.join(r"Fonts\SegoeIcons.ttf").exists() {
+            "Segoe Fluent Icons"
+        } else {
+            "Segoe MDL2 Assets"
+        }
+    })
+}
+
 /// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
 /// `RgbaImage` type is only the buffer container here.
-fn render_image(icon: Icon) -> Option<Arc<RenderImage>> {
+fn render_image(icon: icons::Icon) -> Option<Arc<RenderImage>> {
     let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }

@@ -159,6 +159,7 @@ fn main() {
                     cx.new(|cx| {
                         Launcher::new(
                             label,
+                            spotlight_providers::all(),
                             synthetic,
                             launcher_store,
                             smooth_scrolling,

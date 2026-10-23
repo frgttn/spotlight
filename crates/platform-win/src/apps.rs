@@ -3,23 +3,19 @@
 //! `shell:AppsFolder` is what the Start menu's "All apps" list is built from, so
 //! one enumeration covers classic Win32 shortcuts and MSIX/UWP packages alike.
 
-use std::{ffi::c_void, thread};
+use std::ffi::c_void;
 
 use windows::{
     Win32::{
         System::Com::{
             COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree,
         },
-        UI::{
-            Shell::{
-                BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
-                SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
-                ShellExecuteW,
-            },
-            WindowsAndMessaging::SW_SHOWNORMAL,
+        UI::Shell::{
+            BHID_EnumItems, FOLDERID_AppsFolder, IEnumShellItems, IShellItem, KF_FLAG_DEFAULT,
+            SHGetKnownFolderItem, SIGDN, SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
         },
     },
-    core::{HSTRING, PCWSTR, Result, w},
+    core::Result,
 };
 
 #[derive(Clone, Debug)]
@@ -28,32 +24,6 @@ pub struct AppEntry {
     pub name: String,
     /// AppsFolder parsing name: an AUMID for packaged apps, a (known-folder relative) path otherwise.
     pub launch_id: String,
-}
-
-impl AppEntry {
-    /// Launches the app on a short-lived thread so a slow shell never blocks the UI.
-    pub fn launch(&self) {
-        let target = HSTRING::from(format!("shell:AppsFolder\\{}", self.launch_id));
-        let name = self.name.clone();
-        thread::spawn(move || unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-            let result = ShellExecuteW(
-                None,
-                w!("open"),
-                &target,
-                PCWSTR::null(),
-                PCWSTR::null(),
-                SW_SHOWNORMAL,
-            );
-            // ShellExecute reports success as a value greater than 32.
-            if (result.0 as isize) <= 32 {
-                eprintln!(
-                    "[apps] failed to launch {name:?} (code {})",
-                    result.0 as isize
-                );
-            }
-        });
-    }
 }
 
 /// Enumerates all apps. Blocking and COM-heavy: call it from a dedicated thread.

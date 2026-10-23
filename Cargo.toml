@@ -15,10 +15,13 @@ publish = false
 [workspace.dependencies]
 spotlight-core = { path = "crates/core" }
 spotlight-platform-win = { path = "crates/platform-win" }
+spotlight-providers = { path = "crates/providers" }
 spotlight-search = { path = "crates/search" }
 spotlight-store = { path = "crates/store" }
 spotlight-ui = { path = "crates/ui" }
 async-channel = "2"
+# Calculator: units, arbitrary precision, no dependencies of its own.
+fend-core = "1.5.9"
 gpui = "=0.2.2"
 # Only for its `Frame`/`RgbaImage` types in GPUI's image API; same version as gpui uses.
 image = { version = "0.25", default-features = false }
