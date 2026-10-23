@@ -135,6 +135,15 @@ impl Entry {
     }
 }
 
+/// An item with an alias or a hotkey, as the settings window lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shortcut {
+    pub item_id: String,
+    pub title: String,
+    pub alias: Option<String>,
+    pub hotkey: Option<Hotkey>,
+}
+
 /// A small card over the window for setting an item's alias or hotkey.
 enum Editor {
     Alias {
@@ -761,8 +770,7 @@ impl Launcher {
                 if let Err(err) = self.hotkeys.set_item(&id, None) {
                     eprintln!("[spotlight] could not remove the hotkey of {id:?}: {err}");
                 }
-                self.item_hotkeys.remove(&id);
-                self.persist_hotkey(&id, None, cx);
+                self.hotkey_assigned(&id, None, cx);
                 self.show_toast(format!("Hotkey removed from {title}").into(), cx);
                 return;
             }
@@ -856,28 +864,85 @@ impl Launcher {
             return;
         };
         let (item_id, title) = (item_id.clone(), title.clone());
-        let alias = input.read(cx).text().trim().to_owned();
-        let message = if alias.is_empty() {
-            self.set_alias(&item_id, None, cx);
-            format!("Alias removed from {title}")
-        } else {
-            // One alias, one item: whoever had it loses it.
-            let taken: Vec<String> = self
-                .aliases
-                .iter()
-                .filter(|(other, existing)| {
-                    **other != item_id && existing.eq_ignore_ascii_case(&alias)
-                })
-                .map(|(other, _)| other.clone())
-                .collect();
-            for other in taken {
-                self.set_alias(&other, None, cx);
-            }
-            self.set_alias(&item_id, Some(alias.clone()), cx);
-            format!("Type “{alias}” to find {title}")
+        let alias = input.read(cx).text().to_owned();
+        let message = match self.assign_alias(&item_id, &alias, cx) {
+            Some(alias) => format!("Type “{alias}” to find {title}"),
+            None => format!("Alias removed from {title}"),
         };
         self.close_editor(Some(window), cx);
         self.show_toast(message.into(), cx);
+    }
+
+    /// Gives `item_id` the alias `alias` (trimmed; empty removes it) and saves
+    /// it. One alias, one item: whoever had it loses it. Returns the alias set.
+    pub fn assign_alias(
+        &mut self,
+        item_id: &str,
+        alias: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            self.set_alias(item_id, None, cx);
+            cx.notify();
+            return None;
+        }
+        let taken: Vec<String> = self
+            .aliases
+            .iter()
+            .filter(|(other, existing)| *other != item_id && existing.eq_ignore_ascii_case(alias))
+            .map(|(other, _)| other.clone())
+            .collect();
+        for other in taken {
+            self.set_alias(&other, None, cx);
+        }
+        self.set_alias(item_id, Some(alias.to_owned()), cx);
+        cx.notify();
+        Some(alias.to_owned())
+    }
+
+    /// Records that `item_id`'s hotkey is now `hotkey` (already registered, or
+    /// unregistered for `None`, with the hotkey service) and saves it.
+    pub fn hotkey_assigned(
+        &mut self,
+        item_id: &str,
+        hotkey: Option<Hotkey>,
+        cx: &mut Context<Self>,
+    ) {
+        match hotkey {
+            Some(hotkey) => self.item_hotkeys.insert(item_id.to_owned(), hotkey),
+            None => self.item_hotkeys.remove(item_id),
+        };
+        self.persist_hotkey(item_id, hotkey, cx);
+        cx.notify();
+    }
+
+    /// Every item that has an alias or a hotkey, by title. For the settings window.
+    pub fn shortcuts(&self) -> Vec<Shortcut> {
+        let mut ids: Vec<&String> = self
+            .aliases
+            .keys()
+            .chain(self.item_hotkeys.keys())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut shortcuts: Vec<Shortcut> = ids
+            .into_iter()
+            .map(|id| Shortcut {
+                item_id: id.clone(),
+                // Items that haven't loaded (or no longer exist) show their id.
+                title: self
+                    .search
+                    .catalog()
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map_or_else(|| id.clone(), |item| item.title.clone()),
+                alias: self.aliases.get(id).cloned(),
+                hotkey: self.item_hotkeys.get(id).copied(),
+            })
+            .collect();
+        shortcuts.sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
+        shortcuts
     }
 
     fn set_alias(&mut self, item_id: &str, alias: Option<String>, cx: &mut Context<Self>) {
@@ -943,8 +1008,7 @@ impl Launcher {
         // `set_item` ends recording, whatever the outcome.
         match self.hotkeys.set_item(&item_id, Some(hotkey)) {
             Ok(()) => {
-                self.item_hotkeys.insert(item_id.clone(), hotkey);
-                self.persist_hotkey(&item_id, Some(hotkey), cx);
+                self.hotkey_assigned(&item_id, Some(hotkey), cx);
                 self.editor = None;
                 self.show_toast(format!("{hotkey} now runs {title}").into(), cx);
                 false

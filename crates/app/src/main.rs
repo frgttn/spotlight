@@ -37,7 +37,7 @@ use spotlight_platform_win::{
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
-    settings::{self, Settings, SettingsEvent},
+    settings::{self, Settings, SettingsEvent, ShortcutSource},
     text_input,
 };
 
@@ -327,6 +327,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
                 view_state.data_path.clone(),
+                shortcut_source(view_state.launcher),
                 window,
                 cx,
             )
@@ -374,7 +375,34 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 tray.sync_autostart();
             }
         }
+        // The launcher owns aliases and item hotkeys and saves them.
+        SettingsEvent::AliasChanged { item_id, alias } => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.assign_alias(item_id, alias.as_deref().unwrap_or_default(), cx);
+                })
+                .ok();
+        }
+        SettingsEvent::ItemHotkeyChanged { item_id, hotkey } => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.hotkey_assigned(item_id, *hotkey, cx)
+                })
+                .ok();
+        }
     }
+}
+
+/// How the settings window reads the launcher's aliases and item hotkeys.
+fn shortcut_source(launcher: WindowHandle<Launcher>) -> ShortcutSource {
+    Rc::new(move |cx: &App| {
+        launcher
+            .read(cx)
+            .map(|launcher| launcher.shortcuts())
+            .unwrap_or_default()
+    })
 }
 
 /// Writes a setting on a background thread; without a database it is kept
