@@ -23,7 +23,7 @@ use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     frecency::{self, Frecency},
-    item::{Command, Icon, SearchItem, SystemCommand},
+    item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
 };
@@ -32,7 +32,7 @@ use spotlight_platform_win::{
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    system, win,
+    win,
 };
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{Calculation, Store};
@@ -875,8 +875,7 @@ impl Launcher {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
-            Command::System(command) => self.run_system(*command, cx),
-            command => commands::execute(command),
+            command => self.run_in_background(command.clone(), cx),
         }
         self.hide(cx);
         if let Some(text) = hud {
@@ -884,11 +883,11 @@ impl Launcher {
         }
     }
 
-    /// Runs a system command in the background and shows what it reports
+    /// Runs a command in the background and shows what it reports
     /// ("Bluetooth Off", "Volume 40%", or why it failed) in the HUD, unless
     /// the launcher has been opened again meanwhile.
-    fn run_system(&mut self, command: SystemCommand, cx: &mut Context<Self>) {
-        let outcome = system::spawn(command);
+    fn run_in_background(&mut self, command: Command, cx: &mut Context<Self>) {
+        let outcome = commands::spawn(command);
         cx.spawn(async move |this, cx| {
             let Ok(outcome) = outcome.recv().await else {
                 return;

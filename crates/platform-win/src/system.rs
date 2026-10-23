@@ -62,15 +62,6 @@ use crate::drives;
 /// "Volume 40%"), nothing, or why it failed, in words for the user.
 pub type Outcome = Result<Option<String>, String>;
 
-/// Runs `command` in the background and only logs a failure.
-pub fn run(command: SystemCommand) {
-    thread::spawn(move || {
-        if let Err(err) = run_blocking(command) {
-            eprintln!("[system] {command:?} failed: {err}");
-        }
-    });
-}
-
 /// Runs `command` in the background; its outcome arrives on the returned channel.
 pub fn spawn(command: SystemCommand) -> async_channel::Receiver<Outcome> {
     let (tx, rx) = async_channel::bounded(1);
@@ -84,7 +75,7 @@ pub fn spawn(command: SystemCommand) -> async_channel::Receiver<Outcome> {
     rx
 }
 
-fn run_blocking(command: SystemCommand) -> Outcome {
+pub(crate) fn run_blocking(command: SystemCommand) -> Outcome {
     let done = |result: windows::core::Result<()>| result.map(|()| None).map_err(message);
     unsafe {
         match command {
