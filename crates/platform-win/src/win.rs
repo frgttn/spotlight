@@ -13,9 +13,9 @@ use windows::Win32::{
     },
     System::Console::{ATTACH_PARENT_PROCESS, AttachConsole},
     UI::{
-        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+        HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
         WindowsAndMessaging::{
-            GetCursorPos, GetWindowRect, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
+            GetCursorPos, GetWindowRect, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
             SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
             SetWindowPos, ShowWindow,
         },
@@ -108,18 +108,25 @@ pub fn show_without_focus_near_bottom(raw: isize, logical_size: (f32, f32)) {
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
         let scale = dpi_x as f32 / 96.;
+        // GPUI's client area is inset from the window rect (resize frame on the
+        // left, right and bottom, a pixel on top), so grow the window by that to
+        // get a client of exactly `logical_size`; otherwise the content sits low.
+        let frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi_x)
+            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi_x);
+        let top = scale.round() as i32;
         let width = (logical_size.0 * scale).round() as i32;
         let height = (logical_size.1 * scale).round() as i32;
+        let (win_width, win_height) = (width + 2 * frame, height + top + frame);
         let work = info.rcWork;
-        let x = work.left + (work.right - work.left - width) / 2;
-        let y = work.bottom - height - (64. * scale).round() as i32;
+        let x = work.left + (work.right - work.left - win_width) / 2;
+        let y = work.bottom - win_height + frame - (64. * scale).round() as i32;
         let _ = SetWindowPos(
             hwnd(raw),
             Some(HWND_TOPMOST),
             x,
             y,
-            width,
-            height,
+            win_width,
+            win_height,
             SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
     }
