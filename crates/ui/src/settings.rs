@@ -8,6 +8,7 @@
 //! top bars are the drag area and carry their own close button.
 
 use std::{
+    ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
 };
@@ -156,6 +157,8 @@ pub struct Settings {
     /// while smooth scrolling is on.
     nav_scroll: Scroller,
     page_scroll: Scroller,
+    /// The page's layout changed; render once more with the new one.
+    relayout: bool,
     focus: FocusHandle,
     recorder: FocusHandle,
     _subscriptions: [Subscription; 3],
@@ -252,6 +255,7 @@ impl Settings {
             search,
             nav_scroll: Scroller::new(ScrollHandle::new(), smooth_scrolling),
             page_scroll: Scroller::new(ScrollHandle::new(), smooth_scrolling),
+            relayout: true,
             focus,
             recorder,
             _subscriptions: subscriptions,
@@ -1185,6 +1189,13 @@ enum Page {
     Extension(&'static str),
 }
 
+/// An item row in an extension's list and the line above it. Rows are all
+/// this tall, which is what lets the list build only those on screen.
+const ITEM_ROW_STRIDE: f32 = 49.;
+/// Rows built past each edge of the page, so a fast scroll shows no gap
+/// before the next frame catches up.
+const OVERSCAN_ROWS: usize = 8;
+
 /// How many pixels of scrolling the top bar's title takes to fade in.
 const TITLE_FADE: f32 = 16.;
 
@@ -1341,6 +1352,7 @@ impl Settings {
 
     /// Shows the first page the search finds when the one shown doesn't match.
     fn search_changed(&mut self, cx: &mut Context<Self>) {
+        self.relayout = true;
         let query = self.query(cx);
         let first = self.pages().find(|&page| self.page_matches(page, &query));
         if !self.page_matches(self.page(), &query)
@@ -1383,6 +1395,7 @@ impl Settings {
         self.editing_alias = None;
         self.app_choices = None;
         self.page_scroll.reset();
+        self.relayout = true;
         self.refresh_from_launcher(cx);
         cx.notify();
     }
@@ -1706,7 +1719,13 @@ impl Settings {
 
     /// The extension's items with their alias and hotkey cells, like
     /// Raycast's. While the search finds some of them, only those.
-    fn extension_items(&self, id: &'static str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// `card_ix` is where the list's card lands among the page's children.
+    fn extension_items(
+        &self,
+        id: &'static str,
+        card_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let items: Vec<&ExtensionItem> = self
             .items
             .iter()
@@ -1722,10 +1741,14 @@ impl Settings {
             .filter(|item| !query.is_empty() && item_matches(item, &query))
             .collect();
         let shown = if found.is_empty() { items } else { found };
-        let rows: Vec<_> = shown
+        // Only the rows on screen are built; spacers stand in for the rest.
+        let range = self.visible_rows(card_ix, shown.len());
+        let above = range.start as f32 * ITEM_ROW_STRIDE - 1.;
+        let below = (shown.len() - range.end) as f32 * ITEM_ROW_STRIDE;
+        let rows: Vec<_> = shown[range.clone()]
             .iter()
-            .enumerate()
-            .map(|(ix, item)| {
+            .zip(range.clone())
+            .map(|(item, ix)| {
                 self.shortcut_row(
                     ix,
                     &item.shortcut,
@@ -1756,8 +1779,37 @@ impl Settings {
                         .child(self.shortcuts_hint("Click an alias or hotkey to change it.")),
                 )
                 .into_any_element(),
-            card().children(rows).into_any_element(),
+            card()
+                .when(range.start > 0, |card| {
+                    card.child(div().flex_none().h(px(above)))
+                })
+                .children(rows)
+                .when(range.end < shown.len(), |card| {
+                    card.child(div().flex_none().h(px(below)))
+                })
+                .into_any_element(),
         ]
+    }
+
+    /// Which of `count` item rows in the card at `card_ix` are on screen,
+    /// plus a few either side. Uses where the card was laid out last frame;
+    /// until there is one, enough rows to fill the page from the top.
+    fn visible_rows(&self, card_ix: usize, count: usize) -> Range<usize> {
+        let handle = self.page_scroll.handle();
+        let viewport = handle.bounds();
+        let height = f32::from(viewport.size.height).max(720.);
+        let on_screen = (height / ITEM_ROW_STRIDE).ceil() as usize + 1;
+        let first = handle
+            .bounds_for_item(card_ix)
+            .map_or(0, |card| {
+                // Child bounds don't include the scroll offset: this is the
+                // rows' top within the page's content (inside the border).
+                let rows_top = f32::from(card.top() - viewport.top()) + 1.;
+                let top = self.page_scroll.scrolled() - rows_top;
+                (top / ITEM_ROW_STRIDE).floor().max(0.) as usize
+            })
+            .min(count);
+        first.saturating_sub(OVERSCAN_ROWS)..(first + on_screen + OVERSCAN_ROWS).min(count)
     }
 
     /// The logo, name and version, then updates, links and where the data is.
@@ -1901,7 +1953,8 @@ impl Settings {
             ]),
             _ => {}
         }
-        let items = self.extension_items(id, cx);
+        // The list's heading comes first, then its card.
+        let items = self.extension_items(id, body.len() + 1, cx);
         if body.len() == 1 && items.is_empty() {
             body.push(
                 div()
@@ -1926,7 +1979,10 @@ impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Both run, so neither waits on the other's frame.
         let nav_moving = self.nav_scroll.tick();
-        if self.page_scroll.tick() || nav_moving {
+        // A new page or search lays the item list out anew; one more frame
+        // builds the rows that layout puts on screen.
+        let relayout = std::mem::take(&mut self.relayout);
+        if self.page_scroll.tick() || nav_moving || relayout {
             window.request_animation_frame();
         }
         let page = self.page();
