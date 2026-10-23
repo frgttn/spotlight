@@ -4,6 +4,7 @@
 
 use crate::{
     item::{Action, Command, SearchItem},
+    quicklink,
     web::encode_query,
 };
 
@@ -148,6 +149,27 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
     let (text, in_url) = match command {
         Command::OpenUrl(url) => (url, true),
         Command::Copy(text) => (text, false),
+        Command::OpenQuicklink { link, .. } => {
+            // Quicklinks encode their own way (`%20`, and paths not at all).
+            if link.contains(&placeholder) {
+                let value = quicklink::encode_value(value(false).trim(), quicklink::is_url(link));
+                *link = link.replace(&placeholder, &value);
+            }
+            return;
+        }
+        // Each field of the form fills one field of the quicklink, as typed.
+        Command::SaveQuicklink(link) => {
+            let fields = [&mut link.name, &mut link.link]
+                .into_iter()
+                .chain(link.keyword.as_mut())
+                .chain(link.open_with.as_mut());
+            for field in fields {
+                if *field == placeholder {
+                    *field = value(false);
+                }
+            }
+            return;
+        }
         // The others take paths and ids the user doesn't type.
         _ => return,
     };
@@ -220,6 +242,60 @@ mod tests {
             form.fill(&values),
             // The chosen template's own {query} is filled in too.
             Command::Copy("Hello, Ann & Bo! https://google.com/search?q=Ann & Bo".into())
+        );
+    }
+
+    #[test]
+    fn fills_quicklinks() {
+        let text = |id: &str| Field {
+            id: id.into(),
+            label: id.into(),
+            kind: FieldKind::Text {
+                placeholder: String::new(),
+                default: String::new(),
+                required: false,
+            },
+        };
+        let open = FormView {
+            title: "Open".into(),
+            fields: vec![text("arg0")],
+            submit_title: "Open".into(),
+            submit: Command::OpenQuicklink {
+                link: "https://github.com/{arg0}/{date}".into(),
+                app: None,
+            },
+        };
+        assert_eq!(
+            open.fill(&[FieldValue::Text(" a b ".into())]),
+            Command::OpenQuicklink {
+                link: "https://github.com/a%20b/{date}".into(),
+                app: None
+            }
+        );
+
+        let save = FormView {
+            title: "Create Quicklink".into(),
+            fields: vec![text("name"), text("link"), text("keyword")],
+            submit_title: "Save".into(),
+            submit: Command::SaveQuicklink(quicklink::Quicklink {
+                id: 3,
+                name: "{name}".into(),
+                link: "{link}".into(),
+                keyword: Some("{keyword}".into()),
+                open_with: None,
+            }),
+        };
+        let values = ["Docs {link}", "https://x.com/?q={query}", "gh"]
+            .map(|value| FieldValue::Text(value.into()));
+        assert_eq!(
+            save.fill(&values),
+            Command::SaveQuicklink(quicklink::Quicklink {
+                id: 3,
+                name: "Docs {link}".into(),
+                link: "https://x.com/?q={query}".into(),
+                keyword: Some("gh".into()),
+                open_with: None,
+            })
         );
     }
 

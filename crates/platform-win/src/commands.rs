@@ -4,7 +4,7 @@
 
 use std::{os::windows::process::CommandExt, process, thread};
 
-use spotlight_core::item::Command;
+use spotlight_core::{item::Command, quicklink};
 use windows::{
     Win32::{
         System::{
@@ -16,7 +16,10 @@ use windows::{
     core::{HSTRING, PCWSTR},
 };
 
-use crate::system::{self, Outcome};
+use crate::{
+    links,
+    system::{self, Outcome},
+};
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
 /// program, so anything else is refused.
@@ -80,22 +83,49 @@ fn run_blocking(command: &Command) -> Outcome {
                 Err(format!("Not a web address: {url}"))
             }
         }
-        Command::Copy(_) | Command::OpenCalculatorHistory | Command::PushView(_) => {
-            Err(format!("{command:?} must be handled by the UI"))
+        Command::OpenQuicklink { link, app } => {
+            let link = quicklink::expand_moment(link.trim(), &links::moment());
+            // Paths can use `%USERPROFILE%`; URLs keep their `%20`s.
+            let link = if quicklink::is_url(&link) {
+                link
+            } else {
+                links::expand_env(&link)
+            };
+            match app {
+                Some(app) => shell_execute_with("open", app, &format!("\"{link}\"")),
+                None => shell_execute("open", &link),
+            }
         }
+        Command::Copy(_)
+        | Command::OpenCalculatorHistory
+        | Command::PushView(_)
+        | Command::SaveQuicklink(_)
+        | Command::DeleteQuicklink(_)
+        | Command::OpenProviderView { .. }
+        | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
     }
 }
 
 /// `ShellExecute` with `verb`, blocking.
 fn shell_execute(verb: &str, target: &str) -> Outcome {
+    shell_execute_with(verb, target, "")
+}
+
+/// `ShellExecute` with `verb` and command-line `parameters` for a program, blocking.
+fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
+    let parameters = HSTRING::from(parameters);
     let code = unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(
             None,
             &HSTRING::from(verb),
             &HSTRING::from(target),
-            PCWSTR::null(),
+            if parameters.is_empty() {
+                PCWSTR::null()
+            } else {
+                PCWSTR(parameters.as_ptr())
+            },
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )

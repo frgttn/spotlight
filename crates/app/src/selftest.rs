@@ -4,7 +4,10 @@
 //! The script itself lives in `spotlight_platform_win::metrics::selftest`, unchanged
 //! since the GPUI/Slint comparison so the numbers stay comparable.
 
-use std::time::{Duration, Instant};
+use std::{
+    env,
+    time::{Duration, Instant},
+};
 
 use gpui::{App, AppContext, AsyncApp, Keystroke, WindowHandle};
 use spotlight_core::view::FieldValue;
@@ -176,10 +179,25 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("grid", grid_round_trip(window, cx).await),
         ("detail", detail_round_trip(window, cx).await),
         ("form", form_round_trip(window, cx).await),
+        ("quicklink", quicklink_round_trip(window, cx).await),
+        ("bangs", bangs_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
             if outcome.ends_with("back to search") {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+    }
+
+    // Writes to the database, so only in a data folder of its own.
+    if env::var_os("SPOTLIGHT_DATA_DIR").is_some() {
+        let saved = quicklink_save_and_delete(window, cx).await;
+        eprintln!(
+            "[selftest] quicklink save: {saved} {}",
+            if saved == "saved, opened with !zzq, deleted" {
                 "OK"
             } else {
                 "FAIL"
@@ -515,6 +533,196 @@ async fn form_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> S
     }
     match back_to_search(window, cx).await {
         Ok(()) => "refused empty, Tab → changed engine, back to search".into(),
+        Err(why) => why,
+    }
+}
+
+/// `!gh` fills GitHub's quicklink in root search (not opened), then Create
+/// Quicklink refuses an empty name. Nothing is saved or opened.
+async fn quicklink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    press(window, "ctrl-a", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("!gh rust gpui", window, cx)
+        })
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let first = window
+        .update(cx, |launcher, _, _| {
+            launcher.result_titles().into_iter().next()
+        })
+        .ok()
+        .flatten();
+    if first.as_deref() != Some("Search GitHub “rust gpui”") {
+        return format!("!gh not filled in ({first:?})");
+    }
+    if let Err(why) = open_from_search(window, "create quicklink", "Create Quicklink", cx).await {
+        return why;
+    }
+    let state = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| launcher.form_state(cx))
+            .ok()
+            .flatten()
+    };
+    match state(cx) {
+        Some((values, None)) if values.len() == 4 => {}
+        other => return format!("form didn't open ({other:?})"),
+    }
+    press(window, "enter", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let refused = state(cx).and_then(|(_, error)| error);
+    if refused.as_deref() != Some("Name is required") {
+        return format!("empty name not refused ({refused:?})");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => "!gh filled in, empty form refused, back to search".into(),
+        Err(why) => why,
+    }
+}
+
+/// Creates a quicklink through its form, finds it with its keyword, then
+/// deletes it from the action panel (Enter twice: it asks to confirm).
+async fn quicklink_save_and_delete(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let settle = || executor.timer(Duration::from_millis(SETTLE_MS));
+    let type_text = |text: &str, cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(text, window, cx)
+            })
+            .ok();
+    };
+    let first = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| {
+                launcher.result_titles().into_iter().next()
+            })
+            .ok()
+            .flatten()
+    };
+
+    if let Err(why) = open_from_search(window, "create quicklink", "Create Quicklink", cx).await {
+        return why;
+    }
+    type_text("Selftest Link", cx);
+    press(window, "tab", cx);
+    type_text("https://example.com/?q={query}", cx);
+    press(window, "tab", cx);
+    type_text("zzq", cx);
+    press(window, "enter", cx);
+    settle().await;
+    let screen = window
+        .update(cx, |launcher, _, cx| {
+            (launcher.screen_title(), launcher.form_state(cx))
+        })
+        .ok();
+    if !matches!(screen, Some((None, None))) {
+        return format!("not saved ({screen:?})");
+    }
+
+    press(window, "ctrl-a", cx);
+    type_text("!zzq hi", cx);
+    settle().await;
+    let found = first(cx);
+    if found.as_deref() != Some("Selftest Link “hi”") {
+        return format!("saved, but !zzq gave {found:?}");
+    }
+
+    press(window, "ctrl-a", cx);
+    type_text("selftest link", cx);
+    settle().await;
+    if first(cx).as_deref() != Some("Selftest Link") {
+        return format!("saved, but not found by name ({:?})", first(cx));
+    }
+    press(window, "ctrl-k", cx);
+    let titles = window
+        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let Some(ix) = titles.iter().position(|title| title == "Delete Quicklink") else {
+        return format!("saved, opened with !zzq, no Delete in {titles:?}");
+    };
+    for _ in 0..ix {
+        press(window, "down", cx);
+    }
+    press(window, "enter", cx);
+    press(window, "enter", cx);
+    settle().await;
+    let left = window
+        .update(cx, |launcher, _, _| launcher.result_titles())
+        .unwrap_or_default();
+    if left.iter().any(|title| title == "Selftest Link") {
+        return "saved, opened with !zzq, not deleted".into();
+    }
+    "saved, opened with !zzq, deleted".into()
+}
+
+/// The bangs list (downloaded on first use, so it waits for it): `!reddit
+/// rust` fills Reddit's bang, Enter on `!reddi` completes it to `!reddit `,
+/// and Search Bangs lists them all. Nothing is opened.
+async fn bangs_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let first = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| {
+                launcher.result_titles().into_iter().next()
+            })
+            .ok()
+            .flatten()
+    };
+    let mut found = None;
+    for _ in 0..50 {
+        press(window, "ctrl-a", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text("!reddit rust", window, cx)
+            })
+            .ok();
+        executor.timer(Duration::from_millis(200)).await;
+        found = first(cx);
+        if found.as_deref() == Some("Reddit “rust”") {
+            break;
+        }
+    }
+    if found.as_deref() != Some("Reddit “rust”") {
+        return format!("bangs not loaded, offline? ({found:?})");
+    }
+
+    press(window, "ctrl-a", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("!reddi", window, cx)
+        })
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    if first(cx).as_deref() != Some("Reddit") {
+        return format!("!reddi doesn't suggest Reddit ({:?})", first(cx));
+    }
+    press(window, "enter", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let query = window
+        .update(cx, |launcher, _, cx| launcher.query(cx))
+        .unwrap_or_default();
+    if query != "!reddit " {
+        return format!("Enter completed to {query:?}");
+    }
+
+    if let Err(why) = open_from_search(window, "search bangs", "Search Bangs", cx).await {
+        return why;
+    }
+    let (title, rows) = window
+        .update(cx, |launcher, _, _| {
+            (launcher.screen_title(), launcher.result_titles().len())
+        })
+        .unwrap_or_default();
+    if title.as_deref() != Some("Bangs") || rows < 5000 {
+        return format!("list gave {title:?} with {rows} rows");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => format!("!reddit filled in, !reddi completed, {rows} listed, back to search"),
         Err(why) => why,
     }
 }

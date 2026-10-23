@@ -1,6 +1,7 @@
 //! The launcher view: search field, result list, metrics footer, and the
 //! views opened on top of it (see `views`).
 
+mod quicklinks;
 mod views;
 
 use std::{
@@ -405,6 +406,33 @@ impl Launcher {
         .detach();
     }
 
+    /// Loads one provider's catalog again, after the user changed what it
+    /// lists (a quicklink saved or deleted).
+    fn reload_catalog(&mut self, id: &str, window_scale: f32, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == id)
+        else {
+            return;
+        };
+        let provider = self.search.providers()[ix].clone();
+        let load = cx.background_executor().spawn(async move {
+            let started = Instant::now();
+            let items = provider.catalog();
+            (items, started.elapsed())
+        });
+        cx.spawn(async move |this, cx| {
+            let (items, elapsed) = load.await;
+            this.update(cx, |this, cx| {
+                this.catalog_loaded(ix, items, elapsed, window_scale, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn catalog_loaded(
         &mut self,
         provider: usize,
@@ -618,11 +646,14 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
-    /// Types into the field that has the keyboard: the alias editor's while it's open.
+    /// Types into the field that has the keyboard: the alias editor's while
+    /// it's open, or a form's focused text field.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let input = match &self.editor {
             Some(Editor::Alias { input, .. }) => input.clone(),
-            _ => self.input.clone(),
+            _ => self
+                .focused_form_input(window, cx)
+                .unwrap_or_else(|| self.input.clone()),
         };
         input.update(cx, |input, cx| {
             input.replace_text_in_range(None, text, window, cx)
@@ -974,7 +1005,11 @@ impl Launcher {
         // remembering, also when they're used from a list (Browse Apps).
         let ranked = matches!(row, Row::Catalog(_))
             || self.search.catalog().iter().any(|item| item.id == id);
-        if ranked {
+        let edits = matches!(
+            command,
+            Command::SaveQuicklink(_) | Command::DeleteQuicklink(_) | Command::Complete(_)
+        );
+        if ranked && !edits {
             self.record_visit(id, cx);
         }
         self.perform(&command, window, cx);
@@ -985,8 +1020,47 @@ impl Launcher {
         match command {
             Command::PushView(view) => self.push_view((**view).clone(), window, cx),
             Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
+            Command::SaveQuicklink(link) => self.save_quicklink(link.clone(), window, cx),
+            Command::DeleteQuicklink(id) => self.delete_quicklink(*id, window, cx),
+            Command::OpenProviderView { provider, view } => {
+                self.open_provider_view(provider, view, window, cx)
+            }
+            Command::Complete(text) => self.complete(text.clone(), window, cx),
             command => self.run_command(command, cx),
         }
+    }
+
+    /// Asks `provider` for its view `id` and opens it.
+    fn open_provider_view(
+        &mut self,
+        provider: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .and_then(|provider| provider.view(id));
+        match view {
+            Some(view) => self.push_view(view, window, cx),
+            None => {
+                eprintln!("[spotlight] {provider} has no view {id:?}");
+                self.show_toast("Nothing to show".into(), cx);
+            }
+        }
+    }
+
+    /// Back to root search with `text` in the field, as if typed.
+    fn complete(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.screens.is_empty() {
+            self.screens.clear();
+            self.enter_screen(window, cx);
+        }
+        self.input.update(cx, |input, cx| input.type_over(text, cx));
+        window.focus(&self.input.focus_handle(cx));
     }
 
     /// Carries out `command`, hides the window, and shows a HUD where the

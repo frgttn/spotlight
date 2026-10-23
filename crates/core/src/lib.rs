@@ -3,6 +3,7 @@
 pub mod frecency;
 pub mod item;
 pub mod provider;
+pub mod quicklink;
 pub mod view;
 pub mod web;
 

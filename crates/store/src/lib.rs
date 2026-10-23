@@ -1,5 +1,5 @@
-//! SQLite persistence: settings, frecency, aliases, item hotkeys and the
-//! calculator history.
+//! SQLite persistence: settings, frecency, aliases, item hotkeys, the
+//! calculator history and quicklinks.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -8,7 +8,10 @@ use std::{collections::HashMap, fs, path::Path};
 
 pub use rusqlite::Error;
 use rusqlite::{Connection, OptionalExtension, params};
-use spotlight_core::frecency::Frecency;
+use spotlight_core::{
+    frecency::Frecency,
+    quicklink::{self, Quicklink},
+};
 
 pub type Result<T> = rusqlite::Result<T>;
 
@@ -40,7 +43,19 @@ const MIGRATIONS: &[&str] = &[
         used_at    INTEGER NOT NULL
     );
     CREATE INDEX calculations_used_at ON calculations (used_at);",
+    // Seeded with `quicklink::DEFAULTS` when this runs; see `init`.
+    "CREATE TABLE quicklinks (
+        id        INTEGER PRIMARY KEY,
+        name      TEXT NOT NULL,
+        link      TEXT NOT NULL,
+        keyword   TEXT,
+        open_with TEXT
+    );",
 ];
+
+/// The migration that creates `quicklinks`: databases created before it get
+/// the default quicklinks once too, and deleting them later sticks.
+const QUICKLINKS_MIGRATION: usize = 3;
 
 /// How many calculations the history keeps; older ones go.
 const CALCULATIONS_KEPT: i64 = 200;
@@ -81,8 +96,16 @@ impl Store {
         let applied = applied.max(0) as usize;
         if applied < MIGRATIONS.len() {
             let tx = conn.transaction()?;
-            for migration in &MIGRATIONS[applied..] {
+            for (ix, migration) in MIGRATIONS.iter().enumerate().skip(applied) {
                 tx.execute_batch(migration)?;
+                if ix == QUICKLINKS_MIGRATION {
+                    for (name, keyword, link) in quicklink::DEFAULTS {
+                        tx.execute(
+                            "INSERT INTO quicklinks (name, link, keyword) VALUES (?1, ?2, ?3)",
+                            params![name, link, keyword],
+                        )?;
+                    }
+                }
             }
             tx.pragma_update(None, "user_version", MIGRATIONS.len() as i64)?;
             tx.commit()?;
@@ -251,6 +274,54 @@ impl Store {
         Ok(())
     }
 
+    /// Every quicklink, by name.
+    pub fn quicklinks(&self) -> Result<Vec<Quicklink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, link, keyword, open_with FROM quicklinks
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(Quicklink {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                link: row.get(2)?,
+                keyword: row.get(3)?,
+                open_with: row.get(4)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Adds `link` (id 0) or replaces the one with its id. Returns its id.
+    pub fn save_quicklink(&self, link: &Quicklink) -> Result<i64> {
+        let Quicklink {
+            id,
+            name,
+            link,
+            keyword,
+            open_with,
+        } = link;
+        if *id == 0 {
+            self.conn.execute(
+                "INSERT INTO quicklinks (name, link, keyword, open_with) VALUES (?1, ?2, ?3, ?4)",
+                params![name, link, keyword, open_with],
+            )?;
+            return Ok(self.conn.last_insert_rowid());
+        }
+        self.conn.execute(
+            "UPDATE quicklinks SET name = ?2, link = ?3, keyword = ?4, open_with = ?5
+             WHERE id = ?1",
+            params![id, name, link, keyword, open_with],
+        )?;
+        Ok(*id)
+    }
+
+    pub fn delete_quicklink(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM quicklinks WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     /// Forgets every use of `item_id`.
     pub fn forget(&self, item_id: &str) -> Result<()> {
         self.conn
@@ -329,6 +400,38 @@ mod tests {
     }
 
     #[test]
+    fn quicklinks_start_with_the_defaults_and_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let links = store.quicklinks().unwrap();
+        assert_eq!(links.len(), quicklink::DEFAULTS.len());
+        assert!(
+            links
+                .iter()
+                .any(|link| link.keyword.as_deref() == Some("gh"))
+        );
+
+        let mut link = Quicklink {
+            id: 0,
+            name: "Aardvark".into(),
+            link: r"C:\Projects".into(),
+            keyword: None,
+            open_with: Some(r"C:\Browser\browser.exe".into()),
+        };
+        link.id = store.save_quicklink(&link).unwrap();
+        assert_eq!(store.quicklinks().unwrap()[0], link);
+
+        link.name = "Projects".into();
+        link.keyword = Some("p".into());
+        assert_eq!(store.save_quicklink(&link).unwrap(), link.id);
+        let saved = store.quicklinks().unwrap();
+        assert!(saved.contains(&link));
+        assert_eq!(saved.len(), quicklink::DEFAULTS.len() + 1);
+
+        store.delete_quicklink(link.id).unwrap();
+        assert!(!store.quicklinks().unwrap().contains(&link));
+    }
+
+    #[test]
     fn forget_removes_one_item() {
         let mut store = Store::open_in_memory().unwrap();
         store.record_visit("apps:a", 1).unwrap();
@@ -358,6 +461,7 @@ mod tests {
         let all = store.frecency().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all["apps:calc"], Frecency::default().visit(100).visit(100));
+        assert_eq!(store.quicklinks().unwrap().len(), quicklink::DEFAULTS.len());
         drop(store);
         let _ = fs::remove_dir_all(&dir);
     }

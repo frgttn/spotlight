@@ -36,6 +36,13 @@ const SHORTCUTS: &str = "\
 
 - **Ctrl+,** opens Settings, **Ctrl+Q** quits
 - Give any app or command its own **alias** or global **hotkey** with *Set Alias…* and *Set Hotkey…* in **Ctrl+K**
+
+## Quicklinks
+
+- **!gh tokio** (or **tokio !gh**) opens the quicklink with keyword *gh* with “tokio” filled in, or else one of ~10,000 search bangs (Kagi's, as in Helium)
+- **!g** lists the keywords starting with *g*; **Enter** completes one; *Search Bangs* lists them all
+- *Create Quicklink* saves a link of your own: put **{query}** where the text goes, or **{argument name=\"Repo\"}** for several values
+- **{date}**, **{time}** and **{uuid}** are filled in when the link opens
 ";
 
 impl Provider for Spotlight {

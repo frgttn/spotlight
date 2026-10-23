@@ -1,6 +1,6 @@
 //! The interface every source of search results implements.
 
-use crate::item::SearchItem;
+use crate::{item::SearchItem, view::View};
 
 /// A source of root-search results. Providers return data only; they never
 /// touch the UI and never run actions themselves (see [`crate::item::Command`]).
@@ -26,5 +26,13 @@ pub trait Provider: Send + Sync {
     /// Shown below everything else for a non-empty query (web search).
     fn fallbacks(&self, _query: &str) -> Vec<SearchItem> {
         Vec::new()
+    }
+
+    /// The view `id`, for [`Command::OpenProviderView`]: built when opened,
+    /// on the UI thread, so keep it to a few milliseconds.
+    ///
+    /// [`Command::OpenProviderView`]: crate::item::Command::OpenProviderView
+    fn view(&self, _id: &str) -> Option<View> {
+        None
     }
 }

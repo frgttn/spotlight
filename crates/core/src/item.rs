@@ -3,7 +3,7 @@
 //! Everything here is plain data, so the same types can later come from script
 //! commands and WASM plugins.
 
-use crate::view::View;
+use crate::{quicklink::Quicklink, view::View};
 
 /// One row in a result list.
 #[derive(Clone, Debug, PartialEq)]
@@ -101,8 +101,28 @@ pub enum Command {
     Copy(String),
     /// Shows the calculations the user used, in a list of their own.
     OpenCalculatorHistory,
+    /// Opens a quicklink the user saved: a URL of any scheme or a path, with
+    /// its arguments filled in (`{date}`, `{time}` and `{uuid}` are filled when
+    /// it opens), with `app` or the default handler. Only quicklinks produce
+    /// it, since it opens whatever the user wrote.
+    OpenQuicklink {
+        link: String,
+        app: Option<String>,
+    },
+    /// Saves a new (id 0) or edited quicklink. The UI checks it first.
+    SaveQuicklink(Quicklink),
+    DeleteQuicklink(i64),
     /// Opens a view on top of the current one; Esc comes back.
     PushView(Box<View>),
+    /// Opens a view the provider `provider` builds when asked (see
+    /// `Provider::view`), for lists too large to carry in every command.
+    OpenProviderView {
+        provider: String,
+        view: String,
+    },
+    /// Goes back to root search with this text in the search field, the
+    /// cursor at its end: `!g` completed to `!gh `.
+    Complete(String),
     System(SystemCommand),
 }
 
@@ -113,7 +133,7 @@ impl Command {
             self,
             Command::System(
                 SystemCommand::Restart | SystemCommand::ShutDown | SystemCommand::SignOut
-            )
+            ) | Command::DeleteQuicklink(_)
         )
     }
 }

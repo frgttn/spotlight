@@ -14,6 +14,7 @@ pub mod drives;
 pub mod hotkey;
 pub mod icons;
 pub mod instance;
+pub mod links;
 pub mod metrics;
 pub mod net;
 pub mod registry;

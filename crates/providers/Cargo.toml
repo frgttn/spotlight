@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-providers"
-description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web"
+description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web, quicklinks"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,4 @@ fend-core.workspace = true
 serde_json.workspace = true
 spotlight-core.workspace = true
 spotlight-platform-win.workspace = true
+spotlight-store.workspace = true

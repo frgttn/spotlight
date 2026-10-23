@@ -158,7 +158,8 @@ fn main() {
         let launcher_store = store.clone();
         let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
-        let (providers, web) = spotlight_providers::all(search_engine.clone(), data_dir.clone());
+        let (providers, web) =
+            spotlight_providers::all(search_engine.clone(), data_dir.clone(), store.clone());
         let window = cx
             .open_window(
                 WindowOptions {

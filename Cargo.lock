@@ -5578,6 +5578,7 @@ dependencies = [
  "serde_json",
  "spotlight-core",
  "spotlight-platform-win",
+ "spotlight-store",
 ]
 
 [[package]]

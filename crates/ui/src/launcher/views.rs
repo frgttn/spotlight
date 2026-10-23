@@ -293,6 +293,23 @@ impl Launcher {
         Some((values, form.error.as_ref().map(|error| error.to_string())))
     }
 
+    /// The open form's text field that has the keyboard.
+    pub(super) fn focused_form_input(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<TextInput>> {
+        let Some(Screen::Form(form)) = self.screens.last() else {
+            return None;
+        };
+        form.inputs.iter().find_map(|input| match input {
+            FieldInput::Text(text) if text.focus_handle(cx).is_focused(window) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// The selected row or tile. For the self-test.
     pub fn selected_index(&self) -> usize {
         self.selected

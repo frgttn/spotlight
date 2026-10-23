@@ -2,18 +2,24 @@
 //! runs their actions (see `spotlight_core::item::Command`).
 
 pub mod apps;
+pub mod bangs;
 pub mod calc;
 pub mod control_panel;
 pub mod games;
+pub mod quicklinks;
 pub mod rates;
 pub mod settings_pages;
 pub mod spotlight;
 pub mod system;
 pub mod web;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use spotlight_core::{provider::Provider, web::SearchEngine};
+use spotlight_store::Store;
 
 /// Symbols from Segoe Fluent Icons (Windows 11), at the same code points in
 /// Segoe MDL2 Assets (Windows 10).
@@ -40,15 +46,18 @@ mod glyph {
     pub const KEYBOARD: char = '\u{E765}';
     pub const FORM: char = '\u{E70F}';
     pub const GAME: char = '\u{E7FC}';
+    pub const LINK: char = '\u{E71B}';
+    pub const ADD: char = '\u{E710}';
 }
 
 /// Every built-in provider, in the order their answers and catalogs are
 /// listed, and the web provider again, to change its search engine later.
 /// `data_dir` is where providers keep caches (exchange rates); `None` keeps
-/// nothing between runs.
+/// nothing between runs. `store` holds what the user saves (quicklinks).
 pub fn all(
     engine: SearchEngine,
     data_dir: Option<PathBuf>,
+    store: Option<Arc<Mutex<Store>>>,
 ) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
     let web = Arc::new(web::Web::new(engine));
     let providers: Vec<Arc<dyn Provider>> = vec![
@@ -57,7 +66,11 @@ pub fn all(
         Arc::new(control_panel::ControlPanel),
         Arc::new(games::Games),
         Arc::new(system::System),
-        Arc::new(calc::Calculator::new(rates::Rates::new(data_dir))),
+        Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
+        Arc::new(quicklinks::Quicklinks::new(
+            store,
+            bangs::Bangs::new(data_dir),
+        )),
         web.clone(),
         Arc::new(spotlight::Spotlight),
     ];

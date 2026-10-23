@@ -131,6 +131,17 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Replaces the text with the cursor at its end and emits [`Changed`],
+    /// as if it had been typed.
+    pub fn type_over(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        cx.emit(Changed);
+        cx.notify();
+    }
+
     /// Lets ←/→ (without modifiers) through to the views around the field.
     pub fn set_pass_horizontal_arrows(&mut self, pass: bool) {
         self.pass_horizontal_arrows = pass;
