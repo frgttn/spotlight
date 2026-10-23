@@ -1,6 +1,6 @@
-//! Runs the [`Command`]s that search items carry, except `Copy` (the UI
-//! framework owns the clipboard) and the ones that open views, which the UI
-//! handles.
+//! Runs the [`Command`]s that search items carry, except `Copy` and the
+//! clipboard history's (the UI owns the clipboard and the database) and the
+//! ones that open views, which the UI handles.
 
 use std::{os::windows::process::CommandExt, process, thread};
 
@@ -102,6 +102,10 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::SaveQuicklink(_)
         | Command::DeleteQuicklink(_)
         | Command::OpenProviderView { .. }
+        | Command::RestoreClip { .. }
+        | Command::PinClip { .. }
+        | Command::DeleteClip(_)
+        | Command::ClearClipboardHistory
         | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
     }

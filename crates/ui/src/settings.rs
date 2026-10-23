@@ -1,6 +1,6 @@
 //! The settings window: launcher hotkey, web search engine, smooth scrolling,
-//! which search sources are on, start at login, and every alias and item
-//! hotkey.
+//! which search sources are on, how much clipboard history to keep, start at
+//! login, and every alias and item hotkey.
 //!
 //! The window has no system frame. The header is the drag area and carries
 //! its own close button, so it matches the launcher instead of a stock
@@ -14,7 +14,10 @@ use gpui::{
     div, prelude::*, px, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use spotlight_core::web::{self, SearchEngine};
+use spotlight_core::{
+    clip::{self, Retention},
+    web::{self, SearchEngine},
+};
 use spotlight_platform_win::{
     autostart,
     hotkey::{self, Hotkey, Recorded, SetError},
@@ -59,6 +62,8 @@ pub enum SettingsEvent {
     SmoothScrollingChanged(bool),
     /// The web search engine is now this one; switch to it and save it.
     SearchEngineChanged(SearchEngine),
+    /// The clipboard history now keeps this much; trim it and save it.
+    ClipboardRetentionChanged(Retention),
     /// Start at login was turned on or off here.
     AutostartChanged,
     /// The search provider with this id was turned on or off.
@@ -103,6 +108,7 @@ pub struct Settings {
     engine_message: Option<(SharedString, bool)>,
     /// Search providers and whether each is on, as last read from the launcher.
     sources: Vec<Source>,
+    clipboard_retention: Retention,
     autostart: bool,
     data_path: SharedString,
     focus: FocusHandle,
@@ -119,6 +125,7 @@ impl Settings {
         hotkey: Option<Hotkey>,
         smooth_scrolling: bool,
         search_engine: SearchEngine,
+        clipboard_retention: Retention,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -168,6 +175,7 @@ impl Settings {
             search_engine,
             engine_message: None,
             sources,
+            clipboard_retention,
             autostart: autostart::is_enabled(),
             data_path,
             focus,
@@ -503,6 +511,68 @@ impl Settings {
                 )))
         });
         card().children(rows)
+    }
+
+    fn set_clipboard_retention(&mut self, retention: Retention, cx: &mut Context<Self>) {
+        if retention != self.clipboard_retention {
+            self.clipboard_retention = retention;
+            cx.emit(SettingsEvent::ClipboardRetentionChanged(retention));
+            cx.notify();
+        }
+    }
+
+    /// How long and how many entries to keep: a row of choices for each.
+    fn clipboard_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.clipboard_retention;
+        let days = clip::KEEP_DAYS
+            .iter()
+            .enumerate()
+            .map(|(ix, &(days, label))| {
+                chip(("keep-days", ix), label, current.days == days).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let retention = Retention {
+                            days,
+                            ..this.clipboard_retention
+                        };
+                        this.set_clipboard_retention(retention, cx)
+                    },
+                ))
+            });
+        let max = clip::KEEP_MAX
+            .iter()
+            .enumerate()
+            .map(|(ix, &(max, label))| {
+                chip(("keep-max", ix), label, current.max == max).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let retention = Retention {
+                            max,
+                            ..this.clipboard_retention
+                        };
+                        this.set_clipboard_retention(retention, cx)
+                    },
+                ))
+            });
+        let choices = |chips: Vec<Stateful<gpui::Div>>| {
+            div()
+                .px_4()
+                .pb_3()
+                .flex()
+                .flex_wrap()
+                .gap_1p5()
+                .children(chips)
+        };
+        card()
+            .child(row(
+                "Keep for",
+                "Older entries are deleted, pinned ones never. Passwords from apps that mark them private are never kept.",
+            ))
+            .child(choices(days.collect()))
+            .child(divider())
+            .child(row(
+                "Keep at most",
+                "The oldest entries go first once the history is full.",
+            ))
+            .child(choices(max.collect()))
     }
 
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
@@ -915,6 +985,9 @@ impl Render for Settings {
                     .child(div().h(px(6.)))
                     .child(section_label("Search sources"))
                     .child(self.source_list(cx))
+                    .child(div().h(px(6.)))
+                    .child(section_label("Clipboard history"))
+                    .child(self.clipboard_card(cx))
                     .child(div().h(px(6.)))
                     .child(section_label("System"))
                     .child(system)

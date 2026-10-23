@@ -3,7 +3,10 @@
 //! Everything here is plain data, so the same types can later come from script
 //! commands and WASM plugins.
 
-use crate::{quicklink::Quicklink, view::View};
+use crate::{
+    quicklink::Quicklink,
+    view::{Preview, View},
+};
 
 /// One row in a result list.
 #[derive(Clone, Debug, PartialEq)]
@@ -19,6 +22,9 @@ pub struct SearchItem {
     pub icon: Icon,
     /// `[0]` is the primary action (Enter). Empty for rows that do nothing.
     pub actions: Vec<Action>,
+    /// Shown beside the list while the row is selected, in lists that have
+    /// previews (clipboard history).
+    pub preview: Option<Box<Preview>>,
 }
 
 impl SearchItem {
@@ -30,6 +36,7 @@ impl SearchItem {
             keywords: Vec::new(),
             icon: Icon::None,
             actions: Vec::new(),
+            preview: None,
         }
     }
 
@@ -53,6 +60,11 @@ impl SearchItem {
             title: title.into(),
             command,
         });
+        self
+    }
+
+    pub fn preview(mut self, preview: Preview) -> Self {
+        self.preview = Some(Box::new(preview));
         self
     }
 
@@ -120,6 +132,21 @@ pub enum Command {
         provider: String,
         view: String,
     },
+    /// Puts clipboard history entry `id` back on the clipboard and, with
+    /// `paste`, pastes it into the window that was active before the launcher.
+    RestoreClip {
+        id: i64,
+        paste: bool,
+    },
+    /// Pins or unpins a clipboard history entry: pinned ones stay at the top
+    /// and are never trimmed.
+    PinClip {
+        id: i64,
+        pinned: bool,
+    },
+    DeleteClip(i64),
+    /// Deletes every clipboard history entry that isn't pinned.
+    ClearClipboardHistory,
     /// Goes back to root search with this text in the search field, the
     /// cursor at its end: `!g` completed to `!gh `.
     Complete(String),
@@ -134,6 +161,7 @@ impl Command {
             Command::System(
                 SystemCommand::Restart | SystemCommand::ShutDown | SystemCommand::SignOut
             ) | Command::DeleteQuicklink(_)
+                | Command::ClearClipboardHistory
         )
     }
 }

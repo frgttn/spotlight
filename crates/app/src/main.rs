@@ -29,13 +29,14 @@ use gpui::{
     App, Application, Bounds, SharedString, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions, prelude::*, px, size,
 };
-use spotlight_core::web::SearchEngine;
+use spotlight_core::{clip::Retention, web::SearchEngine};
 use spotlight_platform_win::{
+    clipboard,
     hotkey::{self, Hotkey},
     instance::{self, Instance},
     metrics, win,
 };
-use spotlight_providers::web::Web;
+use spotlight_providers::{Builtins, clipboard::ClipboardHistory, web::Web};
 use spotlight_store::Store;
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit},
@@ -54,6 +55,11 @@ const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
 /// missing means all on.
 const DISABLED_PROVIDERS_SETTING: &str = "disabled_providers";
+/// `settings` key: how much clipboard history to keep, `Retention`'s setting
+/// form; missing means the default.
+const CLIPBOARD_RETENTION_SETTING: &str = "clipboard_retention";
+/// The clipboard history provider's id: turning it off stops recording.
+const CLIPBOARD_PROVIDER: &str = "clipboard";
 
 /// What the tray, the settings window and app-level actions share.
 struct AppState {
@@ -64,6 +70,8 @@ struct AppState {
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
+    /// The clipboard history, to change how much it keeps and whether it records.
+    clipboard: Arc<ClipboardHistory>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -133,6 +141,15 @@ fn main() {
                 .collect()
         })
         .unwrap_or_default();
+    let retention = setting(CLIPBOARD_RETENTION_SETTING)
+        .and_then(|text| {
+            let retention = Retention::from_setting(&text);
+            if retention.is_none() {
+                eprintln!("[spotlight] ignoring unreadable clipboard retention {text:?}");
+            }
+            retention
+        })
+        .unwrap_or_default();
     let saved_hotkey = setting(HOTKEY_SETTING).and_then(|text| {
         let hotkey = Hotkey::parse(&text);
         if hotkey.is_none() {
@@ -170,8 +187,22 @@ fn main() {
         let launcher_store = store.clone();
         let launcher_hotkeys = hotkeys.clone();
         let label = hotkey_label.clone();
-        let (providers, web) =
-            spotlight_providers::all(search_engine.clone(), data_dir.clone(), store.clone());
+        let Builtins {
+            providers,
+            web,
+            clipboard: clipboard_history,
+        } = spotlight_providers::all(
+            search_engine.clone(),
+            data_dir.clone(),
+            store.clone(),
+            retention,
+        );
+        clipboard_history
+            .set_recording(!disabled_providers.iter().any(|id| id == CLIPBOARD_PROVIDER));
+        // The self-test runs beside a normal instance, which keeps the history.
+        if !self_test {
+            record_clipboard(clipboard_history.clone());
+        }
         let window = cx
             .open_window(
                 WindowOptions {
@@ -240,6 +271,7 @@ fn main() {
             smooth_scrolling: Cell::new(smooth_scrolling),
             search_engine: RefCell::new(search_engine.clone()),
             web,
+            clipboard: clipboard_history,
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -361,6 +393,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
                 view_state.search_engine.borrow().clone(),
+                view_state.clipboard.retention(),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
                 window,
@@ -411,6 +444,9 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             save_setting(state, SMOOTH_SCROLLING_SETTING, enabled.to_string(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
+            if *id == CLIPBOARD_PROVIDER {
+                state.clipboard.set_recording(*enabled);
+            }
             let disabled = state
                 .launcher
                 .update(cx, |launcher, window, cx| {
@@ -421,6 +457,19 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             if let Some(disabled) = disabled {
                 save_setting(state, DISABLED_PROVIDERS_SETTING, disabled, cx);
             }
+        }
+        SettingsEvent::ClipboardRetentionChanged(retention) => {
+            let (history, retention) = (state.clipboard.clone(), *retention);
+            // Trimming deletes rows and image files.
+            cx.background_executor()
+                .spawn(async move { history.set_retention(retention) })
+                .detach();
+            save_setting(
+                state,
+                CLIPBOARD_RETENTION_SETTING,
+                retention.to_setting(),
+                cx,
+            );
         }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
@@ -444,6 +493,27 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
         }
+    }
+}
+
+/// Starts the clipboard listener and keeps what it reports in `history`, on
+/// a thread of its own (images are written to disk). Expired entries go first.
+fn record_clipboard(history: Arc<ClipboardHistory>) {
+    let (copied_tx, copied_rx) = async_channel::unbounded();
+    if let Err(err) = clipboard::listen(copied_tx) {
+        eprintln!("[spotlight] clipboard history is off: {err}");
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("clipboard-history".into())
+        .spawn(move || {
+            history.trim();
+            while let Ok(copied) = copied_rx.recv_blocking() {
+                history.record(copied);
+            }
+        });
+    if let Err(err) = spawned {
+        eprintln!("[spotlight] clipboard history is off: {err}");
     }
 }
 

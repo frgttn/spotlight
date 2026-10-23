@@ -4,6 +4,7 @@
 pub mod apps;
 pub mod bangs;
 pub mod calc;
+pub mod clipboard;
 pub mod control_panel;
 pub mod games;
 pub mod quicklinks;
@@ -18,7 +19,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use spotlight_core::{provider::Provider, web::SearchEngine};
+use spotlight_core::{clip::Retention, provider::Provider, web::SearchEngine};
 use spotlight_store::Store;
 
 /// Symbols from Segoe Fluent Icons (Windows 11), at the same code points in
@@ -48,24 +49,46 @@ mod glyph {
     pub const GAME: char = '\u{E7FC}';
     pub const LINK: char = '\u{E71B}';
     pub const ADD: char = '\u{E710}';
+    pub const PASTE: char = '\u{E77F}';
+    pub const TEXT: char = '\u{E8D2}';
+    pub const COLOR: char = '\u{E790}';
+    pub const IMAGE: char = '\u{EB9F}';
+    pub const FOLDER: char = '\u{E8B7}';
 }
 
-/// Every built-in provider, in the order their answers and catalogs are
-/// listed, and the web provider again, to change its search engine later.
-/// `data_dir` is where providers keep caches (exchange rates); `None` keeps
-/// nothing between runs. `store` holds what the user saves (quicklinks).
+/// The built-in providers, and the ones the app talks to again later.
+pub struct Builtins {
+    /// In the order their answers and catalogs are listed.
+    pub providers: Vec<Arc<dyn Provider>>,
+    /// To change its search engine.
+    pub web: Arc<web::Web>,
+    /// To feed it what is copied, and change how much it keeps.
+    pub clipboard: Arc<clipboard::ClipboardHistory>,
+}
+
+/// Every built-in provider. `data_dir` is where providers keep caches
+/// (exchange rates) and files (clipboard images); `None` keeps nothing
+/// between runs. `store` holds what the user saves (quicklinks, clipboard
+/// history).
 pub fn all(
     engine: SearchEngine,
     data_dir: Option<PathBuf>,
     store: Option<Arc<Mutex<Store>>>,
-) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
+    retention: Retention,
+) -> Builtins {
     let web = Arc::new(web::Web::new(engine));
+    let clipboard = Arc::new(clipboard::ClipboardHistory::new(
+        store.clone(),
+        data_dir.clone(),
+        retention,
+    ));
     let providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(apps::Apps),
         Arc::new(settings_pages::SettingsPages),
         Arc::new(control_panel::ControlPanel),
         Arc::new(games::Games),
         Arc::new(system::System),
+        clipboard.clone(),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(
             store,
@@ -74,5 +97,9 @@ pub fn all(
         web.clone(),
         Arc::new(spotlight::Spotlight),
     ];
-    (providers, web)
+    Builtins {
+        providers,
+        web,
+        clipboard,
+    }
 }

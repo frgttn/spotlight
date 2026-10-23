@@ -1,5 +1,5 @@
 //! SQLite persistence: settings, frecency, aliases, item hotkeys, the
-//! calculator history and quicklinks.
+//! calculator history, quicklinks and the clipboard history.
 //!
 //! Calls are blocking. They are short (one indexed row), but callers on the UI
 //! thread should still move writes to a background task.
@@ -9,6 +9,7 @@ use std::{collections::HashMap, fs, path::Path};
 pub use rusqlite::Error;
 use rusqlite::{Connection, OptionalExtension, params};
 use spotlight_core::{
+    clip::{self, ClipKind, Retention},
     frecency::Frecency,
     quicklink::{self, Quicklink},
 };
@@ -51,6 +52,21 @@ const MIGRATIONS: &[&str] = &[
         keyword   TEXT,
         open_with TEXT
     );",
+    // `content`: the text, the image file's path, or file paths one per line.
+    // `hash` identifies the content, so copying it again moves the entry up.
+    "CREATE TABLE clips (
+        id        INTEGER PRIMARY KEY,
+        kind      TEXT NOT NULL,
+        content   TEXT NOT NULL,
+        hash      TEXT NOT NULL UNIQUE,
+        width     INTEGER,
+        height    INTEGER,
+        app       TEXT,
+        app_path  TEXT,
+        pinned    INTEGER NOT NULL DEFAULT 0,
+        copied_at INTEGER NOT NULL
+    );
+    CREATE INDEX clips_copied_at ON clips (copied_at);",
 ];
 
 /// The migration that creates `quicklinks`: databases created before it get
@@ -68,6 +84,53 @@ pub struct Calculation {
     pub answer: String,
     /// Unix seconds.
     pub used_at: i64,
+}
+
+/// A clipboard history entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Clip {
+    /// 0 for one not saved yet.
+    pub id: i64,
+    pub kind: ClipKind,
+    /// The text, the image file's path, or file paths one per line.
+    pub content: String,
+    /// Image size in pixels.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The app it was copied from: its name, and its program's path.
+    pub app: Option<String>,
+    pub app_path: Option<String>,
+    pub pinned: bool,
+    /// Unix seconds, of the latest copy.
+    pub copied_at: i64,
+}
+
+impl Clip {
+    /// Deletes the entry's image files, if it has any. For after it left
+    /// the database.
+    pub fn remove_files(&self) {
+        if self.kind == ClipKind::Image {
+            let _ = fs::remove_file(&self.content);
+            let _ = fs::remove_file(clip::thumbnail_path(&self.content));
+        }
+    }
+}
+
+const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at";
+
+fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
+    let kind: String = row.get(1)?;
+    Ok(Clip {
+        id: row.get(0)?,
+        kind: ClipKind::parse(&kind).unwrap_or(ClipKind::Text),
+        content: row.get(2)?,
+        width: row.get(3)?,
+        height: row.get(4)?,
+        app: row.get(5)?,
+        app_path: row.get(6)?,
+        pinned: row.get(7)?,
+        copied_at: row.get(8)?,
+    })
 }
 
 pub struct Store {
@@ -322,6 +385,126 @@ impl Store {
         Ok(())
     }
 
+    /// Adds `clip` to the clipboard history. When content with this `hash`
+    /// is already there, that entry is replaced by a new one at the top
+    /// (newer id, so it's first even within the same second), keeping its
+    /// pin, and its app if `clip` has none (as when Spotlight itself put it
+    /// back). Returns the new id and whether the content is new.
+    pub fn add_clip(&mut self, clip: &Clip, hash: &str) -> Result<(i64, bool)> {
+        let tx = self.conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "DELETE FROM clips WHERE hash = ?1 RETURNING pinned, app, app_path",
+                [hash],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (pinned, app, app_path) = match &existing {
+            Some((pinned, app, app_path)) => (
+                *pinned || clip.pinned,
+                clip.app.as_ref().or(app.as_ref()),
+                clip.app_path.as_ref().or(app_path.as_ref()),
+            ),
+            None => (clip.pinned, clip.app.as_ref(), clip.app_path.as_ref()),
+        };
+        tx.execute(
+            "INSERT INTO clips
+                (kind, content, hash, width, height, app, app_path, pinned, copied_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                clip.kind.as_str(),
+                clip.content,
+                hash,
+                clip.width,
+                clip.height,
+                app,
+                app_path,
+                pinned,
+                clip.copied_at
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok((id, existing.is_none()))
+    }
+
+    /// The clipboard history: pinned entries first, then the most recent.
+    /// Unpinned entries copied before `cutoff` (unix seconds) are left out.
+    pub fn clips(&self, cutoff: Option<i64>) -> Result<Vec<Clip>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CLIP_COLUMNS} FROM clips WHERE pinned OR copied_at >= ?1
+             ORDER BY pinned DESC, copied_at DESC, id DESC"
+        ))?;
+        stmt.query_map([cutoff.unwrap_or(i64::MIN)], clip_row)?
+            .collect()
+    }
+
+    pub fn clip(&self, id: i64) -> Result<Option<Clip>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {CLIP_COLUMNS} FROM clips WHERE id = ?1"),
+                [id],
+                clip_row,
+            )
+            .optional()
+    }
+
+    pub fn pin_clip(&self, id: i64, pinned: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE clips SET pinned = ?2 WHERE id = ?1",
+            params![id, pinned],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes one entry and returns it, so its image file can go too.
+    pub fn delete_clip(&self, id: i64) -> Result<Option<Clip>> {
+        let clip = self.clip(id)?;
+        self.conn.execute("DELETE FROM clips WHERE id = ?1", [id])?;
+        Ok(clip)
+    }
+
+    /// Deletes every unpinned entry and returns them.
+    pub fn clear_clips(&mut self) -> Result<Vec<Clip>> {
+        self.delete_clips_where("NOT pinned", [])
+    }
+
+    /// Deletes the unpinned entries `retention` no longer keeps at `now`
+    /// (too old, or past the newest `max`) and returns them.
+    pub fn trim_clips(&mut self, retention: Retention, now: i64) -> Result<Vec<Clip>> {
+        let cutoff = retention.cutoff(now).unwrap_or(i64::MIN);
+        self.delete_clips_where(
+            "NOT pinned AND (copied_at < ?1 OR id NOT IN
+                (SELECT id FROM clips WHERE NOT pinned
+                 ORDER BY copied_at DESC, id DESC LIMIT ?2))",
+            params![cutoff, retention.max],
+        )
+    }
+
+    /// `condition` is a constant from this file, never user input.
+    fn delete_clips_where(
+        &mut self,
+        condition: &str,
+        params: impl rusqlite::Params + Clone,
+    ) -> Result<Vec<Clip>> {
+        let tx = self.conn.transaction()?;
+        let removed = tx
+            .prepare(&format!(
+                "SELECT {CLIP_COLUMNS} FROM clips WHERE {condition}"
+            ))?
+            .query_map(params.clone(), clip_row)?
+            .collect::<Result<Vec<_>>>()?;
+        tx.execute(&format!("DELETE FROM clips WHERE {condition}"), params)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Forgets every use of `item_id`.
     pub fn forget(&self, item_id: &str) -> Result<()> {
         self.conn
@@ -429,6 +612,77 @@ mod tests {
 
         store.delete_quicklink(link.id).unwrap();
         assert!(!store.quicklinks().unwrap().contains(&link));
+    }
+
+    fn text_clip(text: &str, copied_at: i64) -> Clip {
+        Clip {
+            id: 0,
+            kind: ClipKind::Text,
+            content: text.into(),
+            width: None,
+            height: None,
+            app: Some("Notepad".into()),
+            app_path: None,
+            pinned: false,
+            copied_at,
+        }
+    }
+
+    fn contents(clips: Vec<Clip>) -> Vec<String> {
+        clips.into_iter().map(|clip| clip.content).collect()
+    }
+
+    #[test]
+    fn clipboard_history_moves_repeats_up_and_pins_first() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (a, new) = store.add_clip(&text_clip("a", 10), "ha").unwrap();
+        assert!(new);
+        store.add_clip(&text_clip("b", 20), "hb").unwrap();
+        // Copied again, by Spotlight itself (no app): moves up, keeps its app.
+        let again = Clip {
+            app: None,
+            ..text_clip("a", 30)
+        };
+        let (again_id, new) = store.add_clip(&again, "ha").unwrap();
+        assert!(!new && again_id != a);
+        assert_eq!(store.clip(a).unwrap(), None);
+        assert_eq!(contents(store.clips(None).unwrap()), ["a", "b"]);
+        let a_clip = store.clip(again_id).unwrap().unwrap();
+        assert_eq!(a_clip.app.as_deref(), Some("Notepad"));
+        assert_eq!(a_clip.copied_at, 30);
+
+        let b = store.clips(None).unwrap()[1].id;
+        store.pin_clip(b, true).unwrap();
+        assert_eq!(contents(store.clips(None).unwrap()), ["b", "a"]);
+        // Pinned entries are listed however old, and survive clearing.
+        assert_eq!(contents(store.clips(Some(25)).unwrap()), ["b", "a"]);
+        assert_eq!(contents(store.clips(Some(35)).unwrap()), ["b"]);
+        assert_eq!(contents(store.clear_clips().unwrap()), ["a"]);
+        assert_eq!(contents(store.clips(None).unwrap()), ["b"]);
+        assert_eq!(store.delete_clip(b).unwrap().unwrap().content, "b");
+        assert!(store.clips(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trimming_keeps_the_newest_and_drops_the_old() {
+        let mut store = Store::open_in_memory().unwrap();
+        for ix in 0..6 {
+            let text = ix.to_string();
+            store.add_clip(&text_clip(&text, ix * 100), &text).unwrap();
+        }
+        let oldest = store.clips(None).unwrap().last().unwrap().id;
+        store.pin_clip(oldest, true).unwrap();
+        let three = Retention { days: None, max: 3 };
+        assert_eq!(contents(store.trim_clips(three, 1000).unwrap()), ["1", "2"]);
+        assert_eq!(contents(store.clips(None).unwrap()), ["0", "5", "4", "3"]);
+
+        // A one-day retention two days later drops everything unpinned.
+        let day = Retention {
+            days: Some(1),
+            max: 100,
+        };
+        assert_eq!(store.trim_clips(day, 2 * 86_400).unwrap().len(), 3);
+        assert_eq!(contents(store.clips(None).unwrap()), ["0"]);
     }
 
     #[test]

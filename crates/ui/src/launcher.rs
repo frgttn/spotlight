@@ -1,6 +1,7 @@
 //! The launcher view: search field, result list, metrics footer, and the
 //! views opened on top of it (see `views`).
 
+mod clipboard;
 mod quicklinks;
 mod views;
 
@@ -33,7 +34,7 @@ use spotlight_core::{
     view::{ListView, View},
 };
 use spotlight_platform_win::{
-    commands,
+    clipboard as system_clipboard, commands,
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
@@ -42,7 +43,10 @@ use spotlight_platform_win::{
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{Calculation, Store};
 
-use self::views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen};
+use self::{
+    clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
+    views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
+};
 use crate::{
     smooth_scroll::SmoothScroll,
     text_input::{self, TextInput},
@@ -263,6 +267,12 @@ pub struct Launcher {
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
     visible: bool,
+    /// The window that was active when the launcher opened, to paste into.
+    previous_window: isize,
+    /// The clipboard preview's image.
+    preview_image: Option<PreviewImage>,
+    /// Images no longer shown, freed on the next frame (it takes the window).
+    stale_images: Vec<Arc<RenderImage>>,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
 }
@@ -384,6 +394,9 @@ impl Launcher {
             grid_scroll: UniformListScrollHandle::new(),
             list_searcher: Searcher::default(),
             visible: false,
+            previous_window: 0,
+            preview_image: None,
+            stale_images: Vec::new(),
             stats: Stats {
                 hotkey,
                 ..Default::default()
@@ -815,6 +828,10 @@ impl Launcher {
     }
 
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        let foreground = system_clipboard::foreground_window();
+        if foreground != self.hwnd {
+            self.previous_window = foreground;
+        }
         self.hud = None;
         if !self.screens.is_empty() {
             self.screens.clear();
@@ -853,6 +870,7 @@ impl Launcher {
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.close_editor(None, cx);
+        self.forget_preview_image();
         win::hide(self.hwnd);
         self.visible = false;
         cx.notify();
@@ -1110,6 +1128,10 @@ impl Launcher {
                 self.open_provider_view(provider, view, window, cx)
             }
             Command::Complete(text) => self.complete(text.clone(), window, cx),
+            Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
+            Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
+            Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
+            Command::ClearClipboardHistory => self.clear_clips(window, cx),
             command => self.run_command(command, cx),
         }
     }
@@ -1129,7 +1151,12 @@ impl Launcher {
             .find(|candidate| candidate.id() == provider)
             .and_then(|provider| provider.view(id));
         match view {
-            Some(view) => self.push_view(view, window, cx),
+            Some(view) => {
+                self.push_view(view, window, cx);
+                if let Some(Screen::List { origin, .. }) = self.screens.last_mut() {
+                    *origin = Some((provider.to_owned(), id.to_owned()));
+                }
+            }
             None => {
                 eprintln!("[spotlight] {provider} has no view {id:?}");
                 self.show_toast("Nothing to show".into(), cx);
@@ -1210,6 +1237,18 @@ impl Launcher {
         let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {
             return;
         };
+        // Commands that open a view (Clipboard History) open the launcher on it.
+        if matches!(
+            action.command,
+            Command::PushView(_)
+                | Command::OpenProviderView { .. }
+                | Command::OpenCalculatorHistory
+        ) {
+            self.show(Instant::now(), window, cx);
+            self.record_visit(id.to_owned(), cx);
+            self.perform(&action.command, window, cx);
+            return;
+        }
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);
             self.results = vec![Row::Catalog(ix)];
@@ -2007,6 +2046,7 @@ impl Render for Launcher {
                 .child(div().truncate().child(text.clone()))
                 .into_any_element();
         }
+        self.drop_stale_images(window);
         if self.scroll.tick() {
             window.request_animation_frame();
         }
@@ -2082,6 +2122,27 @@ impl Render for Launcher {
                 .child(list)
                 .child(wheel)
                 .into_any_element()
+        };
+        // Lists with previews (clipboard history): rows on the left, the
+        // selected row's preview on the right.
+        let results = if self.shows_previews() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(PREVIEW_LIST_WIDTH))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(results),
+                )
+                .child(self.render_preview(cx))
+                .into_any_element()
+        } else {
+            results
         };
 
         let paint = self.stats.paint.clone();

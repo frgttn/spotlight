@@ -5566,6 +5566,7 @@ name = "spotlight-platform-win"
 version = "0.0.0"
 dependencies = [
  "async-channel 2.5.0",
+ "image",
  "spotlight-core",
  "windows 0.61.3",
 ]
@@ -5575,6 +5576,7 @@ name = "spotlight-providers"
 version = "0.0.0"
 dependencies = [
  "fend-core",
+ "image",
  "serde_json",
  "spotlight-core",
  "spotlight-platform-win",

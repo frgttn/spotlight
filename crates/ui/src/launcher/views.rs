@@ -23,6 +23,9 @@ pub(super) enum Screen {
     List {
         view: ListView,
         grid: bool,
+        /// The provider and view id it came from, to build it again after
+        /// a change (an entry deleted); `None` for views carried whole.
+        origin: Option<(String, String)>,
     },
     Detail {
         view: DetailView,
@@ -67,8 +70,16 @@ impl FieldInput {
 impl Screen {
     fn new(view: View, cx: &mut Context<Launcher>) -> Self {
         match view {
-            View::List(view) => Screen::List { view, grid: false },
-            View::Grid(view) => Screen::List { view, grid: true },
+            View::List(view) => Screen::List {
+                view,
+                grid: false,
+                origin: None,
+            },
+            View::Grid(view) => Screen::List {
+                view,
+                grid: true,
+                origin: None,
+            },
             View::Detail(view) => Screen::Detail {
                 view,
                 scroll: ScrollHandle::new(),
@@ -165,6 +176,50 @@ impl Launcher {
                 None => window.focus(&self.focus),
             },
         }
+        cx.notify();
+    }
+
+    /// Builds the open provider list again, after its items changed, and
+    /// keeps the search text. Selects the row `keep` (an item id) if given
+    /// and still there, otherwise stays at the same position.
+    pub(super) fn refresh_screen(
+        &mut self,
+        keep: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Screen::List {
+            origin: Some((provider, id)),
+            ..
+        }) = self.screens.last()
+        else {
+            return;
+        };
+        let fresh = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .and_then(|provider| provider.view(id));
+        match fresh {
+            Some(View::List(fresh) | View::Grid(fresh)) => {
+                if let Some(Screen::List { view, .. }) = self.screens.last_mut() {
+                    *view = fresh;
+                }
+            }
+            _ => return self.pop_screen(window, cx),
+        }
+        let previous = self.selected;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.selected = keep
+            .and_then(|keep| {
+                self.results
+                    .iter()
+                    .position(|row| self.item(row).id == keep)
+            })
+            .unwrap_or_else(|| previous.min(self.results.len().saturating_sub(1)));
+        self.scroll.reveal(self.selected, self.results.len());
         cx.notify();
     }
 

@@ -39,6 +39,24 @@ pub struct ListView {
     pub empty: Option<String>,
 }
 
+/// What a list shows beside itself for the selected row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    pub body: PreviewBody,
+    /// Label and value pairs, under the body.
+    pub metadata: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreviewBody {
+    /// Shown as it is, line breaks kept.
+    Text(String),
+    /// An image file (PNG), scaled down to fit.
+    Image(String),
+    /// File paths, one per row.
+    Files(Vec<String>),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetailView {
     pub title: String,
