@@ -13,8 +13,8 @@ use windows::{
     Win32::{
         Devices::Display::{
             DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_DEVICE_INFO_TYPE,
             DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
             DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
             DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
@@ -293,14 +293,25 @@ fn toggle_hdr() -> Outcome {
         None => return Err("This display doesn't support HDR".into()),
     };
     let enable = !display.enabled;
-    let mut state = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
-    state.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
-    state.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
-    state.header.adapterId = display.adapter;
-    state.header.id = display.target;
-    // Bit 0: enableAdvancedColor.
-    state.Anonymous.value = u32::from(enable);
-    let status = unsafe { DisplayConfigSetDeviceInfo(&state.header) };
+    let status = if display.windows_11_api {
+        let mut state = SetHdrState::default();
+        state.header.r#type = DEVICE_INFO_SET_HDR_STATE;
+        state.header.size = size_of::<SetHdrState>() as u32;
+        state.header.adapterId = display.adapter;
+        state.header.id = display.target;
+        // Bit 0: enableHdr.
+        state.value = u32::from(enable);
+        unsafe { DisplayConfigSetDeviceInfo(&state.header) }
+    } else {
+        let mut state = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
+        state.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+        state.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
+        state.header.adapterId = display.adapter;
+        state.header.id = display.target;
+        // Bit 0: enableAdvancedColor.
+        state.Anonymous.value = u32::from(enable);
+        unsafe { DisplayConfigSetDeviceInfo(&state.header) }
+    };
     if status != 0 {
         return Err(format!("Couldn't change HDR (error {status})"));
     }
@@ -313,6 +324,62 @@ struct HdrDisplay {
     /// `\\.\DISPLAY1`: matches `MONITORINFOEXW::szDevice`.
     gdi_name: String,
     enabled: bool,
+    /// Read (and so switched) through the Windows 11 HDR calls below.
+    windows_11_api: bool,
+}
+
+// Windows 11 split HDR out of "advanced color": the older call's
+// advancedColorEnabled stays set in SDR whenever wide color / auto color
+// management is on, so it can't tell whether HDR is on. These come from the
+// SDK's wingdi.h (10.0.26100); the `windows` crate doesn't have them yet.
+const DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2: DISPLAYCONFIG_DEVICE_INFO_TYPE =
+    DISPLAYCONFIG_DEVICE_INFO_TYPE(15);
+const DEVICE_INFO_SET_HDR_STATE: DISPLAYCONFIG_DEVICE_INFO_TYPE =
+    DISPLAYCONFIG_DEVICE_INFO_TYPE(16);
+/// `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2`.
+#[repr(C)]
+#[derive(Default)]
+struct AdvancedColorInfo2 {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    /// Bit 4: highDynamicRangeSupported, bit 5: highDynamicRangeUserEnabled.
+    value: u32,
+    color_encoding: i32,
+    bits_per_color_channel: u32,
+    active_color_mode: i32,
+}
+/// `DISPLAYCONFIG_SET_HDR_STATE`.
+#[repr(C)]
+#[derive(Default)]
+struct SetHdrState {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    value: u32,
+}
+
+/// Whether a display supports HDR and has it on, and whether that came from
+/// the Windows 11 call (Windows 10 only has the older one).
+unsafe fn hdr_state(adapter: LUID, target: u32) -> Option<(bool, bool, bool)> {
+    unsafe {
+        let mut info = AdvancedColorInfo2::default();
+        info.header.r#type = DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+        info.header.size = size_of::<AdvancedColorInfo2>() as u32;
+        info.header.adapterId = adapter;
+        info.header.id = target;
+        if DisplayConfigGetDeviceInfo(&mut info.header) == 0 {
+            return Some((info.value & 1 << 4 != 0, info.value & 1 << 5 != 0, true));
+        }
+
+        let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+        info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+        info.header.adapterId = adapter;
+        info.header.id = target;
+        if DisplayConfigGetDeviceInfo(&mut info.header) != 0 {
+            return None;
+        }
+        // Bit 0: advancedColorSupported, bit 1: advancedColorEnabled.
+        let flags = info.Anonymous.value;
+        Some((flags & 1 != 0, flags & 2 != 0, false))
+    }
 }
 
 /// The GDI device name of the monitor under the mouse pointer.
@@ -360,19 +427,11 @@ fn hdr_displays() -> Result<Vec<HdrDisplay>, String> {
 
         let mut displays = Vec::new();
         for path in &paths {
-            let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
-            info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
-            info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
-            info.header.adapterId = path.targetInfo.adapterId;
-            info.header.id = path.targetInfo.id;
-            if DisplayConfigGetDeviceInfo(&mut info.header) != 0 {
+            let Some((true, enabled, windows_11_api)) =
+                hdr_state(path.targetInfo.adapterId, path.targetInfo.id)
+            else {
                 continue;
-            }
-            // Bit 0: advancedColorSupported, bit 1: advancedColorEnabled.
-            let flags = info.Anonymous.value;
-            if flags & 1 == 0 {
-                continue;
-            }
+            };
             let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
             source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
             source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
@@ -387,19 +446,20 @@ fn hdr_displays() -> Result<Vec<HdrDisplay>, String> {
                 adapter: path.targetInfo.adapterId,
                 target: path.targetInfo.id,
                 gdi_name,
-                enabled: flags & 2 != 0,
+                enabled,
+                windows_11_api,
             });
         }
         Ok(displays)
     }
 }
 
-/// For each active display that supports HDR: its GDI name and whether HDR
-/// is on. For diagnostics.
-pub fn hdr_status() -> Result<Vec<(String, bool)>, String> {
+/// For each active display that supports HDR: its GDI name, whether HDR is
+/// on, and whether the Windows 11 call answered. For diagnostics.
+pub fn hdr_status() -> Result<Vec<(String, bool, bool)>, String> {
     Ok(hdr_displays()?
         .into_iter()
-        .map(|display| (display.gdi_name, display.enabled))
+        .map(|display| (display.gdi_name, display.enabled, display.windows_11_api))
         .collect())
 }
 
@@ -445,6 +505,22 @@ mod tests {
         let second = run_blocking(SystemCommand::ToggleBluetooth);
         eprintln!("bluetooth: {first:?}, then {second:?}");
         assert!(first.is_ok() && second.is_ok() && first != second);
+    }
+
+    /// Toggles HDR on the display under the pointer twice, so it ends as it
+    /// started. The screen blinks twice.
+    #[test]
+    #[ignore = "switches HDR on a display"]
+    fn toggles_hdr_and_back() {
+        let before = hdr_status();
+        let first = run_blocking(SystemCommand::ToggleHdr);
+        let middle = hdr_status();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let second = run_blocking(SystemCommand::ToggleHdr);
+        let after = hdr_status();
+        eprintln!("hdr: {before:?} -> {first:?} -> {middle:?} -> {second:?} -> {after:?}");
+        assert!(first.is_ok() && second.is_ok() && first != second);
+        assert_eq!(before, after);
     }
 
     /// Read-only: asks which displays support HDR, changes nothing.
