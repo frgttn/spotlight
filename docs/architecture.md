@@ -190,6 +190,7 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
    Each provider can be turned off in Settings (`RootSearch::set_enabled`): it then has no catalog loaded and is skipped for answers and fallbacks. `Provider::name` / `description` label its switch.
 2. Root search core, part 2: ✅ action panel (Ctrl+K), ✅ view stack (List / Grid / Detail / Form, Esc goes back), ✅ HUD and toasts, ✅ aliases and per-item hotkeys, ✅ calculator currencies and history; ✅ more sources (Settings pages, Control Panel, Steam / Epic / GOG / Ubisoft games); still to do: frecency tuning.
 3. Clipboard history, snippets (with expansion), quicklinks.
+3.5 Database encryption: `rusqlite` with `bundled-sqlcipher` instead of `bundled`. The key is random, kept next to the database encrypted with DPAPI (`CryptProtectData`, current user), so nothing to type. An existing plain database is converted once with `sqlcipher_export`. Clipboard images on disk get the same key (or move into the database). Deferred until clipboard history and snippets settle, since both add private data.
 4. Window management, file search.
 5. Script commands.
 6. WASM plugin host + SDK + 2–3 sample plugins.
