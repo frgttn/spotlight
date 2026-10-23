@@ -24,6 +24,13 @@ mod glyph {
     pub const DELETE: char = '\u{E74D}';
     pub const BRIGHTNESS: char = '\u{E793}';
     pub const MUTE: char = '\u{E74F}';
+    pub const VOLUME: char = '\u{E767}';
+    pub const VOLUME_DOWN: char = '\u{E993}';
+    pub const VOLUME_UP: char = '\u{E995}';
+    pub const BLUETOOTH: char = '\u{E702}';
+    pub const DISPLAY: char = '\u{E7F4}';
+    pub const NIGHT_LIGHT: char = '\u{EA80}';
+    pub const USB: char = '\u{E88E}';
 }
 
 /// Every built-in provider, in the order their answers and catalogs are listed.

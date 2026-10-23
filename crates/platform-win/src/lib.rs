@@ -10,6 +10,7 @@ compile_error!("Spotlight is Windows-only");
 pub mod apps;
 pub mod autostart;
 pub mod commands;
+pub mod drives;
 pub mod hotkey;
 pub mod icons;
 pub mod instance;

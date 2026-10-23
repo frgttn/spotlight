@@ -1,17 +1,40 @@
-//! System commands: power, session, Recycle Bin, theme, audio.
+//! System commands: power, session, Recycle Bin, theme, sound, Bluetooth,
+//! HDR, drives.
+//!
+//! Each command runs on a short-lived thread of its own: several block (the
+//! Recycle Bin shows its own confirmation, Bluetooth waits on WinRT) and they
+//! need COM in different apartments.
 
 use std::{ffi::c_void, mem::size_of, os::windows::process::CommandExt, process, ptr, thread};
 
 use spotlight_core::item::SystemCommand;
 use windows::{
+    Devices::Radios::{Radio, RadioAccessStatus, RadioKind, RadioState},
     Win32::{
-        Foundation::{ERROR_SUCCESS, LPARAM, WPARAM},
+        Devices::Display::{
+            DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
+            DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
+            DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+            DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
+            QueryDisplayConfig,
+        },
+        Foundation::{ERROR_SUCCESS, LPARAM, LUID, POINT, WPARAM},
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
+            MonitorFromPoint,
+        },
         Media::Audio::{
             Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole,
             eRender,
         },
         System::{
-            Com::{CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx},
+            Com::{
+                CLSCTX_ALL, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoCreateInstance,
+                CoInitializeEx,
+            },
             Power::SetSuspendState,
             Registry::{
                 HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
@@ -25,15 +48,21 @@ use windows::{
         UI::{
             Shell::SHEmptyRecycleBinW,
             WindowsAndMessaging::{
-                HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+                GetCursorPos, HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+                WM_SETTINGCHANGE,
             },
         },
     },
-    core::{PCWSTR, Result, w},
+    core::{PCWSTR, w},
 };
 
-/// Runs `command` on a short-lived thread: some of these block (the Recycle Bin
-/// shows its own confirmation and progress) or need COM.
+use crate::drives;
+
+/// What a command reports: a short message for the HUD ("Bluetooth Off",
+/// "Volume 40%"), nothing, or why it failed, in words for the user.
+pub type Outcome = Result<Option<String>, String>;
+
+/// Runs `command` in the background and only logs a failure.
 pub fn run(command: SystemCommand) {
     thread::spawn(move || {
         if let Err(err) = run_blocking(command) {
@@ -42,51 +71,88 @@ pub fn run(command: SystemCommand) {
     });
 }
 
-fn run_blocking(command: SystemCommand) -> Result<()> {
+/// Runs `command` in the background; its outcome arrives on the returned channel.
+pub fn spawn(command: SystemCommand) -> async_channel::Receiver<Outcome> {
+    let (tx, rx) = async_channel::bounded(1);
+    thread::spawn(move || {
+        let outcome = run_blocking(command);
+        if let Err(err) = &outcome {
+            eprintln!("[system] {command:?} failed: {err}");
+        }
+        let _ = tx.send_blocking(outcome);
+    });
+    rx
+}
+
+fn run_blocking(command: SystemCommand) -> Outcome {
+    let done = |result: windows::core::Result<()>| result.map(|()| None).map_err(message);
     unsafe {
         match command {
-            SystemCommand::Lock => LockWorkStation(),
+            SystemCommand::Lock => done(LockWorkStation()),
             SystemCommand::Sleep => {
                 // Sleeps, or hibernates if the power settings turned sleep into hibernate.
                 if SetSuspendState(false, false, false) {
-                    Ok(())
+                    Ok(None)
                 } else {
-                    Err(windows::core::Error::from_win32())
+                    Err(message(windows::core::Error::from_win32()))
                 }
             }
             // `shutdown.exe` takes care of the shutdown privilege, which
             // `ExitWindowsEx` would make us enable first.
             SystemCommand::Restart => shutdown(&["/r", "/t", "0"]),
             SystemCommand::ShutDown => shutdown(&["/s", "/t", "0"]),
-            SystemCommand::SignOut => ExitWindowsEx(
+            SystemCommand::SignOut => done(ExitWindowsEx(
                 EWX_LOGOFF,
                 SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED,
-            ),
+            )),
             // No flags: Windows asks for confirmation and shows progress itself.
-            SystemCommand::EmptyRecycleBin => SHEmptyRecycleBinW(None, PCWSTR::null(), 0),
+            // Declining, or a bin that's already empty, also lands in `Err`;
+            // either way Windows has already said what happened.
+            SystemCommand::EmptyRecycleBin => {
+                let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
+                Ok(None)
+            }
             SystemCommand::ToggleDarkMode => toggle_dark_mode(),
             SystemCommand::ToggleMute => toggle_mute(),
+            // Steps of 10%, from the nearest step, as the volume keys feel.
+            SystemCommand::VolumeUp => set_volume(|now| ((now * 10.).round() + 1.) / 10.),
+            SystemCommand::VolumeDown => set_volume(|now| ((now * 10.).round() - 1.) / 10.),
+            SystemCommand::SetVolume(percent) => set_volume(|_| f32::from(percent) / 100.),
+            SystemCommand::ToggleBluetooth => toggle_bluetooth(),
+            SystemCommand::ToggleHdr => toggle_hdr(),
+            SystemCommand::Eject(letter) => drives::eject(letter).map(Some),
+            SystemCommand::EjectAll => drives::eject_all().map(Some),
         }
     }
 }
 
-fn shutdown(args: &[&str]) -> Result<()> {
+fn message(err: windows::core::Error) -> String {
+    let text = err.message();
+    if text.is_empty() {
+        format!("Error {:#x}", err.code().0)
+    } else {
+        text
+    }
+}
+
+fn shutdown(args: &[&str]) -> Outcome {
     process::Command::new("shutdown.exe")
         .args(args)
         .creation_flags(CREATE_NO_WINDOW.0)
         .spawn()
-        .map(drop)
-        .map_err(|err| windows::core::Error::new(windows::core::HRESULT(-1), err.to_string()))
+        .map(|_| None)
+        .map_err(|err| err.to_string())
 }
 
 const PERSONALIZE: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
 
 /// Flips apps and the system (taskbar, Start) between light and dark together,
 /// following the apps setting, as the Settings app's single switch does.
-unsafe fn toggle_dark_mode() -> Result<()> {
+unsafe fn toggle_dark_mode() -> Outcome {
     unsafe {
+        let to_dark = !dark_mode();
         // The registry values say "light": 1 is light, 0 is dark.
-        let next = u32::from(dark_mode());
+        let next = u32::from(!to_dark);
         for name in [w!("AppsUseLightTheme"), w!("SystemUsesLightTheme")] {
             let status = RegSetKeyValueW(
                 HKEY_CURRENT_USER,
@@ -97,7 +163,7 @@ unsafe fn toggle_dark_mode() -> Result<()> {
                 size_of::<u32>() as u32,
             );
             if status != ERROR_SUCCESS {
-                return Err(status.into());
+                return Err(message(status.into()));
             }
         }
         // What the Settings app broadcasts, so open windows repaint in the new theme.
@@ -110,19 +176,9 @@ unsafe fn toggle_dark_mode() -> Result<()> {
             200,
             None,
         );
-        Ok(())
-    }
-}
-
-/// Mutes or unmutes the default playback device.
-unsafe fn toggle_mute() -> Result<()> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let device = devices.GetDefaultAudioEndpoint(eRender, eConsole)?;
-        let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
-        let muted = volume.GetMute()?.as_bool();
-        volume.SetMute(!muted, ptr::null())
+        Ok(Some(
+            if to_dark { "Dark Mode" } else { "Light Mode" }.into(),
+        ))
     }
 }
 
@@ -143,4 +199,262 @@ pub fn dark_mode() -> bool {
         );
     }
     light == 0
+}
+
+/// The default playback device's volume control.
+unsafe fn speakers() -> Result<IAudioEndpointVolume, String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let devices: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(message)?;
+        let device = devices
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|_| "No playback device".to_owned())?;
+        device.Activate(CLSCTX_ALL, None).map_err(message)
+    }
+}
+
+unsafe fn toggle_mute() -> Outcome {
+    unsafe {
+        let volume = speakers()?;
+        let muted = volume.GetMute().map_err(message)?.as_bool();
+        volume.SetMute(!muted, ptr::null()).map_err(message)?;
+        Ok(Some(if muted { "Unmuted" } else { "Muted" }.into()))
+    }
+}
+
+/// Sets the volume to `next(current)` (both 0–1). Turning it up also unmutes,
+/// like the volume keys do.
+unsafe fn set_volume(next: impl FnOnce(f32) -> f32) -> Outcome {
+    unsafe {
+        let volume = speakers()?;
+        let now = volume.GetMasterVolumeLevelScalar().map_err(message)?;
+        let level = next(now).clamp(0., 1.);
+        volume
+            .SetMasterVolumeLevelScalar(level, ptr::null())
+            .map_err(message)?;
+        if level > now && volume.GetMute().map_err(message)?.as_bool() {
+            volume.SetMute(false, ptr::null()).map_err(message)?;
+        }
+        Ok(Some(format!("Volume {}%", (level * 100.).round())))
+    }
+}
+
+/// Turns the (first) Bluetooth radio on or off, as the Quick Settings tile does.
+fn toggle_bluetooth() -> Outcome {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let denied = "Windows doesn't let Spotlight change Bluetooth (Settings › Privacy › Radios)";
+    let access = Radio::RequestAccessAsync()
+        .and_then(|operation| operation.get())
+        .map_err(message)?;
+    if access != RadioAccessStatus::Allowed {
+        return Err(denied.into());
+    }
+    let radios = Radio::GetRadiosAsync()
+        .and_then(|operation| operation.get())
+        .map_err(message)?;
+    for ix in 0..radios.Size().map_err(message)? {
+        let radio = radios.GetAt(ix).map_err(message)?;
+        if radio.Kind().map_err(message)? != RadioKind::Bluetooth {
+            continue;
+        }
+        let on = radio.State().map_err(message)? == RadioState::On;
+        let target = if on { RadioState::Off } else { RadioState::On };
+        let result = radio
+            .SetStateAsync(target)
+            .and_then(|operation| operation.get())
+            .map_err(message)?;
+        if result != RadioAccessStatus::Allowed {
+            return Err(denied.into());
+        }
+        return Ok(Some(
+            if on { "Bluetooth Off" } else { "Bluetooth On" }.into(),
+        ));
+    }
+    Err("No Bluetooth adapter found".into())
+}
+
+/// Turns HDR on or off on the display under the mouse pointer, which is also
+/// where the launcher opens. Other displays keep their setting.
+fn toggle_hdr() -> Outcome {
+    let displays = hdr_displays()?;
+    if displays.is_empty() {
+        return Err("No display here supports HDR".into());
+    }
+    let pointer = display_under_pointer();
+    let display = match displays
+        .iter()
+        .find(|display| Some(&display.gdi_name) == pointer.as_ref())
+    {
+        Some(display) => display,
+        None if displays.len() == 1 => &displays[0],
+        None => return Err("This display doesn't support HDR".into()),
+    };
+    let enable = !display.enabled;
+    let mut state = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE::default();
+    state.header.r#type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+    state.header.size = size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>() as u32;
+    state.header.adapterId = display.adapter;
+    state.header.id = display.target;
+    // Bit 0: enableAdvancedColor.
+    state.Anonymous.value = u32::from(enable);
+    let status = unsafe { DisplayConfigSetDeviceInfo(&state.header) };
+    if status != 0 {
+        return Err(format!("Couldn't change HDR (error {status})"));
+    }
+    Ok(Some(if enable { "HDR On" } else { "HDR Off" }.into()))
+}
+
+struct HdrDisplay {
+    adapter: LUID,
+    target: u32,
+    /// `\\.\DISPLAY1`: matches `MONITORINFOEXW::szDevice`.
+    gdi_name: String,
+    enabled: bool,
+}
+
+/// The GDI device name of the monitor under the mouse pointer.
+fn display_under_pointer() -> Option<String> {
+    unsafe {
+        let mut cursor = POINT::default();
+        GetCursorPos(&mut cursor).ok()?;
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO)
+            .as_bool()
+            .then(|| wide_to_string(&info.szDevice))
+    }
+}
+
+fn wide_to_string(wide: &[u16]) -> String {
+    let len = wide.iter().position(|&ch| ch == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..len])
+}
+
+/// Active displays that support HDR ("advanced color"), and whether it is on.
+fn hdr_displays() -> Result<Vec<HdrDisplay>, String> {
+    unsafe {
+        let (mut path_count, mut mode_count) = (0u32, 0u32);
+        let status =
+            GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count);
+        if status != ERROR_SUCCESS {
+            return Err(message(status.into()));
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let status = QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        );
+        if status != ERROR_SUCCESS {
+            return Err(message(status.into()));
+        }
+        paths.truncate(path_count as usize);
+
+        let mut displays = Vec::new();
+        for path in &paths {
+            let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+            info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            info.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+            info.header.adapterId = path.targetInfo.adapterId;
+            info.header.id = path.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut info.header) != 0 {
+                continue;
+            }
+            // Bit 0: advancedColorSupported, bit 1: advancedColorEnabled.
+            let flags = info.Anonymous.value;
+            if flags & 1 == 0 {
+                continue;
+            }
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            source.header.adapterId = path.sourceInfo.adapterId;
+            source.header.id = path.sourceInfo.id;
+            let gdi_name = if DisplayConfigGetDeviceInfo(&mut source.header) == 0 {
+                wide_to_string(&source.viewGdiDeviceName)
+            } else {
+                String::new()
+            };
+            displays.push(HdrDisplay {
+                adapter: path.targetInfo.adapterId,
+                target: path.targetInfo.id,
+                gdi_name,
+                enabled: flags & 2 != 0,
+            });
+        }
+        Ok(displays)
+    }
+}
+
+/// For each active display that supports HDR: its GDI name and whether HDR
+/// is on. For diagnostics.
+pub fn hdr_status() -> Result<Vec<(String, bool)>, String> {
+    Ok(hdr_displays()?
+        .into_iter()
+        .map(|display| (display.gdi_name, display.enabled))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sets the volume to the level it already has, through the real call.
+    /// Run by hand: `cargo test -p spotlight-platform-win -- --ignored`.
+    #[test]
+    #[ignore = "talks to the audio device"]
+    fn sets_volume_to_its_current_level() {
+        let now = unsafe { speakers().unwrap().GetMasterVolumeLevelScalar().unwrap() };
+        let percent = (now * 100.).round() as u8;
+        let outcome = run_blocking(SystemCommand::SetVolume(percent));
+        eprintln!("volume {percent}% -> {outcome:?}");
+        assert_eq!(outcome, Ok(Some(format!("Volume {percent}%"))));
+    }
+
+    /// Read-only: finds the Bluetooth radio and its state, changes nothing.
+    #[test]
+    #[ignore = "talks to the Bluetooth radio"]
+    fn finds_the_bluetooth_radio() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let radios = Radio::GetRadiosAsync().unwrap().get().unwrap();
+        let states: Vec<_> = (0..radios.Size().unwrap())
+            .map(|ix| radios.GetAt(ix).unwrap())
+            .map(|radio| (radio.Kind().unwrap(), radio.State().unwrap()))
+            .collect();
+        eprintln!("radios (kind, state): {states:?}");
+        let access = Radio::RequestAccessAsync().unwrap().get().unwrap();
+        eprintln!("access: {access:?}");
+    }
+
+    /// Toggles Bluetooth twice, so it ends as it started. Only run it when
+    /// nothing is connected over Bluetooth.
+    #[test]
+    #[ignore = "switches the Bluetooth radio"]
+    fn toggles_bluetooth_and_back() {
+        let first = run_blocking(SystemCommand::ToggleBluetooth);
+        let second = run_blocking(SystemCommand::ToggleBluetooth);
+        eprintln!("bluetooth: {first:?}, then {second:?}");
+        assert!(first.is_ok() && second.is_ok() && first != second);
+    }
+
+    /// Read-only: asks which displays support HDR, changes nothing.
+    #[test]
+    fn reads_hdr_support() {
+        let status = hdr_status();
+        eprintln!(
+            "HDR displays: {status:?}; under the pointer: {:?}",
+            display_under_pointer()
+        );
+        assert!(status.is_ok());
+    }
 }

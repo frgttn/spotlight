@@ -791,22 +791,36 @@ impl Launcher {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
-            Command::System(SystemCommand::ToggleDarkMode) => {
-                // Read before the toggle runs on its own thread.
-                let next = if system::dark_mode() {
-                    "Light Mode"
-                } else {
-                    "Dark Mode"
-                };
-                commands::execute(command);
-                hud = Some(next.into());
-            }
+            Command::System(command) => self.run_system(*command, cx),
             command => commands::execute(command),
         }
         self.hide(cx);
         if let Some(text) = hud {
             self.show_hud(text, cx);
         }
+    }
+
+    /// Runs a system command in the background and shows what it reports
+    /// ("Bluetooth Off", "Volume 40%", or why it failed) in the HUD, unless
+    /// the launcher has been opened again meanwhile.
+    fn run_system(&mut self, command: SystemCommand, cx: &mut Context<Self>) {
+        let outcome = system::spawn(command);
+        cx.spawn(async move |this, cx| {
+            let Ok(outcome) = outcome.recv().await else {
+                return;
+            };
+            let text = match outcome {
+                Ok(Some(text)) | Err(text) => text,
+                Ok(None) => return,
+            };
+            this.update(cx, |this, cx| {
+                if !this.visible {
+                    this.show_hud(text.into(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// An item hotkey was pressed: runs that item's primary action without

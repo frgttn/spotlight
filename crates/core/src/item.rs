@@ -115,4 +115,16 @@ pub enum SystemCommand {
     EmptyRecycleBin,
     ToggleDarkMode,
     ToggleMute,
+    /// Up or down by 10% of the default playback device.
+    VolumeUp,
+    VolumeDown,
+    /// Percent, 0–100.
+    SetVolume(u8),
+    ToggleBluetooth,
+    /// HDR on every display that supports it.
+    ToggleHdr,
+    /// Safely removes the drive with this letter (`'E'`).
+    Eject(char),
+    /// Every removable drive.
+    EjectAll,
 }
