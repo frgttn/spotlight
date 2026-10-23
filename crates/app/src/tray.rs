@@ -109,14 +109,14 @@ fn icon() -> Result<Icon, String> {
         [0, 0, 0]
     };
 
-    // Right half ring around (50, 36.75) and left half ring around (50, 63.25),
-    // both 27.5 outside and 13.25 inside.
+    // Left half ring around (50, 36.75) and right half ring around (50, 63.25),
+    // both 27.5 outside and 13.25 inside (the SVG's two subpaths, as rendered).
     let in_mark = |u: f32, v: f32| {
         let ring = |cy: f32| {
             let d = (u - 50.).hypot(v - cy);
             (13.25..=27.5).contains(&d)
         };
-        (u >= 50. && ring(36.75)) || (u <= 50. && ring(63.25))
+        (u <= 50. && ring(36.75)) || (u >= 50. && ring(63.25))
     };
 
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
