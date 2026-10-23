@@ -95,37 +95,46 @@ fn tooltip(hotkey: &str) -> String {
     format!("Spotlight ({hotkey})")
 }
 
-/// A white magnifier on a blue disc, drawn at 32 px with antialiased edges.
-/// Readable on both light and dark taskbars.
+/// The logo (two interlocked half rings, from `assets/logo.svg`) on a
+/// transparent background, drawn at 32 px with 4x4 supersampling. Dark on a
+/// light taskbar, light on a dark one.
 fn icon() -> Result<Icon, String> {
     const SIZE: u32 = 32;
-    const BLUE: [f32; 3] = [52., 101., 235.];
+    const SAMPLES: u32 = 4;
+    // Logo coordinates are on a 100 x 100 grid; this many pixels per unit.
+    const SCALE: f32 = 0.38;
+    let mark: [u8; 3] = if spotlight_platform_win::system::taskbar_dark() {
+        [242, 244, 243]
+    } else {
+        [39, 47, 45]
+    };
+
+    // Right half ring around (50, 36.75) and left half ring around (50, 63.25),
+    // both 27.5 outside and 13.25 inside.
+    let in_mark = |u: f32, v: f32| {
+        let ring = |cy: f32| {
+            let d = (u - 50.).hypot(v - cy);
+            (13.25..=27.5).contains(&d)
+        };
+        (u >= 50. && ring(36.75)) || (u <= 50. && ring(63.25))
+    };
+
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Coverage from a signed distance: 1 inside, 0 outside, a 1 px ramp between.
-            let cover = |distance: f32| (0.5 - distance).clamp(0., 1.);
-
-            let disc = cover((px - 16.).hypot(py - 16.) - 15.5);
-            let ring = cover(((px - 14.).hypot(py - 14.) - 6.5).abs() - 1.75);
-            let handle = cover(segment_distance((px, py), (19., 19.), (24.5, 24.5)) - 2.);
-            let glyph = ring.max(handle);
-
-            let channel = |blue: f32| (blue + (255. - blue) * glyph).round() as u8;
-            rgba.extend([
-                channel(BLUE[0]),
-                channel(BLUE[1]),
-                channel(BLUE[2]),
-                (disc * 255.).round() as u8,
-            ]);
+            let mut covered = 0u32;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    if in_mark(50. + (px - 16.) / SCALE, 50. + (py - 16.) / SCALE) {
+                        covered += 1;
+                    }
+                }
+            }
+            let alpha = covered as f32 / (SAMPLES * SAMPLES) as f32;
+            rgba.extend([mark[0], mark[1], mark[2], (alpha * 255.).round() as u8]);
         }
     }
     Icon::from_rgba(rgba, SIZE, SIZE).map_err(|err| err.to_string())
-}
-
-fn segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
-    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
-    let t = (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / (abx * abx + aby * aby)).clamp(0., 1.);
-    (p.0 - (a.0 + t * abx)).hypot(p.1 - (a.1 + t * aby))
 }

@@ -175,21 +175,30 @@ unsafe fn toggle_dark_mode() -> Outcome {
 
 /// Whether apps currently use the dark theme.
 pub fn dark_mode() -> bool {
-    // A missing value means light, Windows' default.
+    uses_light_theme(w!("AppsUseLightTheme")) == 0
+}
+
+/// Whether the taskbar and tray use the dark theme (a separate setting from apps).
+pub fn taskbar_dark() -> bool {
+    uses_light_theme(w!("SystemUsesLightTheme")) == 0
+}
+
+/// A `Personalize` theme flag: 1 for light, which is also what a missing value means.
+fn uses_light_theme(value: PCWSTR) -> u32 {
     let mut light = 1u32;
     let mut size = size_of::<u32>() as u32;
     unsafe {
         let _ = RegGetValueW(
             HKEY_CURRENT_USER,
             PERSONALIZE,
-            w!("AppsUseLightTheme"),
+            value,
             RRF_RT_REG_DWORD,
             None,
             Some(&mut light as *mut u32 as *mut c_void),
             Some(&mut size),
         );
     }
-    light == 0
+    light
 }
 
 /// The default playback device's volume control.
