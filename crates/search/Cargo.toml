@@ -1,0 +1,12 @@
+[package]
+name = "spotlight-search"
+description = "Ranking for Spotlight: fuzzy match, prefix bonus and frecency"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+nucleo-matcher.workspace = true

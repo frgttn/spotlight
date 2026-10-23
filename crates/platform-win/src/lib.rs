@@ -1,14 +1,16 @@
-//! UI-independent Windows integration for the launcher spike (hotkey, app
-//! discovery, window placement, fuzzy search, measurements).
+//! Windows integration for Spotlight (hotkey, single instance, app discovery
+//! and icons, autostart, window placement, measurements).
 //!
 //! Nothing in here knows about a UI framework: window handles are passed as raw
 //! `isize` HWND values and events are delivered over `async_channel`.
 
 #[cfg(not(windows))]
-compile_error!("the launcher spikes are Windows-only");
+compile_error!("Spotlight is Windows-only");
 
 pub mod apps;
+pub mod autostart;
 pub mod hotkey;
+pub mod icons;
+pub mod instance;
 pub mod metrics;
-pub mod search;
 pub mod win;

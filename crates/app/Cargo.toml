@@ -1,0 +1,18 @@
+[package]
+name = "spotlight"
+description = "Spotlight launcher binary: wiring, window lifecycle, self-test"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+gpui.workspace = true
+raw-window-handle.workspace = true
+spotlight-platform-win.workspace = true
+spotlight-store.workspace = true
+spotlight-ui.workspace = true
+tray-icon.workspace = true

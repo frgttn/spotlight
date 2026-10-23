@@ -1,6 +1,6 @@
 [package]
-name = "spike-gpui"
-description = "Launcher spike: hotkey, prewarmed window, fuzzy app search, launch (GPUI)"
+name = "spotlight-ui"
+description = "GPUI views for Spotlight: launcher window and text input"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,11 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
-gpui = "=0.2.2"
+gpui.workspace = true
+image.workspace = true
 raw-window-handle.workspace = true
-spike-common.workspace = true
+spotlight-core.workspace = true
+spotlight-platform-win.workspace = true
+spotlight-search.workspace = true
+spotlight-store.workspace = true
 unicode-segmentation.workspace = true

@@ -2,39 +2,55 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     rc::Rc,
+    sync::{Arc, Mutex},
     thread,
     time::Instant,
 };
 
 use gpui::{
-    App, Context, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding, ScrollStrategy,
-    SharedString, Subscription, UniformListScrollHandle, Window, actions, canvas, div, hsla,
-    prelude::*, px, rgb, rgba, uniform_list,
+    App, Context, DispatchPhase, Entity, EntityInputHandler, Focusable, Hsla, KeyBinding,
+    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    UniformListScrollHandle, Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba,
+    uniform_list,
 };
+use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use spike_common::{
+use spotlight_core::{
+    frecency::{self, Frecency},
+    item_id,
+};
+use spotlight_platform_win::{
     apps::{self, AppEntry},
+    icons::{self, Icon},
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    search::Searcher,
     win,
 };
+use spotlight_search::{Candidate, Searcher};
+use spotlight_store::Store;
 
-use crate::text_input::{self, TextInput};
+use crate::{
+    smooth_scroll::SmoothScroll,
+    text_input::{self, TextInput},
+    theme,
+};
 
-actions!(launcher, [SelectNext, SelectPrev, Confirm, Dismiss, Quit]);
+actions!(
+    launcher,
+    [SelectNext, SelectPrev, Confirm, Dismiss, Quit, OpenSettings]
+);
 
 const CONTEXT: &str = "Launcher";
 const ROW_HEIGHT: f32 = 44.;
+/// Space above the first and below the last row.
+const LIST_PADDING: f32 = 4.;
+/// Row icon size in logical pixels.
+const ICON_SIZE: f32 = 26.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
-/// Background over GPUI's `Blurred` window. GPUI's accent-policy blur barely
-/// blurs on Windows 11, so the tint has to hide what's behind on its own.
-/// (The DWM acrylic system backdrop was tried: light grey, and the window lost
-/// focus and hid itself after a few seconds.)
-const BACKGROUND_TINT: u32 = 0x1c1c1ef7;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -45,22 +61,28 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, Some(CONTEXT)),
         KeyBinding::new("escape", Dismiss, Some(CONTEXT)),
         KeyBinding::new("ctrl-q", Quit, None),
+        // Not handled here: it bubbles up to the app, which owns the settings window.
+        KeyBinding::new("ctrl-,", OpenSettings, Some(CONTEXT)),
     ]);
 }
 
 enum Target {
     App(AppEntry),
-    /// Filler rows for the 10k-item list test (`SPIKE_SYNTHETIC`).
+    /// Filler rows for the 10k-item list test (`SPOTLIGHT_SYNTHETIC`).
     Synthetic,
 }
 
 struct Item {
+    /// Frecency key; `None` for items that aren't tracked (synthetic rows).
+    id: Option<String>,
     title: SharedString,
     subtitle: SharedString,
+    /// `None` until extracted (or when there is none): a letter badge is drawn instead.
+    icon: Option<Arc<RenderImage>>,
     target: Target,
 }
 
-/// Spike measurements, shown in the footer and logged to stderr.
+/// Measurements, shown in the footer and logged to stderr.
 #[derive(Default)]
 struct Stats {
     hotkey: SharedString,
@@ -80,8 +102,12 @@ pub struct Launcher {
     /// Indices into `items`, best match first.
     results: Vec<usize>,
     selected: usize,
-    scroll: UniformListScrollHandle,
+    scroll: SmoothScroll,
     searcher: Searcher,
+    /// In-memory copy of the store's frecency table, updated on every launch.
+    frecency: HashMap<String, Frecency>,
+    /// `None` when the database couldn't be opened; usage is then not remembered.
+    store: Option<Arc<Mutex<Store>>>,
     visible: bool,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
@@ -91,6 +117,8 @@ impl Launcher {
     pub fn new(
         hotkey: SharedString,
         synthetic: usize,
+        store: Option<Arc<Mutex<Store>>>,
+        smooth_scrolling: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -116,11 +144,24 @@ impl Launcher {
 
         let items = (0..synthetic)
             .map(|ix| Item {
+                id: None,
                 title: format!("Synthetic item {ix:05} {}", FILLER[ix % FILLER.len()]).into(),
                 subtitle: "Synthetic".into(),
+                icon: None,
                 target: Target::Synthetic,
             })
             .collect();
+
+        let frecency = store
+            .as_ref()
+            .and_then(|store| store.lock().ok())
+            .map(|store| {
+                store.frecency().unwrap_or_else(|err| {
+                    eprintln!("[spotlight] could not read frecency: {err}");
+                    HashMap::new()
+                })
+            })
+            .unwrap_or_default();
 
         let mut this = Self {
             hwnd,
@@ -128,8 +169,15 @@ impl Launcher {
             items,
             results: Vec::new(),
             selected: 0,
-            scroll: UniformListScrollHandle::new(),
+            scroll: {
+                let mut scroll =
+                    SmoothScroll::new(UniformListScrollHandle::new(), ROW_HEIGHT, LIST_PADDING);
+                scroll.set_enabled(smooth_scrolling);
+                scroll
+            },
             searcher: Searcher::default(),
+            frecency,
+            store,
             visible: false,
             stats: Stats {
                 hotkey,
@@ -138,12 +186,12 @@ impl Launcher {
             _subscriptions: subscriptions,
         };
         this.refilter("");
-        this.load_apps(cx);
+        this.load_apps(window.scale_factor(), cx);
         this
     }
 
     /// Discovers apps on a dedicated COM thread and prepends them to the items.
-    fn load_apps(&mut self, cx: &mut Context<Self>) {
+    fn load_apps(&mut self, window_scale: f32, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded(1);
         thread::spawn(move || {
             let started = Instant::now();
@@ -160,17 +208,20 @@ impl Launcher {
                     Ok(apps) => {
                         this.stats.apps = apps.len();
                         let items = apps.into_iter().map(|app| Item {
+                            id: Some(item_id("apps", &app.launch_id)),
                             title: app.name.clone().into(),
                             subtitle: "Application".into(),
+                            icon: None,
                             target: Target::App(app),
                         });
                         this.items.splice(0..0, items);
+                        this.load_icons(window_scale, cx);
                     }
-                    Err(err) => eprintln!("[spike] app discovery failed: {err}"),
+                    Err(err) => eprintln!("[spotlight] app discovery failed: {err}"),
                 }
                 this.stats.discover_ms = Some(ms(elapsed));
                 eprintln!(
-                    "[spike] discovered {} apps in {:.1} ms",
+                    "[spotlight] discovered {} apps in {:.1} ms",
                     this.stats.apps,
                     ms(elapsed)
                 );
@@ -183,6 +234,56 @@ impl Launcher {
         .detach();
     }
 
+    /// Extracts app icons in the background; rows switch from badges to icons as they arrive.
+    /// Apps are at the front of `items` right after discovery, so an app's index
+    /// in the request is also its index in `items`.
+    fn load_icons(&mut self, window_scale: f32, cx: &mut Context<Self>) {
+        let launch_ids: Vec<String> = self
+            .items
+            .iter()
+            .map_while(|item| match &item.target {
+                Target::App(app) => Some(app.launch_id.clone()),
+                Target::Synthetic => None,
+            })
+            .collect();
+        // Sized for the monitor the window was created on; GPUI scales it if that changes.
+        let size = (ICON_SIZE * window_scale).ceil() as u32;
+        let (tx, rx) = async_channel::unbounded();
+        icons::spawn(launch_ids, size, tx);
+
+        cx.spawn(async move |this, cx| {
+            while let Ok(first) = rx.recv().await {
+                // Apply whatever else has arrived too, so the list re-renders once per batch.
+                let batch: Vec<_> = std::iter::once(first)
+                    .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    .collect();
+                let updated = this.update(cx, |this, cx| {
+                    for (ix, icon) in batch {
+                        if let Some(item) = this.items.get_mut(ix) {
+                            item.icon = render_image(icon);
+                        }
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn set_smooth_scrolling(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.scroll.set_enabled(enabled);
+        cx.notify();
+    }
+
+    /// Shown in the footer.
+    pub fn set_hotkey_label(&mut self, label: SharedString, cx: &mut Context<Self>) {
+        self.stats.hotkey = label;
+        cx.notify();
+    }
+
     pub fn query(&self, cx: &App) -> String {
         self.input.read(cx).text().to_owned()
     }
@@ -190,11 +291,18 @@ impl Launcher {
     /// Re-runs the fuzzy filter and resets the selection. Returns the filter time in ms.
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
-        self.results = self
-            .searcher
-            .filter(query, self.items.iter().map(|item| item.title.as_ref()));
+        let now = frecency::now();
+        let candidates = self.items.iter().map(|item| Candidate {
+            title: item.title.as_ref(),
+            frecency: item
+                .id
+                .as_ref()
+                .and_then(|id| self.frecency.get(id))
+                .map_or(0., |used| used.score_at(now)),
+        });
+        self.results = self.searcher.filter(query, candidates);
         self.selected = 0;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        self.scroll.reset();
         ms(started.elapsed())
     }
 
@@ -260,6 +368,16 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Shows the window unless it is already up (tray click, second launch).
+    /// Unlike [`Self::toggle`], it never hides.
+    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible && win::is_visible(self.hwnd) {
+            win::focus(self.hwnd);
+        } else {
+            self.show(Instant::now(), window, cx);
+        }
+    }
+
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         win::hide(self.hwnd);
         self.visible = false;
@@ -269,8 +387,7 @@ impl Launcher {
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
-            self.scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Bottom);
+            self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
@@ -278,19 +395,46 @@ impl Launcher {
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.scroll
-                .scroll_to_item(self.selected, ScrollStrategy::Top);
+            self.scroll.reveal(self.selected, self.results.len());
             cx.notify();
         }
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(&ix) = self.results.get(self.selected)
-            && let Target::App(app) = &self.items[ix].target
-        {
-            app.launch();
+        if let Some(&ix) = self.results.get(self.selected) {
+            let item = &self.items[ix];
+            if let Target::App(app) = &item.target {
+                app.launch();
+            }
+            if let Some(id) = item.id.clone() {
+                self.record_visit(id, cx);
+            }
         }
         self.hide(cx);
+    }
+
+    /// Updates frecency in memory right away and in the database on a background thread.
+    fn record_visit(&mut self, id: String, cx: &mut Context<Self>) {
+        let now = frecency::now();
+        let used = self.frecency.entry(id.clone()).or_default();
+        *used = used.visit(now);
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                let result = store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_owned())
+                    .and_then(|mut store| {
+                        store.record_visit(&id, now).map_err(|err| err.to_string())
+                    });
+                if let Err(err) = result {
+                    eprintln!("[spotlight] could not save frecency for {id:?}: {err}");
+                }
+            })
+            .detach();
     }
 
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
@@ -327,9 +471,13 @@ impl Launcher {
                     this.selected = row;
                     this.confirm(&Confirm, window, cx);
                 }))
-                .child(
-                    div()
-                        .size(px(26.))
+                .child(match &item.icon {
+                    Some(icon) => img(icon.clone())
+                        .size(px(ICON_SIZE))
+                        .flex_none()
+                        .into_any_element(),
+                    None => div()
+                        .size(px(ICON_SIZE))
                         .flex_none()
                         .rounded(px(6.))
                         .bg(badge_color(&item.title))
@@ -337,8 +485,9 @@ impl Launcher {
                         .items_center()
                         .justify_center()
                         .text_size(px(13.))
-                        .child(initial),
-                )
+                        .child(initial)
+                        .into_any_element(),
+                })
                 .child(div().flex_1().truncate().child(item.title.clone()))
                 .child(
                     div()
@@ -372,7 +521,11 @@ impl Launcher {
 }
 
 impl Render for Launcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.scroll.tick() {
+            window.request_animation_frame();
+        }
+
         let results: gpui::AnyElement = if self.results.is_empty() {
             div()
                 .flex_1()
@@ -383,7 +536,7 @@ impl Render for Launcher {
                 .child("No results")
                 .into_any_element()
         } else {
-            uniform_list(
+            let list = uniform_list(
                 "results",
                 self.results.len(),
                 cx.processor(|this, range: Range<usize>, _window, cx| {
@@ -392,10 +545,51 @@ impl Render for Launcher {
                         .collect::<Vec<_>>()
                 }),
             )
-            .track_scroll(self.scroll.clone())
-            .flex_1()
-            .py_1()
-            .into_any_element()
+            .track_scroll(self.scroll.handle())
+            .size_full()
+            .py(px(LIST_PADDING));
+
+            // Wheel notches are taken before the list sees them (capture phase)
+            // and animated instead; everything else falls through to GPUI.
+            let this = cx.entity().downgrade();
+            let wheel = canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture
+                            || !bounds.contains(&event.position)
+                            || !matches!(event.delta, ScrollDelta::Lines(_))
+                        {
+                            return;
+                        }
+                        let delta = event.delta.pixel_delta(window.line_height()).y;
+                        let handled = this
+                            .update(cx, |this, cx| {
+                                if !this.scroll.is_enabled() {
+                                    return false;
+                                }
+                                this.scroll.scroll_by(delta, this.results.len());
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full();
+
+            div()
+                .flex_1()
+                .relative()
+                .child(list)
+                .child(wheel)
+                .into_any_element()
         };
 
         let paint = self.stats.paint.clone();
@@ -409,7 +603,7 @@ impl Render for Launcher {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(BACKGROUND_TINT))
+            .bg(rgba(theme::BACKGROUND_TINT))
             .text_color(rgb(0xececec))
             .text_size(px(14.))
             .child(
@@ -441,7 +635,14 @@ impl Render for Launcher {
     }
 }
 
-/// A stable pastel colour per title, standing in for app icons in the spike.
+/// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
+/// `RgbaImage` type is only the buffer container here.
+fn render_image(icon: Icon) -> Option<Arc<RenderImage>> {
+    let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
+    Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
+}
+
+/// A stable pastel colour per title, drawn while an icon loads or when there is none.
 fn badge_color(title: &str) -> Hsla {
     let mut hasher = DefaultHasher::new();
     title.hash(&mut hasher);

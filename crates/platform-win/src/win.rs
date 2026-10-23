@@ -1,7 +1,7 @@
 //! Raw Win32 window placement for the launcher window.
 //!
 //! UI frameworks generally have no "hide but keep everything alive" call, so the
-//! spikes take the HWND and drive visibility and placement directly.
+//! launcher takes the HWND and drives visibility and placement directly.
 
 use std::{ffi::c_void, mem::size_of};
 
@@ -11,6 +11,7 @@ use windows::Win32::{
         Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
         Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
     },
+    System::Console::{ATTACH_PARENT_PROCESS, AttachConsole},
     UI::{
         HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
         WindowsAndMessaging::{
@@ -89,9 +90,24 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
     }
 }
 
+/// Lets a GUI-subsystem process print to the console it was started from, if
+/// any. Output that is redirected (to a file or a pipe) already works without it.
+pub fn attach_parent_console() {
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 pub fn hide(raw: isize) {
     unsafe {
         let _ = ShowWindow(hwnd(raw), SW_HIDE);
+    }
+}
+
+/// Brings an already visible window to the front.
+pub fn focus(raw: isize) {
+    unsafe {
+        let _ = SetForegroundWindow(hwnd(raw));
     }
 }
 
