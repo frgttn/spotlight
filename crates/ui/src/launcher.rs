@@ -83,7 +83,7 @@ const APPS_PROVIDER: &str = "apps";
 /// How long a footer toast stays.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
 /// HUD size in logical pixels, and how long it stays.
-const HUD_SIZE: (f32, f32) = (300., 44.);
+const HUD_SIZE: (f32, f32) = (240., 48.);
 const HUD_DURATION: Duration = Duration::from_millis(1500);
 
 pub fn bind_keys(cx: &mut App) {
@@ -1816,9 +1816,14 @@ impl Render for Launcher {
                 .items_center()
                 .justify_center()
                 .px_4()
-                .bg(rgba(theme::BACKGROUND_TINT))
+                .bg(rgba(theme::HUD_TINT))
+                .border_1()
+                .border_color(rgba(theme::SURFACE_BORDER))
+                .rounded(px(8.))
                 .text_color(rgba(theme::TEXT))
                 .text_size(px(14.))
+                .line_height(px(20.))
+                .text_center()
                 .child(div().truncate().child(text.clone()))
                 .into_any_element();
         }

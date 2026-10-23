@@ -5,6 +5,8 @@
 /// (The DWM acrylic system backdrop was tried: light grey, and the window lost
 /// focus and hid itself after a few seconds.)
 pub const BACKGROUND_TINT: u32 = 0x1c1c1ef7;
+/// The HUD toast: the same dark tint, but see-through enough to read as glass.
+pub const HUD_TINT: u32 = 0x1c1c1ed2;
 pub const TEXT: u32 = 0xecececff;
 pub const TEXT_MUTED: u32 = 0xffffff80;
 pub const TEXT_FAINT: u32 = 0xffffff60;
