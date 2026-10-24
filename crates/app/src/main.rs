@@ -32,8 +32,7 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
-    deeplink,
-    snippet,
+    deeplink, snippet,
     web::SearchEngine,
 };
 use spotlight_platform_win::{
@@ -132,7 +131,10 @@ fn main() {
         }
         instance::listen(messages_tx);
         if let Err(err) = protocol::register(deeplink::SCHEME) {
-            eprintln!("[spotlight] {}:// links won't open Spotlight: {err}", deeplink::SCHEME);
+            eprintln!(
+                "[spotlight] {}:// links won't open Spotlight: {err}",
+                deeplink::SCHEME
+            );
         }
     }
 

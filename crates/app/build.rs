@@ -41,7 +41,9 @@ fn resource_script(semver: &str, version: &str) -> String {
     let mut parts = semver
         .split(['.', '-', '+'])
         .map(|part| part.parse::<u16>().unwrap_or(0));
-    let numeric = [0; 4].map(|_| parts.next().unwrap_or(0).to_string()).join(",");
+    let numeric = [0; 4]
+        .map(|_| parts.next().unwrap_or(0).to_string())
+        .join(",");
     format!(
         r#"1 ICON "{icon}"
 

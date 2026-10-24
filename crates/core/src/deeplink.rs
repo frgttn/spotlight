@@ -206,7 +206,10 @@ fn query_pairs(query: &str) -> impl Iterator<Item = (String, String)> + '_ {
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode(&key.replace('+', " ")), decode(&value.replace('+', " ")))
+            (
+                decode(&key.replace('+', " ")),
+                decode(&value.replace('+', " ")),
+            )
         })
 }
 
@@ -336,7 +339,10 @@ mod tests {
         };
 
         assert_eq!(
-            apply_arguments(both.clone(), &args(&[("owner", "zed-industries"), ("Repo", "zed")])),
+            apply_arguments(
+                both.clone(),
+                &args(&[("owner", "zed-industries"), ("Repo", "zed")])
+            ),
             Command::OpenUrl("https://github.com/zed-industries/zed".into())
         );
         // One missing: the form opens with the other filled in.
