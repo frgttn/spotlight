@@ -1,6 +1,6 @@
 //! Single instance: a named mutex decides which process is the primary one, and
 //! a named pipe lets later launches hand it a message ([`SHOW`] or
-//! [`SETTINGS`]; deeplinks will use the same pipe).
+//! [`SETTINGS`], or a `spotlight://` link).
 //!
 //! Both names are per user and per Windows session, so two users on one
 //! machine (or one user in two RDP sessions) each get their own launcher.

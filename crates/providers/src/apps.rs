@@ -19,6 +19,14 @@ impl Provider for Apps {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Applications"
+    }
+
+    fn description(&self) -> &'static str {
+        "Installed apps, desktop and Microsoft Store alike."
+    }
+
     /// Blocking and COM-heavy (~200 ms): the shell enumerates every app.
     fn catalog(&self) -> Vec<SearchItem> {
         let apps = match apps::discover() {
@@ -41,6 +49,8 @@ fn browse(apps: &[SearchItem]) -> SearchItem {
         placeholder: Some("Search apps…".into()),
         items: apps.to_vec(),
         empty: Some("No apps found".into()),
+        filters: Vec::new(),
+        live: false,
     });
     SearchItem::new(item_id(ID, "browse"), "Browse Apps")
         .subtitle("Applications")

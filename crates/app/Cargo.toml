@@ -10,6 +10,8 @@ publish.workspace = true
 
 [build-dependencies]
 embed-resource = "3"
+# The local date for dev build versions (already in the tree through GPUI).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 
 [dependencies]
 async-channel.workspace = true

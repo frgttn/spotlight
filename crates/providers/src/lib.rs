@@ -3,17 +3,28 @@
 
 pub mod apps;
 pub mod calc;
+pub mod clipboard;
 pub mod control_panel;
+pub mod files;
 pub mod games;
+pub mod quicklinks;
 pub mod rates;
+pub mod selection;
 pub mod settings_pages;
+pub mod snippets;
 pub mod spotlight;
+pub mod switcher;
 pub mod system;
 pub mod web;
+pub mod windows;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
-use spotlight_core::{provider::Provider, web::SearchEngine};
+use spotlight_core::{clip::Retention, provider::Provider, web::SearchEngine};
+use spotlight_store::Store;
 
 /// Symbols from Segoe Fluent Icons (Windows 11), at the same code points in
 /// Segoe MDL2 Assets (Windows 10).
@@ -40,26 +51,83 @@ mod glyph {
     pub const KEYBOARD: char = '\u{E765}';
     pub const FORM: char = '\u{E70F}';
     pub const GAME: char = '\u{E7FC}';
+    pub const LINK: char = '\u{E71B}';
+    pub const ADD: char = '\u{E710}';
+    pub const PASTE: char = '\u{E77F}';
+    pub const TEXT: char = '\u{E8D2}';
+    pub const COLOR: char = '\u{E790}';
+    pub const IMAGE: char = '\u{EB9F}';
+    pub const FOLDER: char = '\u{E8B7}';
+    pub const TRANSLATE: char = '\u{F2B7}';
+    pub const SNIPPET: char = '\u{E70B}';
+    pub const IMPORT: char = '\u{E8B5}';
+    pub const EXPORT: char = '\u{EDE1}';
+    pub const DOCK_LEFT: char = '\u{E90C}';
+    pub const DOCK_RIGHT: char = '\u{E90D}';
+    pub const DOCK_BOTTOM: char = '\u{E90E}';
+    pub const MAXIMIZE: char = '\u{E922}';
+    pub const RESTORE_WINDOW: char = '\u{E923}';
+    pub const MINIMIZE: char = '\u{E921}';
+    pub const PIN: char = '\u{E718}';
+    pub const SWITCH: char = '\u{E8AB}';
+    pub const WINDOWS: char = '\u{E7C4}';
+    pub const PROCESSES: char = '\u{E9D9}';
 }
 
-/// Every built-in provider, in the order their answers and catalogs are
-/// listed, and the web provider again, to change its search engine later.
-/// `data_dir` is where providers keep caches (exchange rates); `None` keeps
-/// nothing between runs.
+/// The built-in providers, and the ones the app talks to again later.
+pub struct Builtins {
+    /// In the order their answers and catalogs are listed.
+    pub providers: Vec<Arc<dyn Provider>>,
+    /// To change its search engine.
+    pub web: Arc<web::Web>,
+    /// To feed it what is copied, and change how much it keeps.
+    pub clipboard: Arc<clipboard::ClipboardHistory>,
+    /// To start and stop indexing, and change what it covers.
+    pub files: Arc<files::Files>,
+}
+
+/// Every built-in provider. `data_dir` is where providers keep caches
+/// (exchange rates) and files (clipboard images); `None` keeps nothing
+/// between runs. `store` holds what the user saves (quicklinks, clipboard
+/// history, snippets). File Search starts indexing only when the app asks.
 pub fn all(
     engine: SearchEngine,
     data_dir: Option<PathBuf>,
-) -> (Vec<Arc<dyn Provider>>, Arc<web::Web>) {
+    store: Option<Arc<Mutex<Store>>>,
+    retention: Retention,
+    files: spotlight_core::file_search::Config,
+) -> Builtins {
+    let files = Arc::new(files::Files::new(files, store.clone()));
     let web = Arc::new(web::Web::new(engine));
+    let clipboard = Arc::new(clipboard::ClipboardHistory::new(
+        store.clone(),
+        data_dir.clone(),
+        retention,
+    ));
     let providers: Vec<Arc<dyn Provider>> = vec![
         Arc::new(apps::Apps),
         Arc::new(settings_pages::SettingsPages),
         Arc::new(control_panel::ControlPanel),
         Arc::new(games::Games),
         Arc::new(system::System),
-        Arc::new(calc::Calculator::new(rates::Rates::new(data_dir))),
+        Arc::new(windows::WindowManagement),
+        Arc::new(switcher::Switcher),
+        files.clone(),
+        clipboard.clone(),
+        Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
+        Arc::new(quicklinks::Quicklinks::new(store.clone())),
+        Arc::new(snippets::Snippets::new(store)),
         web.clone(),
+        Arc::new(selection::Selection::new(
+            web.clone(),
+            spotlight_platform_win::win::user_language(),
+        )),
         Arc::new(spotlight::Spotlight),
     ];
-    (providers, web)
+    Builtins {
+        providers,
+        web,
+        clipboard,
+        files,
+    }
 }

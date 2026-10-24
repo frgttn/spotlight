@@ -1,30 +1,34 @@
 //! The launcher view: search field, result list, metrics footer, and the
 //! views opened on top of it (see `views`).
 
+mod clipboard;
+mod links;
+mod quicklinks;
+mod snippets;
 mod views;
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
-    FocusHandle, Focusable, Hsla, KeyBinding, RenderImage, ScrollDelta, ScrollWheelEvent,
-    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla,
-    img, prelude::*, px, rgb, rgba, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
+    Hsla, KeyBinding, RenderImage, SharedString, Subscription, Task, UniformListScrollHandle,
+    Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
+    deeplink,
     frecency::{self, Frecency},
     item::{Command, Icon, SearchItem},
     item_id,
@@ -32,18 +36,22 @@ use spotlight_core::{
     view::{ListView, View},
 };
 use spotlight_platform_win::{
-    commands,
+    clipboard as system_clipboard, commands, expander,
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
-    win,
+    selection, win,
 };
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{Calculation, Store};
 
-use self::views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen};
+use self::{
+    clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
+    links::PendingLink,
+    views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
+};
 use crate::{
-    smooth_scroll::SmoothScroll,
+    smooth_scroll::{SmoothScroll, capture_wheel},
     text_input::{self, TextInput},
     theme,
 };
@@ -77,9 +85,15 @@ const ICON_SIZE: f32 = 26.;
 const ICON_EXTRACT_SIZE: f32 = 44.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+/// The collapsed window's height in compact mode: just the search row.
+const COMPACT_HEIGHT: f32 = 52.;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
+/// File Search: its provider and the live list root search's file prefix
+/// asks for rows.
+const FILES_PROVIDER: &str = "files";
+const FILES_VIEW: &str = "search";
 /// How long a footer toast stays.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
 /// HUD size in logical pixels, and how long it stays.
@@ -116,6 +130,10 @@ impl Provider for Synthetic {
         "synthetic"
     }
 
+    fn name(&self) -> &'static str {
+        "Synthetic Rows"
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         (0..self.0)
             .map(|ix| {
@@ -148,6 +166,13 @@ enum EntryKind {
     /// A calculator history entry, by its id in the store.
     DeleteCalculation(i64),
     ClearCalculations,
+    /// Runs the command a link named; `always` also stops asking for it.
+    OpenLink {
+        always: bool,
+    },
+    CopyDeeplink,
+    /// Asks again before the item opens from a link.
+    DistrustLink,
 }
 
 impl Entry {
@@ -164,6 +189,8 @@ impl Entry {
 const CALC_ANSWER_ID: &str = "calc:answer";
 /// Item ids of history rows: this, then the calculation's id in the store.
 const HISTORY_ITEM: &str = "calc-history:";
+/// The Selected Text provider: turned off, the selection is never read.
+const SELECTION_PROVIDER: &str = "selection";
 const SEARCH_PLACEHOLDER: &str = "Search apps and commands, or calculate…";
 
 /// An item with an alias or a hotkey, as the settings window lists it.
@@ -173,6 +200,28 @@ pub struct Shortcut {
     pub title: String,
     pub alias: Option<String>,
     pub hotkey: Option<Hotkey>,
+}
+
+/// An item that can take an alias or a hotkey, as its extension's page in
+/// the settings window lists it.
+#[derive(Clone)]
+pub struct ExtensionItem {
+    /// The id of the search provider it comes from.
+    pub provider: String,
+    pub shortcut: Shortcut,
+    pub subtitle: Option<String>,
+    /// Its icon once extracted, or the glyph it is drawn with.
+    pub image: Option<Arc<RenderImage>>,
+    pub glyph: Option<char>,
+}
+
+/// A search provider, as the settings window lists it to turn it on or off.
+#[derive(Clone)]
+pub struct Source {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub enabled: bool,
 }
 
 /// A small card over the window for setting an item's alias or hotkey.
@@ -205,11 +254,38 @@ struct Stats {
     paint: Rc<RefCell<PaintProbe>>,
 }
 
+/// How the window opens, as set in Settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowMode {
+    /// Just the search field until there is something to show: a query, a
+    /// view, or ↓ to see root search's results.
+    Compact,
+    #[default]
+    Expanded,
+}
+
+impl WindowMode {
+    pub fn to_setting(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    pub fn from_setting(text: &str) -> Option<Self> {
+        match text {
+            "compact" => Some(Self::Compact),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
+}
+
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
     search: RootSearch,
-    /// Catalogs still loading.
+    /// Catalogs still loading at startup.
     loading: usize,
     results: Vec<Row>,
     selected: usize,
@@ -219,6 +295,11 @@ pub struct Launcher {
     /// shut down): that item's id and the action's index. Moving the selection
     /// or typing clears it.
     confirming: Option<(String, usize)>,
+    /// The command a `spotlight://` link named, shown alone until Enter.
+    /// Typing or hiding drops it.
+    pending_link: Option<PendingLink>,
+    /// Ids of the items that open from links without asking.
+    trusted_links: HashSet<String>,
     /// A short message in the footer, for actions that keep the window open.
     toast: Option<SharedString>,
     /// Bumped on every toast, so an older toast's timer doesn't clear a newer one.
@@ -248,7 +329,39 @@ pub struct Launcher {
     grid_scroll: UniformListScrollHandle,
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
+    /// Set to tell the live list's search under way that a newer one
+    /// replaced it.
+    live_cancel: Option<Arc<AtomicBool>>,
+    /// Bumped by every live search, so only the newest one's rows are shown.
+    live_generation: u64,
+    /// The window's scale as last seen, for icons that arrive later.
+    window_scale: f32,
+    /// What a root search starts with to search files ("*"); empty: off.
+    file_prefix: String,
+    /// The files found for root search's text after the file prefix.
+    prefix_rows: Vec<SearchItem>,
     visible: bool,
+    window_mode: WindowMode,
+    /// ↓ showed root search's results in compact mode; typing clears it.
+    revealed: bool,
+    /// The window currently has the collapsed (search field only) height.
+    window_collapsed: bool,
+    /// Stays up when it loses focus. For the self-test, which runs beside
+    /// the window that has it.
+    pinned: bool,
+    /// The window that was active when the launcher opened, to paste into
+    /// and read the selected text from.
+    previous_window: isize,
+    /// Whether reading the selected text may fall back to Ctrl+C.
+    selection_copy: bool,
+    /// Expands snippet keywords typed in other apps; `None` until started.
+    expander: Option<expander::Service>,
+    /// Whether keywords expand, as set in Settings (Snippets must be on too).
+    snippet_expansion: bool,
+    /// The clipboard preview's image.
+    preview_image: Option<PreviewImage>,
+    /// Images no longer shown, freed on the next frame (it takes the window).
+    stale_images: Vec<Arc<RenderImage>>,
     stats: Stats,
     _subscriptions: Vec<Subscription>,
 }
@@ -259,6 +372,7 @@ impl Launcher {
         hotkey: SharedString,
         hotkeys: hotkey::Service,
         mut providers: Vec<Arc<dyn Provider>>,
+        disabled_providers: &[String],
         synthetic: usize,
         store: Option<Arc<Mutex<Store>>>,
         smooth_scrolling: bool,
@@ -279,10 +393,11 @@ impl Launcher {
                 |this, _, _: &text_input::Changed, window, cx| this.query_changed(window, cx),
             ),
             cx.observe_window_activation(window, |this, window, cx| {
-                if this.visible && !window.is_window_active() {
+                if this.visible && !this.pinned && !window.is_window_active() {
                     this.hide(cx);
                 }
             }),
+            cx.observe_self(Self::sync_window_height),
         ];
 
         if synthetic > 0 {
@@ -298,6 +413,11 @@ impl Launcher {
                     HashMap::new()
                 })
             })
+            .unwrap_or_default();
+        let trusted_links = store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.setting(links::TRUSTED_SETTING).ok()?)
+            .map(|setting| links::parse_trusted(&setting).collect())
             .unwrap_or_default();
         let (aliases, saved_hotkeys) = store
             .as_ref()
@@ -330,15 +450,25 @@ impl Launcher {
             })
             .collect();
 
+        let mut search = RootSearch::new(providers);
+        for ix in 0..search.providers().len() {
+            let id = search.providers()[ix].id();
+            if disabled_providers.iter().any(|disabled| disabled == id) {
+                search.set_enabled(ix, false);
+            }
+        }
+
         let mut this = Self {
             hwnd,
             input,
-            loading: providers.len(),
-            search: RootSearch::new(providers),
+            loading: 0,
+            search,
             results: Vec::new(),
             selected: 0,
             panel: None,
             confirming: None,
+            pending_link: None,
+            trusted_links,
             toast: None,
             toast_generation: 0,
             hud: None,
@@ -360,7 +490,22 @@ impl Launcher {
             focus: cx.focus_handle(),
             grid_scroll: UniformListScrollHandle::new(),
             list_searcher: Searcher::default(),
+            live_cancel: None,
+            live_generation: 0,
+            window_scale: window.scale_factor(),
+            file_prefix: spotlight_core::file_search::DEFAULT_PREFIX.to_owned(),
+            prefix_rows: Vec::new(),
             visible: false,
+            window_mode: WindowMode::default(),
+            revealed: false,
+            window_collapsed: false,
+            pinned: false,
+            previous_window: 0,
+            selection_copy: true,
+            expander: None,
+            snippet_expansion: true,
+            preview_image: None,
+            stale_images: Vec::new(),
             stats: Stats {
                 hotkey,
                 ..Default::default()
@@ -372,11 +517,16 @@ impl Launcher {
         this
     }
 
-    /// Loads every provider's catalog on its own thread (app discovery takes
-    /// ~200 ms of COM calls) and merges each one into the search as it arrives.
+    /// Loads every turned-on provider's catalog on its own thread (app
+    /// discovery takes ~200 ms of COM calls) and merges each one into the
+    /// search as it arrives.
     fn load_catalogs(&mut self, window_scale: f32, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::unbounded();
         for (ix, provider) in self.search.providers().iter().enumerate() {
+            if !self.search.is_enabled(ix) {
+                continue;
+            }
+            self.loading += 1;
             let provider = provider.clone();
             let tx = tx.clone();
             let spawned = thread::Builder::new()
@@ -395,12 +545,40 @@ impl Launcher {
         cx.spawn(async move |this, cx| {
             while let Ok((ix, items, elapsed)) = rx.recv().await {
                 let updated = this.update(cx, |this, cx| {
+                    this.loading = this.loading.saturating_sub(1);
                     this.catalog_loaded(ix, items, elapsed, window_scale, cx)
                 });
                 if updated.is_err() {
                     return;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Loads one provider's catalog again, after the user changed what it
+    /// lists (a quicklink saved or deleted) or turned it on.
+    fn reload_catalog(&mut self, id: &str, window_scale: f32, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == id)
+        else {
+            return;
+        };
+        let provider = self.search.providers()[ix].clone();
+        let load = cx.background_executor().spawn(async move {
+            let started = Instant::now();
+            let items = provider.catalog();
+            (items, started.elapsed())
+        });
+        cx.spawn(async move |this, cx| {
+            let (items, elapsed) = load.await;
+            this.update(cx, |this, cx| {
+                this.catalog_loaded(ix, items, elapsed, window_scale, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -414,6 +592,10 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) {
         let id = self.search.providers()[provider].id();
+        if !self.search.is_enabled(provider) {
+            eprintln!("[spotlight] {id}: turned off while loading; catalog dropped");
+            return;
+        }
         eprintln!(
             "[spotlight] {id}: {} items in {:.1} ms",
             items.len(),
@@ -429,10 +611,10 @@ impl Launcher {
             .collect();
 
         self.search.set_catalog(provider, items);
-        self.loading = self.loading.saturating_sub(1);
         // Catalog indices moved, so the rows are rebuilt (and the selection resets).
         let query = self.query(cx);
         self.refilter(&query);
+        self.pin_pending_link();
         self.load_icons(shell_icons, window_scale, cx);
         cx.notify();
     }
@@ -489,9 +671,123 @@ impl Launcher {
         .detach();
     }
 
+    /// Every search provider, in search order, for the settings window.
+    pub fn sources(&self) -> Vec<Source> {
+        self.search
+            .providers()
+            .iter()
+            .enumerate()
+            .map(|(ix, provider)| Source {
+                id: provider.id(),
+                name: provider.name(),
+                description: provider.description(),
+                enabled: self.search.is_enabled(ix),
+            })
+            .collect()
+    }
+
+    /// The ids of the providers that are turned off, for saving.
+    pub fn disabled_providers(&self) -> Vec<&'static str> {
+        self.sources()
+            .into_iter()
+            .filter(|source| !source.enabled)
+            .map(|source| source.id)
+            .collect()
+    }
+
+    /// Turns provider `id` on (loading its catalog again) or off (dropping it).
+    pub fn set_provider_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == id)
+        else {
+            return;
+        };
+        if self.search.is_enabled(ix) == enabled {
+            return;
+        }
+        self.search.set_enabled(ix, enabled);
+        if enabled {
+            self.reload_catalog(id, window.scale_factor(), cx);
+        }
+        if id == snippets::PROVIDER {
+            self.sync_expander();
+        }
+        // Catalog indices moved (or answers changed), so the rows are rebuilt.
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+    }
+
     pub fn set_smooth_scrolling(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.scroll.set_enabled(enabled);
+        self.set_detail_smooth_scrolling(enabled);
         cx.notify();
+    }
+
+    pub fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
+        self.window_mode = mode;
+        if !self.visible && self.hud.is_none() {
+            self.prepare_next_show(cx);
+        }
+        cx.notify();
+    }
+
+    /// In compact mode, the window shows only the search field: root search
+    /// with nothing typed, and nothing asked for with ↓ or Ctrl+K.
+    fn collapsed(&self, cx: &App) -> bool {
+        self.window_mode == WindowMode::Compact
+            && !self.revealed
+            && self.screens.is_empty()
+            && self.panel.is_none()
+            && self.editor.is_none()
+            // A link's command waits on its row for Enter.
+            && self.pending_link.is_none()
+            && self.input.read(cx).text().is_empty()
+    }
+
+    /// Grows or shrinks the window when [`Self::collapsed`] changes; runs
+    /// after every notify.
+    fn sync_window_height(&mut self, cx: &mut Context<Self>) {
+        let collapsed = self.collapsed(cx);
+        if !self.visible || self.hud.is_some() || collapsed == self.window_collapsed {
+            return;
+        }
+        self.window_collapsed = collapsed;
+        self.resize_window(cx);
+        cx.notify();
+    }
+
+    /// Gives the window the size `window_collapsed` says, from a task of its
+    /// own (see [`win::resize`]). Read when it runs: the HUD may have taken
+    /// the window meanwhile, and keeps its own size.
+    fn resize_window(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let target = this.read_with(cx, |this, _| {
+                this.hud
+                    .is_none()
+                    .then_some((this.hwnd, this.window_collapsed))
+            });
+            if let Ok(Some((hwnd, collapsed))) = target {
+                win::resize(hwnd, WINDOW_SIZE, collapsed.then_some(COMPACT_HEIGHT));
+            }
+        })
+        .detach();
+    }
+
+    /// While hidden, the window takes the size it opens with next, so that
+    /// `show` doesn't change it (GPUI would miss that).
+    fn prepare_next_show(&mut self, cx: &mut Context<Self>) {
+        self.window_collapsed = self.window_mode == WindowMode::Compact;
+        self.resize_window(cx);
     }
 
     /// Shown in the footer.
@@ -517,14 +813,47 @@ impl Launcher {
             aliases,
             ..
         } = self;
+        let after_prefix = file_query(&self.file_prefix, query).filter(|_| {
+            search
+                .providers()
+                .iter()
+                .position(|provider| provider.id() == FILES_PROVIDER)
+                .is_some_and(|ix| search.is_enabled(ix))
+        });
         self.results = match screens.last() {
+            // Files only, from the files provider (see `search_prefix`), and
+            // a row to go on in Search Files: first while nothing follows
+            // the prefix, so Enter opens it.
+            None if let Some(rest) = after_prefix => {
+                let open = Row::Computed(files_hint(rest));
+                let found = self.prefix_rows.iter().cloned().map(Row::Computed);
+                if rest.trim().is_empty() {
+                    std::iter::once(open).chain(found).collect()
+                } else {
+                    found.chain(std::iter::once(open)).collect()
+                }
+            }
             None => search.search(
                 query,
                 |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
                 aliases,
             ),
-            Some(Screen::List { view, .. }) => {
-                let candidates = view.items.iter().map(|item| Candidate {
+            // The provider ranked them for this query (or is about to).
+            Some(Screen::List { view, .. }) if view.live => view
+                .items
+                .iter()
+                .map(|item| Row::Computed(item.clone()))
+                .collect(),
+            Some(Screen::List { view, filter, .. }) => {
+                let shown: Vec<&SearchItem> = match view.filters.get(*filter) {
+                    Some(filter) => view
+                        .items
+                        .iter()
+                        .filter(|item| filter.keeps(item))
+                        .collect(),
+                    None => view.items.iter().collect(),
+                };
+                let candidates = shown.iter().map(|item| Candidate {
                     title: &item.title,
                     keywords: &item.keywords,
                     alias: None,
@@ -533,7 +862,7 @@ impl Launcher {
                 list_searcher
                     .filter(query, candidates)
                     .into_iter()
-                    .map(|ix| Row::Computed(view.items[ix].clone()))
+                    .map(|ix| Row::Computed(shown[ix].clone()))
                     .collect()
             }
             Some(_) => Vec::new(),
@@ -576,6 +905,18 @@ impl Launcher {
         if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
             return entries;
         }
+        if self.link_pending_for(&item.id) {
+            return vec![
+                Entry {
+                    title: "Open Command".into(),
+                    kind: EntryKind::OpenLink { always: false },
+                },
+                Entry {
+                    title: "Always Open Command".into(),
+                    kind: EntryKind::OpenLink { always: true },
+                },
+            ];
+        }
         let mut add = |title: &str, kind| {
             entries.push(Entry {
                 title: title.to_owned(),
@@ -597,6 +938,10 @@ impl Launcher {
         if self.frecency.contains_key(&item.id) {
             add("Reset Ranking", EntryKind::ResetRanking);
         }
+        add("Copy Deeplink", EntryKind::CopyDeeplink);
+        if self.trusted_links.contains(&item.id) {
+            add("Ask Before Opening from Links", EntryKind::DistrustLink);
+        }
         entries
     }
 
@@ -607,9 +952,14 @@ impl Launcher {
         }
     }
 
-    fn query_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changed_at = Instant::now();
         let query = self.query(cx);
+        self.revealed = false;
+        self.pending_link = None;
+        self.window_scale = window.scale_factor();
+        self.search_live(cx);
+        self.search_prefix(cx);
         let filter_ms = self.refilter(&query);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
@@ -618,11 +968,14 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
-    /// Types into the field that has the keyboard: the alias editor's while it's open.
+    /// Types into the field that has the keyboard: the alias editor's while
+    /// it's open, or a form's focused text field.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let input = match &self.editor {
             Some(Editor::Alias { input, .. }) => input.clone(),
-            _ => self.input.clone(),
+            _ => self
+                .focused_form_input(window, cx)
+                .unwrap_or_else(|| self.input.clone()),
         };
         input.update(cx, |input, cx| {
             input.replace_text_in_range(None, text, window, cx)
@@ -665,6 +1018,11 @@ impl Launcher {
         )
     }
 
+    /// Keeps the window up when it loses focus. For the self-test.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -699,7 +1057,17 @@ impl Launcher {
         }
     }
 
+    /// The window that was in front before the launcher, which pastes go
+    /// to. For the self-test.
+    pub fn previous_window(&self) -> isize {
+        self.previous_window
+    }
+
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        let foreground = system_clipboard::foreground_window();
+        if foreground != self.hwnd {
+            self.previous_window = foreground;
+        }
         self.hud = None;
         if !self.screens.is_empty() {
             self.screens.clear();
@@ -710,9 +1078,15 @@ impl Launcher {
         }
         self.input.update(cx, |input, cx| input.clear(cx));
         self.stats.filter_ms = Some(self.refilter(""));
+        self.revealed = false;
+        self.window_collapsed = self.collapsed(cx);
         // Explicit size: with `show: false` GPUI defers its own placement to
         // `activate()`, which we bypass, so the window would keep CW_USEDEFAULT.
-        win::show_on_active_monitor(self.hwnd, Some(WINDOW_SIZE));
+        win::show_on_active_monitor(
+            self.hwnd,
+            Some(WINDOW_SIZE),
+            self.window_collapsed.then_some(COMPACT_HEIGHT),
+        );
         self.visible = true;
         window.focus(&self.input.focus_handle(cx));
 
@@ -737,9 +1111,12 @@ impl Launcher {
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.pending_link = None;
         self.close_editor(None, cx);
+        self.forget_preview_image();
         win::hide(self.hwnd);
         self.visible = false;
+        self.prepare_next_show(cx);
         cx.notify();
     }
 
@@ -747,6 +1124,11 @@ impl Launcher {
         if let Some(action) = self.panel {
             let count = self.selected_actions().len();
             self.panel = Some((action + 1).min(count.saturating_sub(1)));
+            cx.notify();
+            return;
+        }
+        if self.collapsed(cx) {
+            self.revealed = true;
             cx.notify();
             return;
         }
@@ -812,13 +1194,24 @@ impl Launcher {
         self.grid_move(1, cx);
     }
 
+    /// Tab: the next form field, or the next choice of a list's filter.
     fn focus_next_field(
         &mut self,
         _: &FocusNextField,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_field(true, window, cx);
+        // After the file prefix, Tab goes on in Search Files.
+        if self.screens.is_empty() {
+            let query = self.query(cx);
+            if let Some(rest) = file_query(&self.file_prefix, &query) {
+                let open = files_hint(rest).actions[0].command.clone();
+                return self.perform(&open, window, cx);
+            }
+        }
+        if !self.step_filter(true, cx) {
+            self.focus_field(true, window, cx);
+        }
     }
 
     fn focus_prev_field(
@@ -827,7 +1220,9 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_field(false, window, cx);
+        if !self.step_filter(false, cx) {
+            self.focus_field(false, window, cx);
+        }
     }
 
     fn next_choice(&mut self, _: &NextChoice, window: &mut Window, cx: &mut Context<Self>) {
@@ -845,6 +1240,10 @@ impl Launcher {
     /// Enter: saves the alias being edited, or runs the action picked in the
     /// panel, the one waiting for a second Enter, or the primary action.
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing is selected that the user can see.
+        if self.collapsed(cx) {
+            return;
+        }
         match &self.editor {
             Some(Editor::Alias { .. }) => return self.save_alias(window, cx),
             // The recorder hook takes every key; Enter can't arrive, but just in case.
@@ -876,16 +1275,23 @@ impl Launcher {
         }
     }
 
-    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…).
+    /// Ctrl+Enter: the second action (Run as Administrator, Copy Calculation…),
+    /// or a form's submit.
     fn secondary_action(
         &mut self,
         _: &SecondaryAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.panel.is_none() && self.editor.is_none() {
-            self.run_action(1, window, cx);
+        if self.panel.is_some() || self.editor.is_some() || self.collapsed(cx) {
+            return;
         }
+        // A form's submit: Enter can't be it in a text area, where it starts
+        // a new line.
+        if matches!(self.screens.last(), Some(Screen::Form(_))) {
+            return self.submit_form(window, cx);
+        }
+        self.run_action(1, window, cx);
     }
 
     fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
@@ -962,6 +1368,18 @@ impl Launcher {
                 return self.delete_calculation(calculation, cx);
             }
             EntryKind::ClearCalculations => return self.clear_calculations(cx),
+            EntryKind::OpenLink { always } => return self.open_pending_link(always, window, cx),
+            EntryKind::CopyDeeplink => {
+                return self.run_command(&Command::Copy(deeplink::for_item(&id)), cx);
+            }
+            EntryKind::DistrustLink => {
+                self.distrust_link(&id, cx);
+                self.show_toast(
+                    format!("{title} will ask before opening from links").into(),
+                    cx,
+                );
+                return;
+            }
         };
         // Using an answer keeps it; using a history entry moves it to the top.
         if id == CALC_ANSWER_ID {
@@ -974,7 +1392,23 @@ impl Launcher {
         // remembering, also when they're used from a list (Browse Apps).
         let ranked = matches!(row, Row::Catalog(_))
             || self.search.catalog().iter().any(|item| item.id == id);
-        if ranked {
+        let edits = matches!(
+            command,
+            Command::SaveQuicklink(_)
+                | Command::DeleteQuicklink(_)
+                | Command::SaveSnippet(_)
+                | Command::DeleteSnippet(_)
+                | Command::Complete(_)
+                | Command::ProviderAction { .. }
+        );
+        if !edits && !ranked {
+            // Item ids start with their provider's id.
+            let owner = id.split(':').next().unwrap_or_default();
+            if let Some(provider) = self.search.providers().iter().find(|p| p.id() == owner) {
+                provider.opened(&id);
+            }
+        }
+        if ranked && !edits {
             self.record_visit(id, cx);
         }
         self.perform(&command, window, cx);
@@ -982,11 +1416,123 @@ impl Launcher {
 
     /// Opens a view, or carries out the command and hides the window.
     fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        if command.needs_selection() {
+            return self.run_with_selection(command.clone(), cx);
+        }
         match command {
             Command::PushView(view) => self.push_view((**view).clone(), window, cx),
             Command::OpenCalculatorHistory => self.open_calculator_history(window, cx),
+            Command::SaveQuicklink(link) => self.save_quicklink(link.clone(), window, cx),
+            Command::DeleteQuicklink(id) => self.delete_quicklink(*id, window, cx),
+            Command::SaveSnippet(snippet) => self.save_snippet(snippet.clone(), window, cx),
+            Command::DeleteSnippet(id) => self.delete_snippet(*id, window, cx),
+            Command::PasteSnippet { text, paste } => self.paste_snippet(text, *paste, cx),
+            Command::ImportSnippets => self.import_snippets(cx),
+            Command::ExportSnippets => self.export_snippets(cx),
+            Command::OpenProviderView { provider, view } => {
+                self.open_provider_view(provider, view, window, cx)
+            }
+            Command::SearchIn {
+                provider,
+                view,
+                query,
+            } => {
+                self.open_provider_view(provider, view, window, cx);
+                if !query.is_empty() {
+                    self.input
+                        .update(cx, |input, cx| input.type_over(query.clone(), cx));
+                }
+            }
+            Command::Complete(text) => self.complete(text.clone(), window, cx),
+            Command::ProviderAction {
+                provider,
+                action,
+                item,
+            } => self.provider_action(provider, action, item, cx),
+            Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
+            Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
+            Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
+            Command::ClearClipboardHistory => self.clear_clips(window, cx),
+            Command::IgnoreClipApp(app) => self.ignore_clip_app(app.clone(), cx),
             command => self.run_command(command, cx),
         }
+    }
+
+    /// Asks `provider` for its view `id` and opens it.
+    fn open_provider_view(
+        &mut self,
+        provider: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .and_then(|provider| provider.view(id));
+        match view {
+            Some(view) => {
+                self.push_view(view, window, cx);
+                if let Some(Screen::List { origin, .. }) = self.screens.last_mut() {
+                    *origin = Some((provider.to_owned(), id.to_owned()));
+                }
+                // A live list's rows come from a background search.
+                self.search_live(cx);
+            }
+            None => {
+                eprintln!("[spotlight] {provider} has no view {id:?}");
+                self.show_toast("Nothing to show".into(), cx);
+            }
+        }
+    }
+
+    /// Has `provider` do `action` to row `item` in the background, then says
+    /// how it went and searches again, so the row shows what it did (an
+    /// excluded file is gone).
+    fn provider_action(
+        &mut self,
+        provider: &str,
+        action: &str,
+        item: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .cloned()
+        else {
+            return;
+        };
+        let (action, item) = (action.to_owned(), item.to_owned());
+        let outcome = cx
+            .background_executor()
+            .spawn(async move { provider.act(&action, &item) });
+        cx.spawn(async move |this, cx| {
+            let message = match outcome.await {
+                Ok(message) | Err(message) => message,
+            };
+            this.update(cx, |this, cx| {
+                this.show_toast(message.into(), cx);
+                this.search_live(cx);
+                this.search_prefix(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Back to root search with `text` in the field, as if typed.
+    fn complete(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.screens.is_empty() {
+            self.screens.clear();
+            self.enter_screen(window, cx);
+        }
+        self.input.update(cx, |input, cx| input.type_over(text, cx));
+        window.focus(&self.input.focus_handle(cx));
     }
 
     /// Carries out `command`, hides the window, and shows a HUD where the
@@ -998,12 +1544,78 @@ impl Launcher {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
+            Command::CopyFile(path) => {
+                let content = system_clipboard::Content::Files(vec![path.clone()]);
+                hud = Some(match system_clipboard::write(self.hwnd, &content) {
+                    Ok(()) => "Copied to Clipboard".into(),
+                    Err(err) => err.into(),
+                });
+            }
+            // Hidden first, so it doesn't take the foreground back from a
+            // window just brought up, and Windows doesn't activate another.
+            Command::Window { target, command } => {
+                let target = target.unwrap_or(self.previous_window);
+                self.hide(cx);
+                return self.run_in_background(
+                    Command::Window {
+                        target: Some(target),
+                        command: *command,
+                    },
+                    cx,
+                );
+            }
             command => self.run_in_background(command.clone(), cx),
         }
         self.hide(cx);
         if let Some(text) = hud {
             self.show_hud(text, cx);
         }
+    }
+
+    /// Reads the text selected in the app the launcher came from, then runs
+    /// `command` with it. The launcher hides first: the app has to be in
+    /// front for its selection to be read.
+    fn run_with_selection(&mut self, command: Command, cx: &mut Context<Self>) {
+        let provider = self
+            .search
+            .providers()
+            .iter()
+            .position(|provider| provider.id() == SELECTION_PROVIDER);
+        if !provider.is_some_and(|ix| self.search.is_enabled(ix)) {
+            self.hide(cx);
+            self.show_hud("Selected Text is turned off in Settings".into(), cx);
+            return;
+        }
+        let outcome = selection::spawn(self.previous_window, self.hwnd, self.selection_copy);
+        self.hide(cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = outcome
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("Couldn't read the selection".into()));
+            this.update(cx, |this, cx| match outcome {
+                Ok(Some(text)) => this.run_command(&command.with_selection(&text), cx),
+                Ok(None) => this.show_hud("No text selected".into(), cx),
+                Err(err) => this.show_hud(err.into(), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Lets reading the selected text use Ctrl+C when an app doesn't share it.
+    /// What a root search starts with to search files; empty turns it off.
+    pub fn set_file_prefix(&mut self, prefix: String) {
+        self.file_prefix = prefix;
+    }
+
+    pub fn set_selection_copy(&mut self, enabled: bool) {
+        self.selection_copy = enabled;
+    }
+
+    /// Loads provider `id`'s catalog again (its items depend on a setting).
+    pub fn reload_provider(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_catalog(id, window.scale_factor(), cx);
     }
 
     /// Runs a command in the background and shows what it reports
@@ -1034,12 +1646,52 @@ impl Launcher {
     /// the launcher on just that item instead, waiting for Enter.
     pub fn run_by_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.search.catalog().iter().position(|item| item.id == id) else {
-            eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)");
+            // Item ids start with their provider's id.
+            let provider = id.split(':').next().unwrap_or_default();
+            let off = self
+                .sources()
+                .into_iter()
+                .find(|source| source.id == provider && !source.enabled);
+            match off {
+                Some(source) => self.show_hud(
+                    format!("{} is turned off in Settings", source.name).into(),
+                    cx,
+                ),
+                None => eprintln!("[spotlight] hotkey for {id:?}, which isn't loaded (yet)"),
+            }
             return;
         };
         let Some(action) = self.search.catalog()[ix].primary_action().cloned() else {
             return;
         };
+        // Commands that open a view (Clipboard History) open the launcher on
+        // it; pressed again while that view is up, the launcher closes.
+        if matches!(
+            action.command,
+            Command::PushView(_)
+                | Command::OpenProviderView { .. }
+                | Command::OpenCalculatorHistory
+        ) {
+            let title = &self.search.catalog()[ix].title;
+            if self.visible && self.screen_title().as_ref() == Some(title) {
+                self.hide(cx);
+                return;
+            }
+            self.show(Instant::now(), window, cx);
+            self.record_visit(id.to_owned(), cx);
+            self.perform(&action.command, window, cx);
+            return;
+        }
+        if matches!(action.command, Command::Window { target: None, .. }) {
+            // The hotkey was pressed in the window it's for.
+            self.previous_window = system_clipboard::foreground_window();
+        }
+        if action.command.needs_selection() {
+            // The hotkey was pressed in the app whose selection it's for.
+            self.previous_window = system_clipboard::foreground_window();
+            self.record_visit(id.to_owned(), cx);
+            return self.run_with_selection(action.command, cx);
+        }
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);
             self.results = vec![Row::Catalog(ix)];
@@ -1163,6 +1815,34 @@ impl Launcher {
             .collect();
         shortcuts.sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
         shortcuts
+    }
+
+    /// Every item that can take an alias or a hotkey (the ones that do
+    /// something), by title. A provider that is off has none loaded.
+    pub fn extension_items(&self) -> Vec<ExtensionItem> {
+        let mut items: Vec<ExtensionItem> = self
+            .search
+            .catalog()
+            .iter()
+            .filter(|item| !item.actions.is_empty())
+            .map(|item| ExtensionItem {
+                provider: item.id.split(':').next().unwrap_or_default().to_owned(),
+                shortcut: Shortcut {
+                    item_id: item.id.clone(),
+                    title: item.title.clone(),
+                    alias: self.aliases.get(&item.id).cloned(),
+                    hotkey: self.item_hotkeys.get(&item.id).copied(),
+                },
+                subtitle: item.subtitle.clone(),
+                image: self.icons.get(&item.id).cloned(),
+                glyph: match item.icon {
+                    Icon::Glyph(glyph) => Some(glyph),
+                    _ => None,
+                },
+            })
+            .collect();
+        items.sort_by_cached_key(|item| item.shortcut.title.to_lowercase());
+        items
     }
 
     fn set_alias(&mut self, item_id: &str, alias: Option<String>, cx: &mut Context<Self>) {
@@ -1314,6 +1994,7 @@ impl Launcher {
             this.update(cx, |this, cx| {
                 if this.hud_generation == generation && this.hud.take().is_some() {
                     win::hide(this.hwnd);
+                    this.prepare_next_show(cx);
                     cx.notify();
                 }
             })
@@ -1393,7 +2074,8 @@ impl Launcher {
     }
 
     /// Esc closes the alias editor or the action panel first, then goes back
-    /// from an opened list to root search, then hides the window.
+    /// from an opened list to root search, then collapses compact mode's
+    /// results shown with ↓, then hides the window.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             self.close_editor(Some(window), cx);
@@ -1401,6 +2083,9 @@ impl Launcher {
             cx.notify();
         } else if !self.screens.is_empty() {
             self.pop_screen(window, cx);
+        } else if self.revealed && self.query(cx).is_empty() {
+            self.revealed = false;
+            cx.notify();
         } else {
             self.hide(cx);
         }
@@ -1427,6 +2112,8 @@ impl Launcher {
                 .map(|calculation| history_item(calculation, now))
                 .collect(),
             empty: Some("No calculations yet. Copy a calculator answer to keep it here.".into()),
+            filters: Vec::new(),
+            live: false,
         };
         self.push_view(View::List(list), window, cx);
     }
@@ -1505,9 +2192,12 @@ impl Launcher {
                 .is_some_and(|(id, _)| id == &item.id);
         let subtitle: SharedString = if confirming {
             "Press Enter again to confirm".into()
+        } else if selected && self.link_pending_for(&item.id) {
+            "Opened from a link · Enter to open".into()
         } else {
             item.subtitle.clone().unwrap_or_default().into()
         };
+        let stacked = !subtitle.is_empty() && self.shows_previews(cx);
 
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
@@ -1533,12 +2223,44 @@ impl Launcher {
                     this.confirm(&Confirm, window, cx);
                 }))
                 .child(self.render_icon(item))
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .child(SharedString::from(item.title.clone())),
-                )
+                .when(stacked, |row| {
+                    // Beside a preview the list is narrow: the name gets the
+                    // whole width, what's after it goes underneath.
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .line_height(px(17.))
+                                    .child(SharedString::from(item.title.clone())),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .line_height(px(15.))
+                                    .text_color(if confirming {
+                                        rgba(theme::ERROR)
+                                    } else {
+                                        rgba(0xffffff70)
+                                    })
+                                    .child(subtitle.clone()),
+                            ),
+                    )
+                })
+                .when(!stacked, |row| {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(item.title.clone())),
+                    )
+                })
                 .when_some(self.aliases.get(&item.id), |row, alias| {
                     row.child(
                         div()
@@ -1555,17 +2277,19 @@ impl Launcher {
                 .when_some(self.item_hotkeys.get(&item.id), |row, hotkey| {
                     row.child(keycaps(&hotkey_keys(*hotkey)))
                 })
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(if confirming {
-                            rgba(theme::ERROR)
-                        } else {
-                            rgba(0xffffff70)
-                        })
-                        .child(subtitle),
-                ),
+                .when(!stacked, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(if confirming {
+                                rgba(theme::ERROR)
+                            } else {
+                                rgba(0xffffff70)
+                            })
+                            .child(subtitle),
+                    )
+                }),
         )
     }
 
@@ -1754,13 +2478,18 @@ impl Launcher {
 
     /// Right side of the footer: what Enter does, and how to see the rest.
     fn footer_hints(&self) -> impl IntoElement {
-        let primary = match self.screens.last() {
-            Some(Screen::Form(form)) => Some(SharedString::from(form.view.submit_title.clone())),
-            _ => self
-                .selected_actions()
-                .into_iter()
-                .next()
-                .map(|action| SharedString::from(action.title)),
+        let (primary, primary_keys) = match self.screens.last() {
+            Some(Screen::Form(form)) => (
+                Some(SharedString::from(form.view.submit_title.clone())),
+                form.submit_keys(),
+            ),
+            _ => (
+                self.selected_actions()
+                    .into_iter()
+                    .next()
+                    .map(|action| SharedString::from(action.title)),
+                "Enter",
+            ),
         };
         let has_actions = !self.selected_actions().is_empty();
         div()
@@ -1776,7 +2505,7 @@ impl Launcher {
                             .items_center()
                             .gap_1()
                             .child(div().text_color(rgba(theme::TEXT)).child(primary))
-                            .child(keycaps("Enter")),
+                            .child(keycaps(primary_keys)),
                     )
                     .when(has_actions, |hints| {
                         hints.child(
@@ -1789,6 +2518,28 @@ impl Launcher {
                         )
                     })
             })
+    }
+
+    fn render_footer(&self) -> impl IntoElement {
+        div()
+            .h(px(30.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_4()
+            .bg(rgba(0x00000033))
+            .text_size(px(11.))
+            .text_color(rgba(0xffffff80))
+            .child(match &self.toast {
+                Some(toast) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgba(theme::SUCCESS))
+                    .child(toast.clone()),
+                None => div().flex_1().min_w_0().truncate().child(self.footer()),
+            })
+            .child(self.footer_hints())
     }
 
     /// Paint-probe values here lag one frame (they are recorded while painting).
@@ -1837,7 +2588,11 @@ impl Render for Launcher {
                 .child(div().truncate().child(text.clone()))
                 .into_any_element();
         }
-        if self.scroll.tick() {
+        self.drop_stale_images(window);
+        let collapsed = self.window_collapsed;
+        // Both run, so neither waits on the other's frame.
+        let detail_moving = self.tick_detail_scroll();
+        if self.scroll.tick() || detail_moving {
             window.request_animation_frame();
         }
 
@@ -1871,40 +2626,15 @@ impl Render for Launcher {
             .size_full()
             .py(px(LIST_PADDING));
 
-            // Wheel notches are taken before the list sees them (capture phase)
-            // and animated instead; everything else falls through to GPUI.
-            let this = cx.entity().downgrade();
-            let wheel = canvas(
-                |_, _, _| {},
-                move |bounds, _, window, _| {
-                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Capture
-                            || !bounds.contains(&event.position)
-                            || !matches!(event.delta, ScrollDelta::Lines(_))
-                        {
-                            return;
-                        }
-                        let delta = event.delta.pixel_delta(window.line_height()).y;
-                        let handled = this
-                            .update(cx, |this, cx| {
-                                if !this.scroll.is_enabled() {
-                                    return false;
-                                }
-                                this.scroll.scroll_by(delta, this.results.len());
-                                cx.notify();
-                                true
-                            })
-                            .unwrap_or(false);
-                        if handled {
-                            cx.stop_propagation();
-                        }
-                    });
-                },
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full();
+            // Wheel notches are animated instead; everything else falls through to GPUI.
+            let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Self, delta, cx| {
+                if !this.scroll.is_enabled() {
+                    return false;
+                }
+                this.scroll.scroll_by(delta, this.results.len());
+                cx.notify();
+                true
+            });
 
             div()
                 .flex_1()
@@ -1912,6 +2642,27 @@ impl Render for Launcher {
                 .child(list)
                 .child(wheel)
                 .into_any_element()
+        };
+        // Lists with previews (clipboard history): rows on the left, the
+        // selected row's preview on the right.
+        let results = if self.shows_previews(cx) {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(PREVIEW_LIST_WIDTH))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(results),
+                )
+                .child(self.render_preview(cx))
+                .into_any_element()
+        } else {
+            results
         };
 
         let paint = self.stats.paint.clone();
@@ -1982,32 +2733,38 @@ impl Render for Launcher {
                                         .child(SharedString::from(screen.title().to_owned())),
                                 )
                             })
-                            .child(div().flex_1().min_w_0().child(self.input.clone())),
+                            .child(div().flex_1().min_w_0().child(self.input.clone()))
+                            .when_some(self.filter_label(), |row, label| {
+                                row.child(
+                                    div()
+                                        .id("filter")
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_2()
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(rgba(theme::SURFACE_BORDER))
+                                        .text_size(px(12.))
+                                        .line_height(px(22.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.step_filter(true, cx);
+                                        }))
+                                        .child(label)
+                                        .child(keycaps("Tab")),
+                                )
+                            }),
                     }),
             )
-            .child(div().h(px(1.)).bg(rgba(0xffffff14)))
-            .child(results)
-            .child(
-                div()
-                    .h(px(30.))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .bg(rgba(0x00000033))
-                    .text_size(px(11.))
-                    .text_color(rgba(0xffffff80))
-                    .child(match &self.toast {
-                        Some(toast) => div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(rgba(theme::SUCCESS))
-                            .child(toast.clone()),
-                        None => div().flex_1().min_w_0().truncate().child(self.footer()),
-                    })
-                    .child(self.footer_hints()),
-            )
+            .when(!collapsed, |root| {
+                root.child(div().h(px(1.)).bg(rgba(0xffffff14)))
+                    .child(results)
+                    .child(self.render_footer())
+            })
             .when_some(self.panel, |root, selected| {
                 root.child(self.render_panel(selected, cx))
             })
@@ -2026,6 +2783,35 @@ impl Render for Launcher {
 
 /// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
 /// contain `+` (the plus key displays as `=`, the same key).
+/// The text after `prefix` when `query` starts with it.
+fn file_query<'a>(prefix: &str, query: &'a str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return None;
+    }
+    query.trim_start().strip_prefix(prefix)
+}
+
+/// The row that goes on in Search Files with `rest` typed.
+fn files_hint(rest: &str) -> SearchItem {
+    let rest = rest.trim();
+    let title = if rest.is_empty() {
+        "Search Files".to_owned()
+    } else {
+        format!("Search Files for “{rest}”")
+    };
+    SearchItem::new(item_id("spotlight", "files-prefix"), title)
+        .subtitle("Tab")
+        .icon(Icon::Glyph('\u{E721}'))
+        .action(
+            "Search Files",
+            Command::SearchIn {
+                provider: FILES_PROVIDER.into(),
+                view: FILES_VIEW.into(),
+                query: rest.to_owned(),
+            },
+        )
+}
+
 fn hotkey_keys(hotkey: Hotkey) -> String {
     hotkey.to_string().replace('+', " ")
 }
@@ -2094,7 +2880,7 @@ fn shell_name(icon: &Icon) -> Option<String> {
 }
 
 /// Windows 11's icon font, or its Windows 10 predecessor (same code points).
-fn icon_font() -> &'static str {
+pub(crate) fn icon_font() -> &'static str {
     static FONT: OnceLock<&'static str> = OnceLock::new();
     FONT.get_or_init(|| {
         let windows =

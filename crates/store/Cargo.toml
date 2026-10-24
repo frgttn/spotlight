@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-store"
-description = "SQLite persistence for Spotlight: settings and frecency"
+description = "SQLite persistence for Spotlight: settings, frecency, quicklinks, clipboard history"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

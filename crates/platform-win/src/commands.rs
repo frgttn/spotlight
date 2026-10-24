@@ -1,22 +1,32 @@
-//! Runs the [`Command`]s that search items carry, except `Copy` (the UI
-//! framework owns the clipboard) and the ones that open views, which the UI
-//! handles.
+//! Runs the [`Command`]s that search items carry, except `Copy` and the
+//! clipboard history's (the UI owns the clipboard and the database) and the
+//! ones that open views, which the UI handles.
 
 use std::{os::windows::process::CommandExt, process, thread};
 
-use spotlight_core::item::Command;
+use spotlight_core::{item::Command, quicklink};
 use windows::{
     Win32::{
         System::{
             Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
-            Threading::CREATE_NO_WINDOW,
+            Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW},
         },
-        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        UI::{
+            Shell::{
+                FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+                SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
     },
     core::{HSTRING, PCWSTR},
 };
 
-use crate::system::{self, Outcome};
+use crate::{
+    links,
+    system::{self, Outcome},
+    wm,
+};
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
 /// program, so anything else is refused.
@@ -72,6 +82,13 @@ fn run_blocking(command: &Command) -> Outcome {
                 .map(|_| None)
                 .map_err(|err| format!("Couldn't open Explorer: {err}"))
         }
+        Command::OpenWith(path) => process::Command::new("rundll32.exe")
+            .raw_arg(format!("shell32.dll,OpenAs_RunDLL {path}"))
+            .spawn()
+            .map(|_| None)
+            .map_err(|err| format!("Couldn't ask which app to use: {err}")),
+        Command::MoveToTrash(path) => move_to_trash(path),
+        Command::OpenTerminal(dir) => open_terminal(dir),
         Command::OpenUrl(url) => {
             let lower = url.to_ascii_lowercase();
             if URL_SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
@@ -80,22 +97,71 @@ fn run_blocking(command: &Command) -> Outcome {
                 Err(format!("Not a web address: {url}"))
             }
         }
-        Command::Copy(_) | Command::OpenCalculatorHistory | Command::PushView(_) => {
-            Err(format!("{command:?} must be handled by the UI"))
+        Command::OpenQuicklink { link, app } => {
+            let link = quicklink::expand_moment(link.trim(), &links::moment());
+            // Paths can use `%USERPROFILE%`; URLs keep their `%20`s.
+            let link = if quicklink::is_url(&link) {
+                link
+            } else {
+                links::expand_env(&link)
+            };
+            match app {
+                Some(app) => shell_execute_with("open", app, &format!("\"{link}\"")),
+                None => shell_execute("open", &link),
+            }
         }
+        Command::Copy(_)
+        | Command::CopyFile(_)
+        | Command::OpenCalculatorHistory
+        | Command::PushView(_)
+        | Command::SaveQuicklink(_)
+        | Command::DeleteQuicklink(_)
+        | Command::SaveSnippet(_)
+        | Command::DeleteSnippet(_)
+        | Command::PasteSnippet { .. }
+        | Command::ImportSnippets
+        | Command::ExportSnippets
+        | Command::OpenProviderView { .. }
+        | Command::SearchIn { .. }
+        | Command::ProviderAction { .. }
+        | Command::RestoreClip { .. }
+        | Command::PinClip { .. }
+        | Command::DeleteClip(_)
+        | Command::ClearClipboardHistory
+        | Command::IgnoreClipApp(_)
+        | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
+        Command::Window {
+            target: Some(target),
+            command,
+        } => wm::run(*target, *command),
+        Command::Window { target: None, .. } => {
+            Err("No window to arrange: the UI fills in the target".into())
+        }
+        Command::QuitApp(pid) => wm::quit_app(*pid),
+        Command::ForceQuit(pid) => wm::force_quit(*pid),
     }
 }
 
 /// `ShellExecute` with `verb`, blocking.
 fn shell_execute(verb: &str, target: &str) -> Outcome {
+    shell_execute_with(verb, target, "")
+}
+
+/// `ShellExecute` with `verb` and command-line `parameters` for a program, blocking.
+fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
+    let parameters = HSTRING::from(parameters);
     let code = unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(
             None,
             &HSTRING::from(verb),
             &HSTRING::from(target),
-            PCWSTR::null(),
+            if parameters.is_empty() {
+                PCWSTR::null()
+            } else {
+                PCWSTR(parameters.as_ptr())
+            },
             PCWSTR::null(),
             SW_SHOWNORMAL,
         )
@@ -115,9 +181,59 @@ fn shell_execute(verb: &str, target: &str) -> Outcome {
     }
 }
 
+/// Opens Windows Terminal in `dir`, or PowerShell where it isn't installed.
+fn open_terminal(dir: &str) -> Outcome {
+    if !std::path::Path::new(dir).is_dir() {
+        return Err("Couldn't open a terminal: the folder is gone".into());
+    }
+    let terminal = process::Command::new("wt.exe").arg("-d").arg(dir).spawn();
+    if terminal.is_ok() {
+        return Ok(None);
+    }
+    process::Command::new("powershell.exe")
+        .arg("-NoExit")
+        .current_dir(dir)
+        .creation_flags(CREATE_NEW_CONSOLE.0)
+        .spawn()
+        .map(|_| None)
+        .map_err(|err| format!("Couldn't open a terminal: {err}"))
+}
+
+/// Moves `path` to the Recycle Bin, without Explorer's own confirmation (the
+/// launcher asked for a second Enter) and without its progress window.
+fn move_to_trash(path: &str) -> Outcome {
+    // A list of paths, each ending in a NUL, the list in a second one.
+    let from: Vec<u16> = path.encode_utf16().chain([0, 0]).collect();
+    let mut operation = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        ..Default::default()
+    };
+    let code = unsafe { SHFileOperationW(&mut operation) };
+    if code != 0 {
+        return Err(format!(
+            "Couldn't move it to the Recycle Bin (error {code:#x})"
+        ));
+    }
+    if operation.fAnyOperationsAborted.as_bool() {
+        return Err("Moving it to the Recycle Bin was stopped".into());
+    }
+    Ok(Some("Moved to Recycle Bin".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moves_a_file_to_the_recycle_bin() {
+        let path = std::env::temp_dir().join(format!("spotlight-trash-{}.txt", std::process::id()));
+        std::fs::write(&path, "x").unwrap();
+        let outcome = run_blocking(&Command::MoveToTrash(path.to_string_lossy().into_owned()));
+        assert_eq!(outcome, Ok(Some("Moved to Recycle Bin".into())));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn reports_a_missing_file() {

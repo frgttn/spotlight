@@ -2,14 +2,27 @@
 //! launcher's screen stack, and how grids, details and forms are drawn. Lists
 //! reuse root search's rows, and every view keeps the action panel and Esc.
 
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, ScrollHandle, ScrollStrategy,
     SharedString, Window, div, prelude::*, px, rgba, uniform_list,
 };
-use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, View};
+use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, LiveRows, View};
 
 use super::{Launcher, Row, keycaps};
-use crate::{markdown, text_input::TextInput, theme};
+use crate::{
+    markdown,
+    smooth_scroll::{Scroller, capture_wheel},
+    text_input::TextInput,
+    theme,
+};
 
 /// Tiles per grid row.
 pub(super) const GRID_COLUMNS: usize = 5;
@@ -17,16 +30,24 @@ const TILE_HEIGHT: f32 = 112.;
 const TILE_ICON: f32 = 44.;
 /// How far ↑/↓ scroll a detail view.
 const DETAIL_STEP: f32 = 48.;
+/// How soon a live list whose rows are still settling asks again.
+const UNSETTLED_RETRY: Duration = Duration::from_secs(1);
 
 /// One level of the screen stack above root search.
 pub(super) enum Screen {
     List {
         view: ListView,
         grid: bool,
+        /// The provider and view id it came from, to build it again after
+        /// a change (an entry deleted); `None` for views carried whole.
+        origin: Option<(String, String)>,
+        /// The chosen one of `view.filters`.
+        filter: usize,
     },
     Detail {
         view: DetailView,
-        scroll: ScrollHandle,
+        /// Eased like the result list while smooth scrolling is on.
+        scroll: Scroller,
     },
     Form(FormState),
 }
@@ -43,6 +64,19 @@ pub(super) enum FieldInput {
     Text(Entity<TextInput>),
     Checkbox { on: bool, focus: FocusHandle },
     Dropdown { selected: usize, focus: FocusHandle },
+}
+
+impl FormState {
+    /// The key that submits it: Ctrl+Enter when Enter starts a new line in
+    /// one of its fields.
+    pub(super) fn submit_keys(&self) -> &'static str {
+        let has_area = self
+            .view
+            .fields
+            .iter()
+            .any(|field| matches!(field.kind, FieldKind::TextArea { .. }));
+        if has_area { "Ctrl Enter" } else { "Enter" }
+    }
 }
 
 impl FieldInput {
@@ -65,13 +99,24 @@ impl FieldInput {
 }
 
 impl Screen {
-    fn new(view: View, cx: &mut Context<Launcher>) -> Self {
+    /// `smooth`: whether scrolling it animates (the Smooth Scrolling setting).
+    fn new(view: View, smooth: bool, cx: &mut Context<Launcher>) -> Self {
         match view {
-            View::List(view) => Screen::List { view, grid: false },
-            View::Grid(view) => Screen::List { view, grid: true },
+            View::List(view) => Screen::List {
+                view,
+                grid: false,
+                origin: None,
+                filter: 0,
+            },
+            View::Grid(view) => Screen::List {
+                view,
+                grid: true,
+                origin: None,
+                filter: 0,
+            },
             View::Detail(view) => Screen::Detail {
                 view,
-                scroll: ScrollHandle::new(),
+                scroll: Scroller::new(ScrollHandle::new(), smooth),
             },
             View::Form(view) => {
                 let inputs = view
@@ -82,10 +127,20 @@ impl Screen {
                             placeholder,
                             default,
                             ..
+                        }
+                        | FieldKind::TextArea {
+                            placeholder,
+                            default,
+                            ..
                         } => {
+                            let multiline = matches!(field.kind, FieldKind::TextArea { .. });
                             let (placeholder, default) = (placeholder.clone(), default.clone());
                             FieldInput::Text(cx.new(|cx| {
-                                let mut input = TextInput::new(placeholder, cx);
+                                let mut input = if multiline {
+                                    TextInput::multiline(placeholder, cx)
+                                } else {
+                                    TextInput::new(placeholder, cx)
+                                };
                                 input.set_text(default, cx);
                                 input
                             }))
@@ -127,15 +182,226 @@ impl Screen {
 impl Launcher {
     /// Opens `view` on top of the current screen.
     pub(super) fn push_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
-        let screen = Screen::new(view, cx);
+        // Rows of their own (open windows, processes) bring icons the
+        // catalog didn't have.
+        let icons: Vec<(String, String)> = match &view {
+            View::List(list) | View::Grid(list) => list
+                .items
+                .iter()
+                .filter(|item| !self.icons.contains_key(&item.id))
+                .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.load_icons(icons, window.scale_factor(), cx);
+        let screen = Screen::new(view, self.scroll.is_enabled(), cx);
         self.screens.push(screen);
         self.enter_screen(window, cx);
     }
 
+    /// Opens `view` as if a command had pushed it. For the self-test.
+    pub fn open_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.push_view(view, window, cx);
+    }
+
     /// Back to the screen below (root search at the bottom).
     pub(super) fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.screens.pop();
+        if let Some(Screen::List {
+            view,
+            origin: Some((provider, _)),
+            ..
+        }) = self.screens.pop()
+            && view.live
+        {
+            if let Some(cancel) = self.live_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            // A live list's rows are only ever shown once (files found while
+            // typing), so their icons go with it rather than pile up.
+            self.forget_icons(&provider);
+        }
         self.enter_screen(window, cx);
+    }
+
+    /// In a live list, asks its provider for the rows of what is typed, on a
+    /// background thread. A newer search cancels this one, and only the
+    /// newest one's rows are shown.
+    pub(super) fn search_live(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::List {
+            view,
+            origin: Some((provider, id)),
+            filter,
+            ..
+        }) = self.screens.last()
+        else {
+            return;
+        };
+        if !view.live {
+            return;
+        }
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .cloned()
+        else {
+            return;
+        };
+        let keyword = view
+            .filters
+            .get(*filter)
+            .and_then(|choice| choice.keyword.clone());
+        let id = id.clone();
+        if let Some(older) = self.live_cancel.take() {
+            older.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.live_cancel = Some(cancel.clone());
+        self.live_generation += 1;
+        let generation = self.live_generation;
+        let query = self.query(cx);
+        let rows = cx
+            .background_executor()
+            .spawn(async move { provider.search_view(&id, &query, keyword.as_deref(), &cancel) });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = rows.await else {
+                return;
+            };
+            this.update(cx, |this, cx| this.show_live_rows(generation, rows, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// In root search after the file prefix, asks the files provider for the
+    /// rows of what follows it, like a live list. Without the prefix, lets go
+    /// of the rows found before.
+    pub(super) fn search_prefix(&mut self, cx: &mut Context<Self>) {
+        if !self.screens.is_empty() {
+            return;
+        }
+        let query = self.query(cx);
+        let Some(rest) = super::file_query(&self.file_prefix, &query).map(str::to_owned) else {
+            if !self.prefix_rows.is_empty() {
+                self.prefix_rows.clear();
+                self.forget_icons(super::FILES_PROVIDER);
+            }
+            return;
+        };
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == super::FILES_PROVIDER)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(older) = self.live_cancel.take() {
+            older.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.live_cancel = Some(cancel.clone());
+        self.live_generation += 1;
+        let generation = self.live_generation;
+        let rows = cx
+            .background_executor()
+            .spawn(async move { provider.search_view(super::FILES_VIEW, &rest, None, &cancel) });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = rows.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if generation != this.live_generation || !this.screens.is_empty() {
+                    return;
+                }
+                let icons: Vec<(String, String)> = rows
+                    .items
+                    .iter()
+                    .filter(|item| !this.icons.contains_key(&item.id))
+                    .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                    .collect();
+                this.prefix_rows = rows.items;
+                let query = this.query(cx);
+                this.refilter(&query);
+                this.load_icons(icons, this.window_scale, cx);
+                if rows.unsettled {
+                    this.search_again(generation, Self::search_prefix, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Frees the icons of rows from `provider` that were only ever shown
+    /// once (files found while typing), so they don't pile up.
+    fn forget_icons(&mut self, provider: &str) {
+        let prefix = format!("{provider}:");
+        let stale: Vec<String> = self
+            .icons
+            .keys()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(image) = self.icons.remove(&id) {
+                self.stale_images.push(image);
+            }
+        }
+    }
+
+    /// Puts a live search's rows in the open list, unless a newer search or
+    /// another screen has taken its place.
+    fn show_live_rows(&mut self, generation: u64, rows: LiveRows, cx: &mut Context<Self>) {
+        if generation != self.live_generation {
+            return;
+        }
+        let icons: Vec<(String, String)> = rows
+            .items
+            .iter()
+            .filter(|item| !self.icons.contains_key(&item.id))
+            .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+            .collect();
+        let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
+            return;
+        };
+        if !view.live {
+            return;
+        }
+        view.items = rows.items;
+        view.empty = rows.empty;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.load_icons(icons, self.window_scale, cx);
+        if rows.unsettled {
+            self.search_again(generation, Self::search_live, cx);
+        }
+        cx.notify();
+    }
+
+    /// While the rows still change by themselves (files being indexed),
+    /// runs `search` again in a moment, unless something newer was searched
+    /// meanwhile.
+    fn search_again(
+        &self,
+        generation: u64,
+        search: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx.background_executor().timer(UNSETTLED_RETRY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if generation == this.live_generation {
+                    search(this, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Sets up the search field, the rows and the keyboard for the top screen.
@@ -168,6 +434,88 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Builds the open provider list again, after its items changed, and
+    /// keeps the search text. Selects the row `keep` (an item id) if given
+    /// and still there, otherwise stays at the same position.
+    pub(super) fn refresh_screen(
+        &mut self,
+        keep: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Screen::List {
+            origin: Some((provider, id)),
+            ..
+        }) = self.screens.last()
+        else {
+            return;
+        };
+        let fresh = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .and_then(|provider| provider.view(id));
+        match fresh {
+            Some(View::List(fresh) | View::Grid(fresh)) => {
+                if let Some(Screen::List { view, filter, .. }) = self.screens.last_mut() {
+                    if *filter >= fresh.filters.len() {
+                        *filter = 0;
+                    }
+                    *view = fresh;
+                }
+            }
+            _ => return self.pop_screen(window, cx),
+        }
+        // A live list's rows come from a background search.
+        self.search_live(cx);
+        let previous = self.selected;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.selected = keep
+            .and_then(|keep| {
+                self.results
+                    .iter()
+                    .position(|row| self.item(row).id == keep)
+            })
+            .unwrap_or_else(|| previous.min(self.results.len().saturating_sub(1)));
+        self.scroll.reveal(self.selected, self.results.len());
+        cx.notify();
+    }
+
+    /// Tab / Shift+Tab in a list with a filter: the next or previous choice.
+    /// Returns `false` when the open view has no filter.
+    pub(super) fn step_filter(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(Screen::List { view, filter, .. }) = self.screens.last_mut() else {
+            return false;
+        };
+        let count = view.filters.len();
+        if count == 0 {
+            return false;
+        }
+        *filter = if forward {
+            (*filter + 1) % count
+        } else {
+            (*filter + count - 1) % count
+        };
+        self.search_live(cx);
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+        true
+    }
+
+    /// The open list's filter choice, if it has a filter.
+    pub(super) fn filter_label(&self) -> Option<SharedString> {
+        match self.screens.last() {
+            Some(Screen::List { view, filter, .. }) => view
+                .filters
+                .get(*filter)
+                .map(|choice| SharedString::from(choice.label.clone())),
+            _ => None,
+        }
+    }
+
     pub(super) fn in_grid(&self) -> bool {
         matches!(self.screens.last(), Some(Screen::List { grid: true, .. }))
     }
@@ -198,12 +546,28 @@ impl Launcher {
 
     /// ↑/↓ in a detail view scroll it.
     pub(super) fn detail_scroll(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(Screen::Detail { scroll, .. }) = self.screens.last() {
-            let mut offset = scroll.offset();
-            // Offsets are negative: scrolling down makes `y` smaller.
-            offset.y += px(if down { -DETAIL_STEP } else { DETAIL_STEP });
-            scroll.set_offset(offset);
+        if let Some(Screen::Detail { scroll, .. }) = self.screens.last_mut() {
+            // Positive deltas move the content down, as for the wheel.
+            scroll.scroll_by(px(if down { -DETAIL_STEP } else { DETAIL_STEP }));
             cx.notify();
+        }
+    }
+
+    /// Advances the open detail view's scrolling by a frame; returns whether
+    /// another frame is needed.
+    pub(super) fn tick_detail_scroll(&mut self) -> bool {
+        match self.screens.last_mut() {
+            Some(Screen::Detail { scroll, .. }) => scroll.tick(),
+            _ => false,
+        }
+    }
+
+    /// Turns smooth scrolling on or off in every open detail view.
+    pub(super) fn set_detail_smooth_scrolling(&mut self, enabled: bool) {
+        for screen in &mut self.screens {
+            if let Screen::Detail { scroll, .. } = screen {
+                scroll.set_enabled(enabled);
+            }
         }
     }
 
@@ -293,6 +657,23 @@ impl Launcher {
         Some((values, form.error.as_ref().map(|error| error.to_string())))
     }
 
+    /// The open form's text field that has the keyboard.
+    pub(super) fn focused_form_input(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<TextInput>> {
+        let Some(Screen::Form(form)) = self.screens.last() else {
+            return None;
+        };
+        form.inputs.iter().find_map(|input| match input {
+            FieldInput::Text(text) if text.focus_handle(cx).is_focused(window) => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// The selected row or tile. For the self-test.
     pub fn selected_index(&self) -> usize {
         self.selected
@@ -307,7 +688,7 @@ impl Launcher {
         match self.screens.last()? {
             Screen::List { grid: true, .. } => Some(self.render_grid(cx)),
             Screen::List { grid: false, .. } => None,
-            Screen::Detail { view, scroll } => Some(render_detail(view, scroll)),
+            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, cx)),
             Screen::Form(form) => Some(self.render_form(form, window, cx)),
         }
     }
@@ -397,13 +778,15 @@ impl Launcher {
                 .enumerate()
                 .map(|(ix, (field, input))| {
                     let focused = input.focus_handle(cx).is_focused(window);
+                    let area = matches!(field.kind, FieldKind::TextArea { .. });
                     let control: AnyElement = match (input, &field.kind) {
                         (FieldInput::Text(input), _) => div()
                             .flex_1()
-                            .h(px(34.))
+                            .min_w_0()
+                            .when(area, |field| field.py(px(7.)))
+                            .when(!area, |field| field.h(px(34.)).items_center())
                             .px_2()
                             .flex()
-                            .items_center()
                             .rounded(px(6.))
                             .border_1()
                             .border_color(rgba(if focused {
@@ -498,11 +881,14 @@ impl Launcher {
                     };
                     div()
                         .flex()
-                        .items_center()
+                        // A text area's label stays by its first row.
+                        .when(area, |row| row.items_start())
+                        .when(!area, |row| row.items_center())
                         .gap_3()
                         .child(
                             div()
                                 .flex_none()
+                                .when(area, |label| label.pt(px(8.)))
                                 .w(px(110.))
                                 .text_size(px(13.))
                                 .text_color(rgba(theme::TEXT_MUTED))
@@ -536,7 +922,7 @@ impl Launcher {
                     .text_size(px(11.))
                     .text_color(rgba(theme::TEXT_FAINT))
                     .child("Tab moves between fields;")
-                    .child(keycaps("Enter"))
+                    .child(keycaps(form.submit_keys()))
                     .child(SharedString::from(form.view.submit_title.to_lowercase()))
                     .child("·")
                     .child(keycaps("Esc"))
@@ -578,23 +964,41 @@ impl Launcher {
 /// change the choice (elsewhere Space types a space).
 pub(super) const CHOICE_CONTEXT: &str = "FormChoice";
 
-fn render_detail(view: &DetailView, scroll: &ScrollHandle) -> AnyElement {
+fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher>) -> AnyElement {
     let text = div()
         .id("detail")
-        .flex_1()
-        .min_w_0()
-        .h_full()
+        .size_full()
         .overflow_y_scroll()
-        .track_scroll(scroll)
+        .track_scroll(&scroll.handle())
         .px_5()
         .py_4()
         .text_size(px(14.))
         .child(markdown::render(&view.markdown));
+    // Wheel notches are animated instead; everything else falls through to GPUI.
+    let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Launcher, delta, cx| {
+        let Some(Screen::Detail { scroll, .. }) = this.screens.last_mut() else {
+            return false;
+        };
+        if !scroll.is_enabled() {
+            return false;
+        }
+        scroll.scroll_by(delta);
+        cx.notify();
+        true
+    });
     div()
         .flex_1()
         .min_h_0()
         .flex()
-        .child(text)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .relative()
+                .child(text)
+                .child(wheel),
+        )
         .when(!view.metadata.is_empty(), |body| {
             body.child(
                 div()

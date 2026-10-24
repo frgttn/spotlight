@@ -36,6 +36,14 @@ impl Provider for Games {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Games"
+    }
+
+    fn description(&self) -> &'static str {
+        "Games installed with Steam, Epic, GOG and Ubisoft Connect."
+    }
+
     /// Reads a few small files and registry keys; a few milliseconds.
     fn catalog(&self) -> Vec<SearchItem> {
         let shortcuts = start_menu_names();

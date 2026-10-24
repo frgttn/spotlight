@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-platform-win"
-description = "Windows integration for Spotlight: hotkey, app discovery, running commands, window placement, measurements"
+description = "Windows integration for Spotlight: hotkey, clipboard, app discovery, running commands, window placement, measurements"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,11 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
+# PNG for clipboard images.
+image = { workspace = true, features = ["png"] }
 spotlight-core.workspace = true
+# `Listed`, what a folder listing gives the file index.
+spotlight-files.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
@@ -20,26 +24,36 @@ features = [
     "Web_Http",
     "Win32_Devices_Display",
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
+    "Win32_System_DataExchange",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Pipes",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
+    "Win32_System_Services",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

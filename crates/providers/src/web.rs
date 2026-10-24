@@ -44,7 +44,7 @@ impl Web {
         }
     }
 
-    fn engine(&self) -> SearchEngine {
+    pub fn engine(&self) -> SearchEngine {
         self.engine
             .read()
             .map(|engine| engine.clone())
@@ -55,6 +55,14 @@ impl Web {
 impl Provider for Web {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Web Search and URLs"
+    }
+
+    fn description(&self) -> &'static str {
+        "Opens typed addresses, and offers a web search as the last result."
     }
 
     /// "Search the Web…": a form to search with any engine, not only the

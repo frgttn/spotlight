@@ -1,29 +1,106 @@
-//! Raw Win32 window placement for the launcher window.
+//! Raw Win32 window placement for the launcher window, and the apps that
+//! have windows open.
 //!
 //! UI frameworks generally have no "hide but keep everything alive" call, so the
 //! launcher takes the HWND and drives visibility and placement directly.
 
 use std::{ffi::c_void, mem::size_of};
 
-use windows::Win32::{
-    Foundation::{HWND, POINT, RECT},
-    Graphics::{
-        Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
-        Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
-    },
-    System::Console::{ATTACH_PARENT_PROCESS, AttachConsole},
-    UI::{
-        HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
-        WindowsAndMessaging::{
-            GetCursorPos, GetWindowRect, HWND_TOPMOST, IsWindowVisible, SET_WINDOW_POS_FLAGS,
-            SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE,
-            SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindow,
+use spotlight_core::clip::IgnoredApp;
+use windows::{
+    Win32::{
+        Foundation::{HWND, LPARAM, POINT, RECT},
+        Globalization::GetUserDefaultLocaleName,
+        Graphics::{
+            Dwm::{
+                DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetWindowAttribute,
+                DwmSetWindowAttribute,
+            },
+            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
+        },
+        System::{
+            Console::{ATTACH_PARENT_PROCESS, AttachConsole},
+            Threading::GetCurrentProcessId,
+        },
+        UI::{
+            HiDpi::{GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
+            WindowsAndMessaging::{
+                EnumWindows, GW_OWNER, GWL_EXSTYLE, GetCursorPos, GetWindow, GetWindowLongPtrW,
+                GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST,
+                IsWindowVisible, SET_WINDOW_POS_FLAGS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SW_HIDE,
+                SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+                SetForegroundWindow, SetWindowPos, ShowWindow, WS_EX_TOOLWINDOW,
+            },
         },
     },
+    core::BOOL,
 };
+
+use crate::clipboard;
 
 fn hwnd(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
+}
+
+/// The apps with a window on screen (as the taskbar would show them), each
+/// once, by name; not Spotlight. For choosing apps in Settings.
+pub fn apps_with_windows() -> Vec<IgnoredApp> {
+    let windows = app_windows();
+    let own = unsafe { GetCurrentProcessId() };
+    let mut apps: Vec<IgnoredApp> = Vec::new();
+    for window in windows {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd(window), Some(&mut pid)) };
+        if pid == own {
+            continue;
+        }
+        let Some(path) = clipboard::window_program(window) else {
+            continue;
+        };
+        if !IgnoredApp::contains(&apps, &path) {
+            let name = clipboard::app_name(&path);
+            apps.push(IgnoredApp { path, name });
+        }
+    }
+    apps.sort_by_key(|app| app.name.to_lowercase());
+    apps
+}
+
+/// The windows a user would call an app's window (as the taskbar shows
+/// them), front to back, as raw HWNDs. Includes Spotlight's own.
+pub(crate) fn app_windows() -> Vec<isize> {
+    let mut windows: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut windows as *mut Vec<isize> as isize),
+        );
+    }
+    windows
+}
+
+/// `EnumWindows` callback: keeps windows a user would call an app's window.
+unsafe extern "system" fn collect_window(window: HWND, windows: LPARAM) -> BOOL {
+    unsafe {
+        let ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            size_of::<u32>() as u32,
+        );
+        let shown = IsWindowVisible(window).as_bool()
+            && GetWindow(window, GW_OWNER).is_err()
+            && ex_style & WS_EX_TOOLWINDOW.0 == 0
+            && GetWindowTextLengthW(window) > 0
+            // Hidden by DWM: suspended Store apps, other virtual desktops.
+            && cloaked == 0;
+        if shown {
+            (*(windows.0 as *mut Vec<isize>)).push(window.0 as isize);
+        }
+        true.into()
+    }
 }
 
 /// Asks DWM for Windows 11 rounded corners (frameless popups don't get them by default).
@@ -39,12 +116,21 @@ pub fn round_corners(raw: isize) {
     }
 }
 
-/// Shows the window topmost, horizontally centered and a fifth of the way down
+/// Shows the window topmost, centered (as Raycast places it) in
 /// the work area of the monitor under the mouse cursor, then takes focus.
 ///
 /// `logical_size` (in 96-DPI units) is scaled by that monitor's DPI and applied;
-/// pass `None` to keep the window's current size.
-pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
+/// pass `None` to keep the window's current size. With `client_height`, the
+/// window is placed as if it had `logical_size` but is only that tall inside
+/// (a collapsed launcher), so growing it later keeps its top edge.
+///
+/// GPUI misses a size change made here while it updates the window (see
+/// [`resize`]), so the window should already have the size asked for.
+pub fn show_on_active_monitor(
+    raw: isize,
+    logical_size: Option<(f32, f32)>,
+    client_height: Option<f32>,
+) {
     unsafe {
         let hwnd = hwnd(raw);
         let mut cursor = POINT::default();
@@ -72,7 +158,15 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
             };
             let work = info.rcWork;
             let x = work.left + (work.right - work.left - width) / 2;
-            let y = work.top + (work.bottom - work.top - height) / 5;
+            let y = work.top + (work.bottom - work.top - height) / 2;
+            let height = match client_height {
+                Some(client_height) => {
+                    let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+                    let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+                    window_height_for_client(client_height, dpi_x)
+                }
+                None => height,
+            };
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -88,6 +182,51 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
         // Allowed because our process just received the hotkey input event.
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+/// Changes the window's size, keeping its top-left corner and z-order.
+/// `logical_size` and `client_height` are as for [`show_on_active_monitor`].
+///
+/// GPUI learns the new size from WM_SIZE, which it can only take while no
+/// update of the window is running: call this from a spawned task, as GPUI's
+/// own resize does, or its layout keeps the old size.
+pub fn resize(raw: isize, logical_size: (f32, f32), client_height: Option<f32>) {
+    unsafe {
+        let hwnd = hwnd(raw);
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let scale = dpi as f32 / 96.;
+        let width = (logical_size.0 * scale).round() as i32;
+        let height = match client_height {
+            Some(client_height) => window_height_for_client(client_height, dpi),
+            None => (logical_size.1 * scale).round() as i32,
+        };
+        if (width, height) == (rect.right - rect.left, rect.bottom - rect.top) {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The window height whose client area is `logical_height` tall: GPUI insets
+/// it by the resize frame at the bottom and a pixel at the top.
+fn window_height_for_client(logical_height: f32, dpi: u32) -> i32 {
+    let scale = dpi as f32 / 96.;
+    let frame = unsafe {
+        GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    };
+    (logical_height * scale).round() as i32 + scale.round() as i32 + frame
 }
 
 /// Shows the window topmost, horizontally centered near the bottom of the work
@@ -150,6 +289,18 @@ pub fn hide(raw: isize) {
 pub fn focus(raw: isize) {
     unsafe {
         let _ = SetForegroundWindow(hwnd(raw));
+    }
+}
+
+/// The user's language as a two-letter code (`"ru"`), from their Windows
+/// regional format; `"en"` when it can't be told.
+pub fn user_language() -> String {
+    let mut name = [0u16; 85];
+    let len = unsafe { GetUserDefaultLocaleName(&mut name) };
+    let name = String::from_utf16_lossy(&name[..(len.max(1) - 1) as usize]);
+    match name.split('-').next() {
+        Some(language) if language.len() >= 2 => language.to_lowercase(),
+        _ => "en".into(),
     }
 }
 

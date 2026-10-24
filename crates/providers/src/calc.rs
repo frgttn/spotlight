@@ -103,6 +103,14 @@ impl Provider for Calculator {
         ID
     }
 
+    fn name(&self) -> &'static str {
+        "Calculator"
+    }
+
+    fn description(&self) -> &'static str {
+        "Answers math, units and currencies as you type. Off, it fetches no exchange rates."
+    }
+
     /// The history command. This runs once on a background thread at
     /// startup, which is also a good moment to fetch exchange rates if old.
     fn catalog(&self) -> Vec<SearchItem> {

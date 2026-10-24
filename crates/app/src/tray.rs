@@ -95,28 +95,28 @@ fn tooltip(hotkey: &str) -> String {
     format!("Spotlight ({hotkey})")
 }
 
-/// The logo (two interlocked half rings, from `assets/logo.svg`) on a
-/// transparent background, drawn at 32 px with 4x4 supersampling. Dark on a
-/// light taskbar, light on a dark one.
+/// The logo (two interlocked half rings, the same geometry as `assets/logo-white.svg`
+/// and `assets/logo-black.svg`) on a transparent background, drawn at 32 px with
+/// 4x4 supersampling. White on a dark taskbar, black on a light one.
 fn icon() -> Result<Icon, String> {
     const SIZE: u32 = 32;
     const SAMPLES: u32 = 4;
     // Logo coordinates are on a 100 x 100 grid; this many pixels per unit.
     const SCALE: f32 = 0.38;
     let mark: [u8; 3] = if spotlight_platform_win::system::taskbar_dark() {
-        [242, 244, 243]
+        [255, 255, 255]
     } else {
-        [39, 47, 45]
+        [0, 0, 0]
     };
 
-    // Right half ring around (50, 36.75) and left half ring around (50, 63.25),
-    // both 27.5 outside and 13.25 inside.
+    // Left half ring around (50, 36.75) and right half ring around (50, 63.25),
+    // both 27.5 outside and 13.25 inside (the SVG's two subpaths, as rendered).
     let in_mark = |u: f32, v: f32| {
         let ring = |cy: f32| {
             let d = (u - 50.).hypot(v - cy);
             (13.25..=27.5).contains(&d)
         };
-        (u >= 50. && ring(36.75)) || (u <= 50. && ring(63.25))
+        (u <= 50. && ring(36.75)) || (u >= 50. && ring(63.25))
     };
 
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);

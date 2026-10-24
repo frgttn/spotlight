@@ -4,6 +4,7 @@
 
 use crate::{
     item::{Action, Command, SearchItem},
+    quicklink,
     web::encode_query,
 };
 
@@ -36,6 +37,69 @@ pub struct ListView {
     pub items: Vec<SearchItem>,
     /// Shown when there are no items at all (rather than none matching).
     pub empty: Option<String>,
+    /// Choices that narrow the list (All, Images, Links…), which Tab steps
+    /// through. Empty: no filter.
+    pub filters: Vec<ListFilter>,
+    /// The rows come from the provider for what is typed
+    /// ([`crate::provider::Provider::search_view`]) instead of from
+    /// filtering `items`, which show until its first answer. For lists too
+    /// large to hand over whole: Search Files.
+    pub live: bool,
+}
+
+/// A live list's rows for one query.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveRows {
+    pub items: Vec<SearchItem>,
+    /// Shown when there are no items ("Indexing… 12,345 files so far").
+    pub empty: Option<String>,
+    /// The rows will change without anything typed (files are still being
+    /// indexed): the list asks again a little later.
+    pub unsettled: bool,
+}
+
+/// One choice of a list's filter: items with `keyword` among their keywords.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ListFilter {
+    pub label: String,
+    /// `None` keeps every item.
+    pub keyword: Option<String>,
+}
+
+impl ListFilter {
+    pub fn new(label: impl Into<String>, keyword: Option<&str>) -> Self {
+        Self {
+            label: label.into(),
+            keyword: keyword.map(str::to_owned),
+        }
+    }
+
+    pub fn keeps(&self, item: &SearchItem) -> bool {
+        self.keyword
+            .as_ref()
+            .is_none_or(|keyword| item.keywords.contains(keyword))
+    }
+}
+
+/// What a list shows beside itself for the selected row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    pub body: PreviewBody,
+    /// Label and value pairs, under the body.
+    pub metadata: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreviewBody {
+    /// Shown as it is, line breaks kept.
+    Text(String),
+    /// An image file (PNG), scaled down to fit.
+    Image(String),
+    /// File paths, one per row.
+    Files(Vec<String>),
+    /// A file's thumbnail as Explorer shows it (pictures, videos, PDFs), or
+    /// its icon when it has none, with its path under it.
+    Thumbnail(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +138,13 @@ pub enum FieldKind {
         /// Submitting is refused while it's empty.
         required: bool,
     },
+    /// Text over several lines: Enter starts a new line, Ctrl+Enter submits.
+    TextArea {
+        placeholder: String,
+        default: String,
+        /// Submitting is refused while it's empty.
+        required: bool,
+    },
     Checkbox {
         default: bool,
     },
@@ -97,8 +168,10 @@ impl FormView {
     /// Why the form can't be submitted with `values` yet, naming the field.
     pub fn check(&self, values: &[FieldValue]) -> Result<(), String> {
         for (field, value) in self.fields.iter().zip(values) {
-            if let (FieldKind::Text { required: true, .. }, FieldValue::Text(text)) =
-                (&field.kind, value)
+            if let (
+                FieldKind::Text { required: true, .. } | FieldKind::TextArea { required: true, .. },
+                FieldValue::Text(text),
+            ) = (&field.kind, value)
                 && text.trim().is_empty()
             {
                 return Err(format!("{} is required", field.label));
@@ -147,7 +220,39 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
     let placeholder = format!("{{{id}}}");
     let (text, in_url) = match command {
         Command::OpenUrl(url) => (url, true),
-        Command::Copy(text) => (text, false),
+        Command::Copy(text) | Command::PasteSnippet { text, .. } => (text, false),
+        Command::OpenQuicklink { link, .. } => {
+            // Quicklinks encode their own way (`%20`, and paths not at all).
+            if link.contains(&placeholder) {
+                let value = quicklink::encode_value(value(false).trim(), quicklink::is_url(link));
+                *link = link.replace(&placeholder, &value);
+            }
+            return;
+        }
+        // Each field of the form fills one field of the quicklink, as typed.
+        Command::SaveQuicklink(link) => {
+            let fields = [&mut link.name, &mut link.link]
+                .into_iter()
+                .chain(link.keyword.as_mut())
+                .chain(link.open_with.as_mut());
+            for field in fields {
+                if *field == placeholder {
+                    *field = value(false);
+                }
+            }
+            return;
+        }
+        Command::SaveSnippet(snippet) => {
+            let fields = [&mut snippet.name, &mut snippet.text]
+                .into_iter()
+                .chain(snippet.keyword.as_mut());
+            for field in fields {
+                if *field == placeholder {
+                    *field = value(false);
+                }
+            }
+            return;
+        }
         // The others take paths and ids the user doesn't type.
         _ => return,
     };
@@ -224,11 +329,83 @@ mod tests {
     }
 
     #[test]
+    fn fills_quicklinks() {
+        let text = |id: &str| Field {
+            id: id.into(),
+            label: id.into(),
+            kind: FieldKind::Text {
+                placeholder: String::new(),
+                default: String::new(),
+                required: false,
+            },
+        };
+        let open = FormView {
+            title: "Open".into(),
+            fields: vec![text("arg0")],
+            submit_title: "Open".into(),
+            submit: Command::OpenQuicklink {
+                link: "https://github.com/{arg0}/{date}".into(),
+                app: None,
+            },
+        };
+        assert_eq!(
+            open.fill(&[FieldValue::Text(" a b ".into())]),
+            Command::OpenQuicklink {
+                link: "https://github.com/a%20b/{date}".into(),
+                app: None
+            }
+        );
+
+        let save = FormView {
+            title: "Create Quicklink".into(),
+            fields: vec![text("name"), text("link"), text("keyword")],
+            submit_title: "Save".into(),
+            submit: Command::SaveQuicklink(quicklink::Quicklink {
+                id: 3,
+                name: "{name}".into(),
+                link: "{link}".into(),
+                keyword: Some("{keyword}".into()),
+                open_with: None,
+            }),
+        };
+        let values = ["Docs {link}", "https://x.com/?q={query}", "gh"]
+            .map(|value| FieldValue::Text(value.into()));
+        assert_eq!(
+            save.fill(&values),
+            Command::SaveQuicklink(quicklink::Quicklink {
+                id: 3,
+                name: "Docs {link}".into(),
+                link: "https://x.com/?q={query}".into(),
+                keyword: Some("gh".into()),
+                open_with: None,
+            })
+        );
+    }
+
+    #[test]
     fn required_fields_must_be_filled() {
         let form = search_form();
         let empty = [FieldValue::Text("  ".into()), FieldValue::Dropdown(0)];
         assert_eq!(form.check(&empty), Err("Search for is required".into()));
         let filled = [FieldValue::Text("x".into()), FieldValue::Dropdown(0)];
         assert_eq!(form.check(&filled), Ok(()));
+
+        let area = FormView {
+            fields: vec![Field {
+                id: "text".into(),
+                label: "Snippet".into(),
+                kind: FieldKind::TextArea {
+                    placeholder: String::new(),
+                    default: String::new(),
+                    required: true,
+                },
+            }],
+            ..search_form()
+        };
+        assert_eq!(
+            area.check(&[FieldValue::Text("\n \n".into())]),
+            Err("Snippet is required".into())
+        );
+        assert_eq!(area.check(&[FieldValue::Text("a\nb".into())]), Ok(()));
     }
 }

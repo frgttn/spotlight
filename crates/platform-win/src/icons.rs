@@ -11,7 +11,10 @@ use windows::{
             DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
         },
         System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
-        UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY},
+        UI::Shell::{
+            IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
+            SIIGBF_ICONONLY,
+        },
     },
     core::{HSTRING, Result},
 };
@@ -37,6 +40,27 @@ pub fn shell_icon(parsing_name: &str, size: u32) -> Result<Icon> {
                 cy: size as i32,
             },
             SIIGBF_ICONONLY,
+        )?;
+        let icon = read_bitmap(bitmap);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        icon
+    }
+}
+
+/// The thumbnail Explorer shows for a file (a picture, a video's frame, a
+/// PDF's first page), fitting in `size` pixels, or its icon when it has none.
+/// Blocking; initialises COM on the calling thread.
+pub fn thumbnail(path: &str, size: u32) -> Result<Icon> {
+    let path = HSTRING::from(path);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&path, None)?;
+        let bitmap = factory.GetImage(
+            SIZE {
+                cx: size as i32,
+                cy: size as i32,
+            },
+            SIIGBF_BIGGERSIZEOK,
         )?;
         let icon = read_bitmap(bitmap);
         let _ = DeleteObject(HGDIOBJ(bitmap.0));

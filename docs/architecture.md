@@ -37,7 +37,7 @@ Later, and optional: a tiny elevated helper for interacting with admin windows. 
   core           # domain types: SearchItem, Action, Provider trait, ranking, frecency
   search         # aggregator: fan-out to providers, cancel on new keystroke, merge + rank (nucleo)
   platform-win   # windows-rs: hotkey/hook, focus, window mgmt, clipboard, UIA, app discovery, icons
-  store          # rusqlite (+ SQLCipher later): settings, frecency, clipboard history, snippets, quicklinks
+  store          # rusqlite + SQLCipher: settings, frecency, clipboard history, snippets, quicklinks
   providers/
     apps         # shell:AppsFolder (Win32 + MSIX), icon extraction, launch
     system       # lock, sleep, restart, empty bin, toggle dark mode, ...
@@ -160,9 +160,10 @@ Script commands are a simple, language-agnostic way to extend the launcher.
 | Background | GPUI `Blurred` + a dense tint. GPUI's accent-policy blur barely blurs on Windows 11; the DWM acrylic system backdrop was tried and rejected (light grey, unstable focus) |
 | Apps | `shell:AppsFolder` enumeration (Win32 + MSIX in one list); launch via `ShellExecuteW("shell:AppsFolder\<id>")` |
 | Icons | `IShellItemImageFactory::GetImage`, cached as PNG on disk |
-| Clipboard history | `AddClipboardFormatListener` |
-| Paste into the previous app | Restore focus, then `SendInput` Ctrl+V |
-| Selected text | UIA `TextPattern`, falling back to a simulated Ctrl+C |
+| Clipboard history | `AddClipboardFormatListener` on a message-only window of its own thread; reads 100 ms after a change (apps write in steps); skips copies marked `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore` or `CanIncludeInClipboardHistory = 0` |
+| Paste into the previous app | Foreground window remembered when the launcher opens; `SetForegroundWindow` while still foreground, then `SendInput` Ctrl+V once it has focus (blocked by UIPI in elevated apps) |
+| Win+V | Can't be registered (Windows owns it): a `WH_KEYBOARD_LL` hook on the hotkey thread swallows the V, then taps an unused key so releasing Win doesn't open Start |
+| Selected text | Read only when a command with `{selection}` runs: the launcher hands the foreground back to the app it came from, then UIA (`GetFocusedElement` → `TextPattern.GetSelection`, same process only). Otherwise, unless turned off or the window is a terminal, simulated Ctrl+C: the clipboard is copied aside format by format, the selection read, the clipboard put back, and the history skips those changes (by clipboard sequence number) |
 | Window management | `SetWindowPos`, `MonitorFromWindow`, `GetMonitorInfoW`, `SetWinEventHook` |
 | Single instance + deeplinks | Named mutex + named pipe; `spotlight://` registered under `HKCU\Software\Classes` |
 | Login item | `HKCU\...\Run` |
@@ -187,8 +188,11 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
    The providers live in one `providers` crate (modules, not one crate each) until one needs heavy dependencies of its own.
    `Provider` is synchronous for now: catalogs load on background threads and per-keystroke answers are bounded (the calculator gives up after 30 ms). Async with cancellation comes with providers that do IO (files, plugins).
    Actions are data (`Command`: launch app, open URL, copy, system command) that the app runs, rather than a `Provider::run` callback, so scripts and plugins can only ask for this safe set.
+   Each provider can be turned off in Settings (`RootSearch::set_enabled`): it then has no catalog loaded and is skipped for answers and fallbacks. `Provider::name` / `description` label its switch.
 2. Root search core, part 2: ✅ action panel (Ctrl+K), ✅ view stack (List / Grid / Detail / Form, Esc goes back), ✅ HUD and toasts, ✅ aliases and per-item hotkeys, ✅ calculator currencies and history; ✅ more sources (Settings pages, Control Panel, Steam / Epic / GOG / Ubisoft games); still to do: frecency tuning.
-3. Clipboard history, snippets (with expansion), quicklinks.
+3. ✅ Quicklinks (with `!keyword` searches); ✅ clipboard history: text, links, colours, files and images (PNG files plus a 640 px copy for the preview), pinning, filters (Tab), retention by age and count, ignored apps, paste into the previous app, Win+V as an option. Lists can show a preview of the selected row (`SearchItem::preview`) and a filter (`ListView::filters`). Still to do: snippets (with expansion).
+   ✅ Selected text: `{selection}` in `OpenUrl` URLs and quicklinks (`Command::needs_selection` / `with_selection`), the Selected Text source (Search Selection on the Web, Translate Selection); turning the source off means the selection is never read, and Settings can forbid the Ctrl+C fallback.
+3.5 ✅ Database encryption: `rusqlite` with `bundled-sqlcipher`. SQLCipher's crypto is Windows CNG (`vendor/libsqlite3-sys/sqlcipher/crypto_cng.c`, a patched `libsqlite3-sys`), so building needs no OpenSSL or Perl; the format is standard SQLCipher 4. The key is 32 random bytes in Credential Manager (generic credential `Spotlight/database`, as Raycast keeps its `main.db` key), used raw (`x'…'`), so nothing to type. A plain database is converted once with `sqlcipher_export`. Clipboard images are sealed with AES-256-GCM (CNG) under a key derived from the database key (`platform-win::vault`); older plain images are sealed at startup. A database the saved key can't read is renamed to `spotlight.unreadable-<time>.db` and a new one starts.
 4. Window management, file search.
 5. Script commands.
 6. WASM plugin host + SDK + 2–3 sample plugins.
