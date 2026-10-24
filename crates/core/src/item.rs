@@ -9,6 +9,7 @@ use crate::{
     snippet::Snippet,
     view::{Preview, View},
     web::encode_query,
+    window::WindowCommand,
 };
 
 /// One row in a result list.
@@ -171,6 +172,16 @@ pub enum Command {
     /// cursor at its end: `!g` completed to `!gh `.
     Complete(String),
     System(SystemCommand),
+    /// Does `command` to window `target` (a raw HWND), or with `None` to the
+    /// window that was active before the launcher (the app fills it in).
+    Window {
+        target: Option<isize>,
+        command: WindowCommand,
+    },
+    /// Asks every window of process `pid` to close, as their × buttons would.
+    QuitApp(u32),
+    /// Ends process `pid` at once; what it hadn't saved is lost.
+    ForceQuit(u32),
 }
 
 /// Where a command takes the text selected in the app the launcher came
@@ -211,6 +222,7 @@ impl Command {
             ) | Command::DeleteQuicklink(_)
                 | Command::DeleteSnippet(_)
                 | Command::ClearClipboardHistory
+                | Command::ForceQuit(_)
         )
     }
 }

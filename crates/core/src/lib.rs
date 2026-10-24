@@ -10,6 +10,7 @@ pub mod quicklink;
 pub mod snippet;
 pub mod view;
 pub mod web;
+pub mod window;
 
 /// Stable identity of a search result, `"{provider}:{instance}"`.
 /// Frecency and (later) aliases and hotkeys are keyed by it, so it must not

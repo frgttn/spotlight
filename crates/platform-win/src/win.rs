@@ -45,13 +45,7 @@ fn hwnd(raw: isize) -> HWND {
 /// The apps with a window on screen (as the taskbar would show them), each
 /// once, by name; not Spotlight. For choosing apps in Settings.
 pub fn apps_with_windows() -> Vec<IgnoredApp> {
-    let mut windows: Vec<isize> = Vec::new();
-    unsafe {
-        let _ = EnumWindows(
-            Some(collect_window),
-            LPARAM(&mut windows as *mut Vec<isize> as isize),
-        );
-    }
+    let windows = app_windows();
     let own = unsafe { GetCurrentProcessId() };
     let mut apps: Vec<IgnoredApp> = Vec::new();
     for window in windows {
@@ -70,6 +64,19 @@ pub fn apps_with_windows() -> Vec<IgnoredApp> {
     }
     apps.sort_by_key(|app| app.name.to_lowercase());
     apps
+}
+
+/// The windows a user would call an app's window (as the taskbar shows
+/// them), front to back, as raw HWNDs. Includes Spotlight's own.
+pub(crate) fn app_windows() -> Vec<isize> {
+    let mut windows: Vec<isize> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut windows as *mut Vec<isize> as isize),
+        );
+    }
+    windows
 }
 
 /// `EnumWindows` callback: keeps windows a user would call an app's window.

@@ -25,3 +25,4 @@ pub mod selection;
 pub mod system;
 pub mod vault;
 pub mod win;
+pub mod wm;

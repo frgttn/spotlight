@@ -535,7 +535,7 @@ pub(crate) fn window_program(window: isize) -> Option<String> {
     (pid != 0).then(|| process_path(pid)).flatten()
 }
 
-fn process_path(pid: u32) -> Option<String> {
+pub(crate) fn process_path(pid: u32) -> Option<String> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buffer = [0u16; 1024];

@@ -19,6 +19,7 @@ use windows::{
 use crate::{
     links,
     system::{self, Outcome},
+    wm,
 };
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
@@ -114,6 +115,15 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::IgnoreClipApp(_)
         | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
+        Command::Window {
+            target: Some(target),
+            command,
+        } => wm::run(*target, *command),
+        Command::Window { target: None, .. } => {
+            Err("No window to arrange: the UI fills in the target".into())
+        }
+        Command::QuitApp(pid) => wm::quit_app(*pid),
+        Command::ForceQuit(pid) => wm::force_quit(*pid),
     }
 }
 
