@@ -5621,6 +5621,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spotlight-service"
+version = "0.1.0"
+dependencies = [
+ "spotlight-files",
+ "spotlight-platform-win",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "spotlight-store"
 version = "0.1.0"
 dependencies = [

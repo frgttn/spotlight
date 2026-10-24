@@ -30,7 +30,7 @@ use spotlight_core::{
 use spotlight_platform_win::{
     autostart, commands,
     hotkey::{self, Hotkey, Recorded, SetError},
-    win,
+    index_service, win,
 };
 
 use crate::{
@@ -168,6 +168,10 @@ pub struct Settings {
     exclusion_input: Entity<TextInput>,
     /// Redraws the File Search page while indexing, for its count.
     status_refresh: Option<Task<()>>,
+    /// The index service's installer or remover is running (behind its UAC
+    /// prompt), or how the last run went.
+    service_busy: bool,
+    service_message: Option<(SharedString, bool)>,
     autostart: bool,
     /// The build's version, shown on About.
     version: &'static str,
@@ -279,6 +283,8 @@ impl Settings {
             file_status,
             exclusion_input: cx.new(|cx| TextInput::new("Folder name or path", cx)),
             status_refresh: None,
+            service_busy: false,
+            service_message: None,
             autostart: autostart::is_enabled(),
             version,
             data_path,
@@ -1012,6 +1018,91 @@ impl Settings {
         }
     }
 
+    /// Installs or removes the index service: Windows asks for an
+    /// administrator first. Indexing starts again after, with or without it.
+    fn change_service(&mut self, install: bool, cx: &mut Context<Self>) {
+        if self.service_busy {
+            return;
+        }
+        self.service_busy = true;
+        self.service_message = None;
+        let job = cx.background_executor().spawn(async move {
+            if install {
+                index_service::install()
+            } else {
+                index_service::uninstall()
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = job.await;
+            this.update(cx, |this, cx| {
+                this.service_busy = false;
+                this.service_message = Some(match outcome {
+                    Ok(()) if install => (
+                        "Installed. Search Files now reads NTFS drives through it.".into(),
+                        false,
+                    ),
+                    Ok(()) => ("Removed. Search Files walks folders again.".into(), false),
+                    Err(err) => (err.into(), true),
+                });
+                cx.emit(SettingsEvent::FileSearchRebuild);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The index service's row: what it does, its state and a button.
+    fn service_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = index_service::state();
+        let available = index_service::service_exe().is_some();
+        let description = match (state, available) {
+            (index_service::State::Running, _) => {
+                "Running: NTFS drives are read from their file table and change journal, and changes are kept across restarts."
+            }
+            (index_service::State::Stopped, _) => {
+                "Installed but not running; Search Files walks folders meanwhile."
+            }
+            (index_service::State::NotInstalled, true) => {
+                "A Windows service that reads NTFS drives' file tables and change journals, which needs an administrator once. It tells Spotlight only about folders you can open yourself."
+            }
+            (index_service::State::NotInstalled, false) => {
+                "spotlight-service.exe isn't next to Spotlight, so it can't be installed from here."
+            }
+        };
+        let button = match state {
+            _ if self.service_busy => Some(chip("service", "Waiting…", false)),
+            index_service::State::NotInstalled if available => Some(
+                chip("service", "Install…", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.change_service(true, cx))),
+            ),
+            index_service::State::NotInstalled => None,
+            _ if available => Some(
+                chip("service", "Remove…", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.change_service(false, cx))),
+            ),
+            _ => None,
+        };
+        let message = self.service_message.clone().map(|(text, is_error)| {
+            div()
+                .px_4()
+                .pb_3()
+                .text_size(px(12.))
+                .text_color(rgba(if is_error {
+                    theme::ERROR
+                } else {
+                    theme::SUCCESS
+                }))
+                .child(text)
+        });
+        div()
+            .child(row("Fast indexing service", description).children(button))
+            .children(message)
+            .into_any_element()
+    }
+
     /// Keeps the File Search page's count moving while indexing, and stops
     /// once it's done.
     fn refresh_status_while_indexing(&mut self, cx: &mut Context<Self>) {
@@ -1198,6 +1289,8 @@ impl Settings {
                             ),
                     ),
             )
+            .child(divider())
+            .child(self.service_row(cx))
             .child(divider())
             .child(
                 row(
@@ -1696,7 +1789,13 @@ impl Page {
                 "Data folder",
             ],
             Page::Extension("clipboard") => &["Keep for", "Keep at most", "Win+V", "Ignored apps"],
-            Page::Extension(FILES_PAGE) => &["Index", "Folders", "Leave out", "Hidden files"],
+            Page::Extension(FILES_PAGE) => &[
+                "Index",
+                "Folders",
+                "Leave out",
+                "Fast indexing service",
+                "Hidden files",
+            ],
             Page::Extension("selection") => &["Copy the selection", "Ctrl+C"],
             Page::Extension("snippets") => &["Expand keywords", "Don't expand in"],
             Page::Extension("web") => &["Search engine", "Custom"],

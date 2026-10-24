@@ -22,7 +22,9 @@ mod search;
 pub use index::{Builder, EntryId, Index, Meta, NO_PARENT};
 pub use kind::Kind;
 pub use query::Query;
-pub use scan::{Exclusions, Listed, ScanOptions, add_tree, is_excluded, scan};
+pub use scan::{
+    Exclusions, Listed, ScanOptions, add_tree, is_excluded, root_check, scan, scan_into,
+};
 pub use search::{Hit, SearchOptions};
 
 #[cfg(test)]

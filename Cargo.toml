@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 # Patched dependencies, built but not linted or tested as ours.
 exclude = ["vendor"]
-default-members = ["crates/app"]
+default-members = ["crates/app", "crates/service"]
 
 [workspace.package]
 edition = "2024"

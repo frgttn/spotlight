@@ -124,7 +124,7 @@ pub(crate) fn unix_seconds(time: FILETIME) -> i64 {
 }
 
 /// `dir` with the `\\?\` prefix, so paths past 260 characters list too.
-pub(crate) fn long_path(dir: &Path) -> String {
+pub fn long_path(dir: &Path) -> String {
     let text = dir.to_string_lossy().replace('/', "\\");
     let text = text.trim_end_matches('\\');
     if text.starts_with(r"\\?\") {

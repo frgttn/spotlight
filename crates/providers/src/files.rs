@@ -8,7 +8,8 @@
 //! the index, under a read lock that changes take only briefly.
 
 use std::{
-    path::Path,
+    collections::HashMap,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -27,12 +28,14 @@ use spotlight_core::{
     view::{ListFilter, ListView, LiveRows, Preview, PreviewBody, View},
 };
 use spotlight_files::{
-    EntryId, Exclusions, Hit, Index, Kind, Listed, Query, ScanOptions, SearchOptions, add_tree,
-    is_excluded, scan,
+    Builder, EntryId, Exclusions, Hit, Index, Kind, Listed, Query, ScanOptions, SearchOptions,
+    add_tree, is_excluded, root_check, scan_into,
 };
 use spotlight_platform_win::{
     fswalk,
     fswatch::{self, Change, Watcher},
+    index_service::{Client, Entry as ServiceEntry, FromService, ROOT, ToService},
+    ntfs,
 };
 
 use crate::glyph;
@@ -171,12 +174,23 @@ impl Shared {
         let rules = rules(&config);
         *self.status.lock().expect("status") = Status::Indexing(0);
         self.progress.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let mut builder = Builder::default();
+        let (changes_tx, changes_rx) = async_channel::unbounded();
+
+        // The index service, if installed, has the roots on NTFS drives.
+        let served = self.fill_from_service(generation, &roots, &rules, &mut builder, &changes_tx);
+        let walked: Vec<PathBuf> = roots
+            .iter()
+            .zip(&served)
+            .filter(|(_, served)| !**served)
+            .map(|(root, _)| root.clone())
+            .collect();
 
         // Watching starts before the walk, so nothing that changes during it
         // is missed; those changes wait in the channel until it ends.
-        let (changes_tx, changes_rx) = async_channel::unbounded();
         let mut watchers = Vec::new();
-        for root in &roots {
+        for root in &walked {
             match fswatch::watch(root, changes_tx.clone()) {
                 Ok(watcher) => watchers.push(watcher),
                 Err(err) => eprintln!("[files] {err}"),
@@ -184,7 +198,6 @@ impl Shared {
         }
         drop(changes_tx);
 
-        let started = Instant::now();
         let stop = AtomicBool::new(false);
         let options = ScanOptions {
             threads: 0,
@@ -198,18 +211,20 @@ impl Shared {
             }
             fswalk::list(dir)
         };
-        let Some(index) = scan(&roots, &rules, &list, &options) else {
-            return;
-        };
-        if !self.current(generation) {
+        if !scan_into(&mut builder, &walked, &roots, &rules, &list, &options)
+            || !self.current(generation)
+        {
             return;
         }
+        let index = builder.finish();
         let took = started.elapsed();
         let (entries, memory_bytes) = (index.len(), index.memory_bytes());
         eprintln!(
-            "[files] indexed {entries} entries in {:.1} s, {:.1} MB",
+            "[files] indexed {entries} entries in {:.1} s, {:.1} MB ({} of {} roots from the index service)",
             took.as_secs_f64(),
-            memory_bytes as f64 / 1_048_576.
+            memory_bytes as f64 / 1_048_576.,
+            roots.len() - walked.len(),
+            roots.len()
         );
         *self.index.write().expect("file index") = index;
         *self.watchers.lock().expect("watchers") = watchers;
@@ -217,9 +232,128 @@ impl Shared {
             entries,
             memory_bytes,
             took,
+            from_service: roots.len() - walked.len(),
         };
 
         self.follow(generation, &rules, &changes_rx);
+    }
+
+    /// Fills `builder` with what the index service has for the roots on NTFS
+    /// drives, and sends their changes to `changes` from then on. Returns
+    /// which roots it filled; the others are walked. Without the service, or
+    /// if it goes away midway, it fills none.
+    fn fill_from_service(
+        &self,
+        generation: u64,
+        roots: &[PathBuf],
+        rules: &Exclusions,
+        builder: &mut Builder,
+        changes: &async_channel::Sender<Vec<Change>>,
+    ) -> Vec<bool> {
+        let none = vec![false; roots.len()];
+        let asked: Vec<usize> = (0..roots.len())
+            .filter(|&ix| ntfs::is_ntfs(&roots[ix]))
+            .collect();
+        if asked.is_empty() {
+            return none;
+        }
+        let Some(mut client) = Client::connect(Duration::from_millis(300)) else {
+            return none;
+        };
+        let request = ToService::Watch {
+            roots: asked.iter().map(|&ix| roots[ix].clone()).collect(),
+        };
+        if client.send(&request).is_err() {
+            return none;
+        }
+        let is_root = root_check(roots);
+        let mut served = none.clone();
+        // Per asked root, once its first entries arrive: its entry, what each
+        // snapshot entry became (`None`: left out), and folder paths.
+        let mut filled: Vec<Option<Snapshot>> = (0..asked.len()).map(|_| None).collect();
+        let mut pending = asked.len();
+        while pending > 0 {
+            let Ok(message) = client.recv() else {
+                eprintln!("[files] the index service went away; walking instead");
+                *builder = Builder::default();
+                return none;
+            };
+            if !self.current(generation) {
+                return none;
+            }
+            match message {
+                FromService::Entries { root, entries } => {
+                    let Some(&ix) = asked.get(root as usize) else {
+                        continue;
+                    };
+                    let root_path = &roots[ix];
+                    let snapshot = filled[root as usize].get_or_insert_with(|| Snapshot {
+                        root: builder.root(root_path),
+                        made: Vec::new(),
+                        folders: HashMap::new(),
+                    });
+                    for entry in entries {
+                        let made = snapshot.add(builder, root_path, &entry, rules, &is_root);
+                        snapshot.made.push(made);
+                    }
+                    self.progress.store(builder.len(), Ordering::Relaxed);
+                }
+                FromService::Ready { root } => {
+                    if let Some(&ix) = asked.get(root as usize) {
+                        filled[root as usize].get_or_insert_with(|| Snapshot {
+                            root: builder.root(&roots[ix]),
+                            made: Vec::new(),
+                            folders: HashMap::new(),
+                        });
+                        served[ix] = true;
+                        pending -= 1;
+                    }
+                }
+                FromService::Unavailable { root, why } => {
+                    if let Some(&ix) = asked.get(root as usize) {
+                        eprintln!(
+                            "[files] the index service can't serve {}: {why}",
+                            roots[ix].display()
+                        );
+                        pending -= 1;
+                    }
+                }
+                // For roots already complete.
+                FromService::Changes { changes: batch, .. } => {
+                    let _ = changes.send_blocking(batch);
+                }
+                FromService::Resync { .. } => {
+                    let _ = changes.send_blocking(vec![Change::Overflow]);
+                }
+            }
+        }
+        if served.iter().any(|&served| served) {
+            let changes = changes.clone();
+            let spawned = thread::Builder::new()
+                .name("file-index-service".into())
+                .spawn(move || {
+                    loop {
+                        let batch = match client.recv() {
+                            Ok(FromService::Changes { changes, .. }) => changes,
+                            Ok(FromService::Resync { .. }) => vec![Change::Overflow],
+                            Ok(_) => continue,
+                            Err(_) => {
+                                // Walk instead; it comes back on the next start.
+                                eprintln!("[files] lost the index service; indexing again");
+                                vec![Change::Overflow]
+                            }
+                        };
+                        let gone = matches!(batch.last(), Some(Change::Overflow));
+                        if changes.send_blocking(batch).is_err() || gone {
+                            return;
+                        }
+                    }
+                });
+            if let Err(err) = spawned {
+                eprintln!("[files] couldn't follow the index service: {err}");
+            }
+        }
+        served
     }
 
     /// Applies changes in batches until the watchers stop.
@@ -260,10 +394,12 @@ impl Shared {
             }
             // Read first: the guard of a scrutinee lives through the `if let`.
             let took = match *self.status.lock().expect("status") {
-                Status::Ready { took, .. } => Some(took),
+                Status::Ready {
+                    took, from_service, ..
+                } => Some((took, from_service)),
                 _ => None,
             };
-            if let Some(took) = took {
+            if let Some((took, from_service)) = took {
                 let (entries, memory_bytes) = {
                     let index = self.index.read().expect("file index");
                     (index.len(), index.memory_bytes())
@@ -272,9 +408,53 @@ impl Shared {
                     entries,
                     memory_bytes,
                     took,
+                    from_service,
                 };
             }
         }
+    }
+}
+
+/// A root's snapshot from the index service, as it arrives.
+struct Snapshot {
+    root: EntryId,
+    /// Per snapshot entry, the index entry it became; `None` when it was
+    /// left out (by the rules, or being under something left out).
+    made: Vec<Option<EntryId>>,
+    /// The paths of the folders among them, by snapshot index.
+    folders: HashMap<u32, PathBuf>,
+}
+
+impl Snapshot {
+    /// Adds `entry` (the next one) unless the rules leave it out.
+    fn add(
+        &mut self,
+        builder: &mut Builder,
+        root_path: &Path,
+        entry: &ServiceEntry,
+        rules: &Exclusions,
+        is_root: &impl Fn(&Path) -> bool,
+    ) -> Option<EntryId> {
+        let index = self.made.len() as u32;
+        let (parent, dir) = if entry.parent == ROOT {
+            (self.root, root_path.to_path_buf())
+        } else {
+            let parent = (*self.made.get(entry.parent as usize)?)?;
+            (parent, self.folders.get(&entry.parent)?.clone())
+        };
+        if is_excluded(rules, &dir, &entry.listed) {
+            return None;
+        }
+        let path = dir.join(&entry.listed.name);
+        // A root of its own, inside this one, comes as itself.
+        if entry.listed.dir && is_root(&path) {
+            return None;
+        }
+        let id = builder.add(parent, meta(&entry.listed));
+        if entry.listed.dir {
+            self.folders.insert(index, path);
+        }
+        Some(id)
     }
 }
 

@@ -136,6 +136,25 @@ pub fn scan<L>(
 where
     L: Fn(&Path) -> io::Result<Vec<Listed>> + Sync,
 {
+    let mut builder = Builder::default();
+    scan_into(&mut builder, roots, roots, exclusions, list, options).then(|| builder.finish())
+}
+
+/// [`scan`] into a builder that may hold other roots already (ones the
+/// index service filled in). `all_roots` are every root of the index: a
+/// folder that is one of them is left to its own root. `false` when
+/// cancelled.
+pub fn scan_into<L>(
+    builder: &mut Builder,
+    roots: &[PathBuf],
+    all_roots: &[PathBuf],
+    exclusions: &Exclusions,
+    list: &L,
+    options: &ScanOptions,
+) -> bool
+where
+    L: Fn(&Path) -> io::Result<Vec<Listed>> + Sync,
+{
     let threads = match options.threads {
         0 => thread::available_parallelism()
             .map_or(4, |n| n.get())
@@ -143,14 +162,13 @@ where
         n => n,
     };
     let queue = Queue::default();
-    let mut builder = Builder::default();
     let cancelled = || {
         options
             .cancel
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
     };
 
-    let finished = thread::scope(|scope| {
+    thread::scope(|scope| {
         let (found_tx, found_rx) = mpsc::channel::<(EntryId, PathBuf, Vec<Listed>)>();
         for _ in 0..threads {
             let found_tx = found_tx.clone();
@@ -173,8 +191,7 @@ where
             pending += 1;
         }
         // A root inside another is walked as itself, not again from outside.
-        let root_keys: Vec<String> = roots.iter().map(|root| path_key(root)).collect();
-        let is_root = |path: &Path| roots.len() > 1 && root_keys.contains(&path_key(path));
+        let is_root = root_check(all_roots);
         while pending > 0 {
             let Ok((id, dir, listed)) = found_rx.recv() else {
                 break;
@@ -200,8 +217,14 @@ where
         }
         queue.close();
         true
-    });
-    finished.then(|| builder.finish())
+    })
+}
+
+/// Whether a folder's path is one of `roots`: such a folder is a root of
+/// its own and isn't walked again from the root above it.
+pub fn root_check(roots: &[PathBuf]) -> impl Fn(&Path) -> bool + Sync + use<> {
+    let keys: Vec<String> = roots.iter().map(|root| path_key(root)).collect();
+    move |path: &Path| keys.len() > 1 && keys.contains(&path_key(path))
 }
 
 /// Adds what folder `dir` (entry `id`, already in the index) holds, and so on

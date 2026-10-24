@@ -10,7 +10,7 @@ use std::{fs, io, path::Path, sync::OnceLock};
 
 use windows::{
     Win32::{
-        Foundation::{ERROR_NOT_FOUND, NTSTATUS},
+        Foundation::{ERROR_NOT_FOUND, HLOCAL, LocalFree, NTSTATUS},
         Security::{
             Credentials::{
                 CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
@@ -20,7 +20,8 @@ use windows::{
                 BCRYPT_AES_GCM_ALG_HANDLE, BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO, BCRYPT_FLAGS,
                 BCRYPT_HMAC_SHA256_ALG_HANDLE, BCRYPT_KEY_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
                 BCryptDecrypt, BCryptDestroyKey, BCryptEncrypt, BCryptGenRandom,
-                BCryptGenerateSymmetricKey, BCryptHash,
+                BCryptGenerateSymmetricKey, BCryptHash, CRYPT_INTEGER_BLOB,
+                CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
             },
         },
     },
@@ -161,6 +162,77 @@ pub fn seal_folder(dir: &Path) -> usize {
     sealed
 }
 
+/// Seals `plain` with `key`, as files are sealed: for data with a key of its
+/// own (the index service's snapshots).
+pub fn seal_with(key: &Key, plain: &[u8]) -> io::Result<Vec<u8>> {
+    seal(key, plain)
+}
+
+/// Opens what [`seal_with`] sealed; fails on a wrong key or changed data.
+pub fn unseal_with(key: &Key, sealed: &[u8]) -> io::Result<Vec<u8>> {
+    if !sealed.starts_with(MAGIC) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not sealed"));
+    }
+    unseal(key, sealed)
+}
+
+/// A new random key.
+pub fn random_key() -> io::Result<Key> {
+    let mut key = Key::default();
+    random(&mut key)?;
+    Ok(key)
+}
+
+/// `key` protected with DPAPI for the current Windows account: only a
+/// process running as that account on this machine can unprotect it. For
+/// the service, that account is LocalSystem.
+pub fn protect_key(key: &Key) -> io::Result<Vec<u8>> {
+    dpapi(key, true)
+}
+
+pub fn unprotect_key(protected: &[u8]) -> io::Result<Key> {
+    Key::try_from(dpapi(protected, false)?.as_slice())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not a key"))
+}
+
+fn dpapi(data: &[u8], protect: bool) -> io::Result<Vec<u8>> {
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    let done = unsafe {
+        if protect {
+            CryptProtectData(
+                &input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        }
+    };
+    done.map_err(|err| io::Error::other(err.message()))?;
+    let bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
+    }
+    Ok(bytes)
+}
+
 /// `MAGIC`, a random nonce, the AES-256-GCM ciphertext and its tag.
 fn seal(key: &Key, plain: &[u8]) -> io::Result<Vec<u8>> {
     let mut nonce = [0u8; NONCE];
@@ -257,6 +329,18 @@ fn check(status: NTSTATUS) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_keys_and_sealed_data_round_trip() {
+        let key = random_key().unwrap();
+        let protected = protect_key(&key).unwrap();
+        assert_ne!(&protected[..], &key[..]);
+        assert_eq!(unprotect_key(&protected).unwrap(), key);
+        let sealed = seal_with(&key, b"snapshot").unwrap();
+        assert_eq!(unseal_with(&key, &sealed).unwrap(), b"snapshot");
+        assert!(unseal_with(&random_key().unwrap(), &sealed).is_err());
+        assert!(unseal_with(&key, b"plain").is_err());
+    }
 
     #[test]
     fn sealing_round_trips_and_detects_changes() {

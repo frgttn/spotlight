@@ -113,6 +113,8 @@ pub enum Status {
         entries: usize,
         memory_bytes: usize,
         took: Duration,
+        /// Roots the index service filled in; the others were walked.
+        from_service: usize,
     },
 }
 
@@ -126,12 +128,21 @@ impl Status {
                 entries,
                 memory_bytes,
                 took,
-            } => format!(
-                "{} files and folders, indexed in {:.1} s, {:.1} MB",
-                thousands(*entries),
-                took.as_secs_f64(),
-                *memory_bytes as f64 / 1_048_576.
-            ),
+                from_service,
+            } => {
+                let mut line = format!(
+                    "{} files and folders, indexed in {:.1} s, {:.1} MB",
+                    thousands(*entries),
+                    took.as_secs_f64(),
+                    *memory_bytes as f64 / 1_048_576.
+                );
+                match from_service {
+                    0 => {}
+                    1 => line.push_str(", one folder through the indexing service"),
+                    n => line.push_str(&format!(", {n} folders through the indexing service")),
+                }
+                line
+            }
         }
     }
 }
@@ -223,10 +234,11 @@ mod tests {
             entries: 152_340,
             memory_bytes: 7 * 1_048_576,
             took: Duration::from_millis(1_234),
+            from_service: 1,
         };
         assert_eq!(
             ready.describe(),
-            "152,340 files and folders, indexed in 1.2 s, 7.0 MB"
+            "152,340 files and folders, indexed in 1.2 s, 7.0 MB, one folder through the indexing service"
         );
     }
 }
