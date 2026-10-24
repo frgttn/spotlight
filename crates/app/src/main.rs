@@ -7,7 +7,8 @@
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
 //!
 //! `spotlight.exe --settings` opens the settings window (of the running
-//! instance, if there is one).
+//! instance, if there is one); `spotlight.exe "spotlight://…"` opens that link
+//! (Windows starts it so for links, see `protocol`).
 
 // A GUI-subsystem binary, so starting at login or from the Start menu opens no
 // console window. Logs still reach a terminal it was started from; see `main`.
@@ -31,6 +32,7 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
+    deeplink,
     snippet,
     web::SearchEngine,
 };
@@ -38,7 +40,7 @@ use spotlight_platform_win::{
     clipboard,
     hotkey::{self, Hotkey},
     instance::{self, Instance},
-    metrics, vault, win,
+    metrics, protocol, vault, win,
 };
 use spotlight_providers::{Builtins, clipboard::ClipboardHistory, web::Web};
 use spotlight_store::{Key, Store};
@@ -100,6 +102,7 @@ fn main() {
     win::attach_parent_console();
     let self_test = env::var_os("SPOTLIGHT_SELFTEST").is_some();
     let settings_requested = env::args().skip(1).any(|arg| arg == "--settings");
+    let link = env::args().skip(1).find(|arg| is_link(arg));
 
     // Before anything else, so a second launch doesn't grab a fallback hotkey.
     // The self-test runs alongside a normal instance, so it skips this.
@@ -109,10 +112,10 @@ fn main() {
         match instance::acquire() {
             Instance::Primary(guard) => Some(guard),
             Instance::Secondary => {
-                let message = if settings_requested {
-                    instance::SETTINGS
-                } else {
-                    instance::SHOW
+                let message = match &link {
+                    Some(link) => link.as_str(),
+                    None if settings_requested => instance::SETTINGS,
+                    None => instance::SHOW,
                 };
                 if let Err(err) = instance::send(message) {
                     eprintln!("[spotlight] already running, but could not reach it: {err}");
@@ -123,7 +126,14 @@ fn main() {
     };
     let (messages_tx, messages_rx) = async_channel::unbounded::<String>();
     if !self_test {
+        // A link that started Spotlight is handled like one sent later.
+        if let Some(link) = link {
+            messages_tx.send_blocking(link).ok();
+        }
         instance::listen(messages_tx);
+        if let Err(err) = protocol::register(deeplink::SCHEME) {
+            eprintln!("[spotlight] {}:// links won't open Spotlight: {err}", deeplink::SCHEME);
+        }
     }
 
     let synthetic = env::var("SPOTLIGHT_SYNTHETIC")
@@ -330,7 +340,7 @@ fn main() {
         let settings_state = state.clone();
         cx.on_action(move |_: &OpenSettings, cx| open_settings(&settings_state, cx));
 
-        // Later launches of the executable (Start menu, a shortcut) open this instance.
+        // Later launches of the executable (Start menu, a shortcut, a link) open this instance.
         let messages_state = state.clone();
         cx.spawn(async move |cx| {
             while let Ok(message) = messages_rx.recv().await {
@@ -343,6 +353,14 @@ fn main() {
                             .ok();
                     }
                     instance::SETTINGS => open_settings(state, cx),
+                    link if is_link(link) => {
+                        state
+                            .launcher
+                            .update(cx, |launcher, window, cx| {
+                                launcher.open_link(link, window, cx)
+                            })
+                            .ok();
+                    }
                     other => eprintln!("[spotlight] ignoring unknown message {other:?}"),
                 })
                 .ok();
@@ -680,6 +698,12 @@ fn save_setting(state: &AppState, key: &'static str, value: String, cx: &mut App
             }
         })
         .detach();
+}
+
+/// Whether a command-line argument or instance message is a `spotlight:` link.
+fn is_link(text: &str) -> bool {
+    text.get(..deeplink::SCHEME.len() + 1)
+        .is_some_and(|start| start.eq_ignore_ascii_case(&format!("{}:", deeplink::SCHEME)))
 }
 
 fn hotkey_label(hotkey: Option<Hotkey>) -> SharedString {

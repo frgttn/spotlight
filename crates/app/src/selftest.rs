@@ -212,6 +212,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("form", form_round_trip(window, cx).await),
         ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
+        ("deeplink", deeplink_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
@@ -560,6 +561,48 @@ async fn back_to_search(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> Re
         Ok(())
     } else {
         Err(format!("Esc gave {back:?}"))
+    }
+}
+
+/// A `spotlight://` link to Clipboard History, by its title's slug: the
+/// launcher shows just that command and asks, Enter opens it with the
+/// link's fallback text in the search field.
+async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    const LINK: &str =
+        "spotlight://extensions/spotlight/clipboard/clipboard-history?fallbackText=zzq";
+    let executor = cx.background_executor().clone();
+    window
+        .update(cx, |launcher, window, cx| launcher.open_link(LINK, window, cx))
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let rows = window
+        .update(cx, |launcher, _, _| launcher.result_titles())
+        .unwrap_or_default();
+    if rows != ["Clipboard History"] {
+        return format!("link showed {rows:?}");
+    }
+    press(window, "ctrl-k", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let actions = window
+        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .ok()
+        .flatten();
+    if actions.as_deref() != Some(&["Open Command".to_owned(), "Always Open Command".to_owned()])
+    {
+        return format!("asked with {actions:?}");
+    }
+    press(window, "ctrl-k", cx);
+    press(window, "enter", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let opened = window
+        .update(cx, |launcher, _, cx| (launcher.screen_title(), launcher.query(cx)))
+        .ok();
+    if opened != Some((Some("Clipboard History".into()), "zzq".into())) {
+        return format!("Enter gave {opened:?}");
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => "asked, opened with its text, back to search".into(),
+        Err(err) => err,
     }
 }
 

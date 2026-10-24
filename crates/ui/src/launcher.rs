@@ -2,13 +2,14 @@
 //! views opened on top of it (see `views`).
 
 mod clipboard;
+mod links;
 mod quicklinks;
 mod snippets;
 mod views;
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
@@ -27,6 +28,7 @@ use gpui::{
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
+    deeplink,
     frecency::{self, Frecency},
     item::{Command, Icon, SearchItem},
     item_id,
@@ -45,6 +47,7 @@ use spotlight_store::{Calculation, Store};
 
 use self::{
     clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
+    links::PendingLink,
     views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
 };
 use crate::{
@@ -159,6 +162,13 @@ enum EntryKind {
     /// A calculator history entry, by its id in the store.
     DeleteCalculation(i64),
     ClearCalculations,
+    /// Runs the command a link named; `always` also stops asking for it.
+    OpenLink {
+        always: bool,
+    },
+    CopyDeeplink,
+    /// Asks again before the item opens from a link.
+    DistrustLink,
 }
 
 impl Entry {
@@ -281,6 +291,11 @@ pub struct Launcher {
     /// shut down): that item's id and the action's index. Moving the selection
     /// or typing clears it.
     confirming: Option<(String, usize)>,
+    /// The command a `spotlight://` link named, shown alone until Enter.
+    /// Typing or hiding drops it.
+    pending_link: Option<PendingLink>,
+    /// Ids of the items that open from links without asking.
+    trusted_links: HashSet<String>,
     /// A short message in the footer, for actions that keep the window open.
     toast: Option<SharedString>,
     /// Bumped on every toast, so an older toast's timer doesn't clear a newer one.
@@ -384,6 +399,11 @@ impl Launcher {
                 })
             })
             .unwrap_or_default();
+        let trusted_links = store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.setting(links::TRUSTED_SETTING).ok()?)
+            .map(|setting| links::parse_trusted(&setting).collect())
+            .unwrap_or_default();
         let (aliases, saved_hotkeys) = store
             .as_ref()
             .and_then(|store| store.lock().ok())
@@ -432,6 +452,8 @@ impl Launcher {
             selected: 0,
             panel: None,
             confirming: None,
+            pending_link: None,
+            trusted_links,
             toast: None,
             toast_generation: 0,
             hud: None,
@@ -572,6 +594,7 @@ impl Launcher {
         // Catalog indices moved, so the rows are rebuilt (and the selection resets).
         let query = self.query(cx);
         self.refilter(&query);
+        self.pin_pending_link();
         self.load_icons(shell_icons, window_scale, cx);
         cx.notify();
     }
@@ -835,6 +858,18 @@ impl Launcher {
         if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
             return entries;
         }
+        if self.link_pending_for(&item.id) {
+            return vec![
+                Entry {
+                    title: "Open Command".into(),
+                    kind: EntryKind::OpenLink { always: false },
+                },
+                Entry {
+                    title: "Always Open Command".into(),
+                    kind: EntryKind::OpenLink { always: true },
+                },
+            ];
+        }
         let mut add = |title: &str, kind| {
             entries.push(Entry {
                 title: title.to_owned(),
@@ -856,6 +891,10 @@ impl Launcher {
         if self.frecency.contains_key(&item.id) {
             add("Reset Ranking", EntryKind::ResetRanking);
         }
+        add("Copy Deeplink", EntryKind::CopyDeeplink);
+        if self.trusted_links.contains(&item.id) {
+            add("Ask Before Opening from Links", EntryKind::DistrustLink);
+        }
         entries
     }
 
@@ -870,6 +909,7 @@ impl Launcher {
         let changed_at = Instant::now();
         let query = self.query(cx);
         self.revealed = false;
+        self.pending_link = None;
         let filter_ms = self.refilter(&query);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
@@ -1021,6 +1061,7 @@ impl Launcher {
     }
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.pending_link = None;
         self.close_editor(None, cx);
         self.forget_preview_image();
         win::hide(self.hwnd);
@@ -1269,6 +1310,18 @@ impl Launcher {
                 return self.delete_calculation(calculation, cx);
             }
             EntryKind::ClearCalculations => return self.clear_calculations(cx),
+            EntryKind::OpenLink { always } => return self.open_pending_link(always, window, cx),
+            EntryKind::CopyDeeplink => {
+                return self.run_command(&Command::Copy(deeplink::for_item(&id)), cx);
+            }
+            EntryKind::DistrustLink => {
+                self.distrust_link(&id, cx);
+                self.show_toast(
+                    format!("{title} will ask before opening from links").into(),
+                    cx,
+                );
+                return;
+            }
         };
         // Using an answer keeps it; using a history entry moves it to the top.
         if id == CALC_ANSWER_ID {
@@ -1988,6 +2041,8 @@ impl Launcher {
                 .is_some_and(|(id, _)| id == &item.id);
         let subtitle: SharedString = if confirming {
             "Press Enter again to confirm".into()
+        } else if selected && self.link_pending_for(&item.id) {
+            "Opened from a link · Enter to open".into()
         } else {
             item.subtitle.clone().unwrap_or_default().into()
         };
