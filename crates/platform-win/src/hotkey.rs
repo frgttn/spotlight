@@ -389,8 +389,8 @@ thread_local! {
     /// The key of a hotkey `hooked_key` took: its repeats and release are
     /// swallowed too.
     static SWALLOWED: Cell<Option<u16>> = const { Cell::new(None) };
-    /// Bits of `MODIFIER_KEYS` that `hooked_key` saw go down and not up, and
-    /// the time of the last key event it saw (see `track_modifiers`).
+    /// Bits of `MODIFIER_KEYS` that the hooks saw go down and not up, and
+    /// the time of the last key event they saw (see `track_modifiers`).
     static HELD: Cell<(u8, u32)> = const { Cell::new((0, 0)) };
 }
 
@@ -642,14 +642,14 @@ fn hookable(hotkey: Hotkey) -> Result<(), SetError> {
     Ok(())
 }
 
-/// The hotkey `vk` makes with the modifiers held now.
-fn held_with(vk: u16) -> Hotkey {
-    let pressed = |key: VIRTUAL_KEY| unsafe { GetAsyncKeyState(key.0 as i32) } < 0;
+/// The hotkey `vk` makes with the modifiers `held` (see `track_modifiers`).
+fn hotkey_with(held: u8, vk: u16) -> Hotkey {
+    let any = |bits: u8| held & bits != 0;
     Hotkey {
-        ctrl: pressed(VK_CONTROL),
-        alt: pressed(VK_MENU),
-        shift: pressed(VK_SHIFT),
-        win: pressed(VK_LWIN) || pressed(VK_RWIN),
+        ctrl: any(0b11),
+        alt: any(0b1100),
+        shift: any(0b11_0000),
+        win: any(0b1100_0000),
         vk,
     }
 }
@@ -658,12 +658,18 @@ fn held_with(vk: u16) -> Hotkey {
 /// their state stays current; any other key press is reported and swallowed.
 unsafe extern "system" fn record_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        // Every event, so the modifiers stay current between presses.
+        let held = if code == HC_ACTION as i32 {
+            track_modifiers(event, key_down)
+        } else {
+            0
+        };
         if code == HC_ACTION as i32 && key_down {
-            let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let vk = event.vkCode as u16;
             if !is_modifier(vk) {
-                let hotkey = held_with(vk);
+                let hotkey = hotkey_with(held, vk);
                 let recorded = if hotkey.ctrl || hotkey.alt || hotkey.shift || hotkey.win {
                     Recorded::Hotkey(hotkey)
                 } else if vk == VK_ESCAPE.0 {
@@ -715,10 +721,11 @@ fn modifiers_from_windows() -> u8 {
         .fold(0, |held, (bit, _)| held | 1 << bit)
 }
 
-/// Follows the modifiers through the hook's own events and returns those
-/// held now. `GetAsyncKeyState` lags here: with another app in front it
-/// often still says Win is up when V arrives, which handed the first Win+V
-/// to Windows.
+/// Follows the modifiers through the hooks' own events and returns those
+/// held now. `GetAsyncKeyState` lags here: it often still says Win is up
+/// when V arrives, which handed the first Win+V to Windows and made the
+/// recorder miss the first Win+W. Both hooks run on the hotkey thread and
+/// may see the same event; applying it twice changes nothing.
 fn track_modifiers(event: &KBDLLHOOKSTRUCT, key_down: bool) -> u8 {
     let (mut held, last) = HELD.get();
     if event.time.wrapping_sub(last) > HELD_STALE_MS {
@@ -766,14 +773,7 @@ unsafe extern "system" fn hooked_key(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             if key_down && !is_modifier(vk) {
                 let pressed_at = Instant::now();
-                let any = |bits: u8| held & bits != 0;
-                let hotkey = Hotkey {
-                    ctrl: any(0b11),
-                    alt: any(0b1100),
-                    shift: any(0b11_0000),
-                    win: any(0b1100_0000),
-                    vk,
-                };
+                let hotkey = hotkey_with(held, vk);
                 let target = HOOKED.with(|hooked| {
                     let hooked = hooked.borrow();
                     let found = hooked.iter().find(|(held, _)| *held == hotkey);
@@ -942,6 +942,27 @@ mod tests {
         assert!(hookable(Hotkey::parse("Win+Shift+K").unwrap()).is_ok());
         assert!(hookable(Hotkey::parse("Win+L").unwrap()).is_err());
         assert!(hookable(Hotkey::parse("Win+Shift+L").unwrap()).is_err());
+    }
+
+    #[test]
+    fn modifiers_follow_the_hook_events() {
+        let event = |key: VIRTUAL_KEY, time: u32| KBDLLHOOKSTRUCT {
+            vkCode: u32::from(key.0),
+            time,
+            ..Default::default()
+        };
+        HELD.set((0, 100));
+        let held = track_modifiers(&event(VK_LWIN, 200), true);
+        assert_eq!(hotkey_with(held, u16::from(b'W')).to_string(), "Win+W");
+        // A side-neutral Shift counts as the left one.
+        let held = track_modifiers(&event(VK_SHIFT, 300), true);
+        assert_eq!(
+            hotkey_with(held, u16::from(b'W')).to_string(),
+            "Shift+Win+W"
+        );
+        track_modifiers(&event(VK_SHIFT, 400), false);
+        let held = track_modifiers(&event(VK_LWIN, 500), false);
+        assert_eq!(held, 0);
     }
 
     #[test]
