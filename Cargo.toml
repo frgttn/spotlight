@@ -16,6 +16,7 @@ publish = false
 
 [workspace.dependencies]
 spotlight-core = { path = "crates/core" }
+spotlight-files = { path = "crates/files" }
 spotlight-platform-win = { path = "crates/platform-win" }
 spotlight-providers = { path = "crates/providers" }
 spotlight-search = { path = "crates/search" }
@@ -24,9 +25,13 @@ spotlight-ui = { path = "crates/ui" }
 async-channel = "2"
 # Calculator: units, arbitrary precision, no dependencies of its own.
 fend-core = "1.5.9"
+# File index: sorted, compressed set of file names with prefix lookups.
+fst = "0.4.7"
 gpui = "=0.2.2"
 # Only for its `Frame`/`RgbaImage` types in GPUI's image API; same version as gpui uses.
 image = { version = "0.25", default-features = false }
+# File search matcher: SIMD Smith-Waterman with typos, no dependencies (taken from fff).
+neo_frizbee = "0.13.3"
 nucleo-matcher = "0.3.1"
 # Markdown in detail views; no HTML output needed.
 pulldown-cmark = { version = "0.13", default-features = false }
