@@ -213,6 +213,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
         ("deeplink", deeplink_round_trip(window, cx).await),
+        ("switcher", switcher_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
@@ -567,12 +568,41 @@ async fn back_to_search(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> Re
 /// A `spotlight://` link to Clipboard History, by its title's slug: the
 /// launcher shows just that command and asks, Enter opens it with the
 /// link's fallback text in the search field.
+/// Switch Windows lists the open windows, Search Processes this session's
+/// processes; Enter isn't pressed in either (it would switch or end one).
+async fn switcher_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let mut counts = Vec::new();
+    for title in ["Switch Windows", "Search Processes"] {
+        if let Err(err) = open_from_search(window, title, title, cx).await {
+            return err;
+        }
+        let opened = window
+            .update(cx, |launcher, _, _| {
+                (launcher.screen_title(), launcher.result_titles().len())
+            })
+            .ok();
+        match opened {
+            Some((Some(screen), rows)) if screen == title && rows > 0 => counts.push(rows),
+            other => return format!("{title} gave {other:?}"),
+        }
+        if let Err(err) = back_to_search(window, cx).await {
+            return err;
+        }
+    }
+    format!(
+        "{} windows, {} processes, back to search",
+        counts[0], counts[1]
+    )
+}
+
 async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
     const LINK: &str =
         "spotlight://extensions/spotlight/clipboard/clipboard-history?fallbackText=zzq";
     let executor = cx.background_executor().clone();
     window
-        .update(cx, |launcher, window, cx| launcher.open_link(LINK, window, cx))
+        .update(cx, |launcher, window, cx| {
+            launcher.open_link(LINK, window, cx)
+        })
         .ok();
     executor.timer(Duration::from_millis(SETTLE_MS)).await;
     let rows = window
@@ -587,15 +617,16 @@ async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) 
         .update(cx, |launcher, _, _| launcher.panel_actions())
         .ok()
         .flatten();
-    if actions.as_deref() != Some(&["Open Command".to_owned(), "Always Open Command".to_owned()])
-    {
+    if actions.as_deref() != Some(&["Open Command".to_owned(), "Always Open Command".to_owned()]) {
         return format!("asked with {actions:?}");
     }
     press(window, "ctrl-k", cx);
     press(window, "enter", cx);
     executor.timer(Duration::from_millis(SETTLE_MS)).await;
     let opened = window
-        .update(cx, |launcher, _, cx| (launcher.screen_title(), launcher.query(cx)))
+        .update(cx, |launcher, _, cx| {
+            (launcher.screen_title(), launcher.query(cx))
+        })
         .ok();
     if opened != Some((Some("Clipboard History".into()), "zzq".into())) {
         return format!("Enter gave {opened:?}");

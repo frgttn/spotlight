@@ -135,10 +135,16 @@ impl Launcher {
         let command = deeplink::apply_arguments(action.command.clone(), &link.arguments);
         let opens_view = matches!(
             command,
-            Command::PushView(_) | Command::OpenProviderView { .. } | Command::OpenCalculatorHistory
+            Command::PushView(_)
+                | Command::OpenProviderView { .. }
+                | Command::OpenCalculatorHistory
         );
-        if opens_view && !self.visible {
-            self.show(Instant::now(), window, cx);
+        if !self.visible {
+            // Window commands act on the window the link was opened from.
+            self.previous_window = spotlight_platform_win::clipboard::foreground_window();
+            if opens_view {
+                self.show(Instant::now(), window, cx);
+            }
         }
         self.pending_link = None;
         self.record_visit(id, cx);

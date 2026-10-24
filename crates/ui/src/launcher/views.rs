@@ -172,6 +172,18 @@ impl Screen {
 impl Launcher {
     /// Opens `view` on top of the current screen.
     pub(super) fn push_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        // Rows of their own (open windows, processes) bring icons the
+        // catalog didn't have.
+        let icons: Vec<(String, String)> = match &view {
+            View::List(list) | View::Grid(list) => list
+                .items
+                .iter()
+                .filter(|item| !self.icons.contains_key(&item.id))
+                .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.load_icons(icons, window.scale_factor(), cx);
         let screen = Screen::new(view, self.scroll.is_enabled(), cx);
         self.screens.push(screen);
         self.enter_screen(window, cx);

@@ -12,8 +12,10 @@ pub mod selection;
 pub mod settings_pages;
 pub mod snippets;
 pub mod spotlight;
+pub mod switcher;
 pub mod system;
 pub mod web;
+pub mod windows;
 
 use std::{
     path::PathBuf,
@@ -59,6 +61,16 @@ mod glyph {
     pub const SNIPPET: char = '\u{E70B}';
     pub const IMPORT: char = '\u{E8B5}';
     pub const EXPORT: char = '\u{EDE1}';
+    pub const DOCK_LEFT: char = '\u{E90C}';
+    pub const DOCK_RIGHT: char = '\u{E90D}';
+    pub const DOCK_BOTTOM: char = '\u{E90E}';
+    pub const MAXIMIZE: char = '\u{E922}';
+    pub const RESTORE_WINDOW: char = '\u{E923}';
+    pub const MINIMIZE: char = '\u{E921}';
+    pub const PIN: char = '\u{E718}';
+    pub const SWITCH: char = '\u{E8AB}';
+    pub const WINDOWS: char = '\u{E7C4}';
+    pub const PROCESSES: char = '\u{E9D9}';
 }
 
 /// The built-in providers, and the ones the app talks to again later.
@@ -93,6 +105,8 @@ pub fn all(
         Arc::new(control_panel::ControlPanel),
         Arc::new(games::Games),
         Arc::new(system::System),
+        Arc::new(windows::WindowManagement),
+        Arc::new(switcher::Switcher),
         clipboard.clone(),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(store.clone())),

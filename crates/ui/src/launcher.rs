@@ -1423,6 +1423,19 @@ impl Launcher {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
+            // Hidden first, so it doesn't take the foreground back from a
+            // window just brought up, and Windows doesn't activate another.
+            Command::Window { target, command } => {
+                let target = target.unwrap_or(self.previous_window);
+                self.hide(cx);
+                return self.run_in_background(
+                    Command::Window {
+                        target: Some(target),
+                        command: *command,
+                    },
+                    cx,
+                );
+            }
             command => self.run_in_background(command.clone(), cx),
         }
         self.hide(cx);
@@ -1535,6 +1548,10 @@ impl Launcher {
             self.record_visit(id.to_owned(), cx);
             self.perform(&action.command, window, cx);
             return;
+        }
+        if matches!(action.command, Command::Window { target: None, .. }) {
+            // The hotkey was pressed in the window it's for.
+            self.previous_window = system_clipboard::foreground_window();
         }
         if action.command.needs_selection() {
             // The hotkey was pressed in the app whose selection it's for.
