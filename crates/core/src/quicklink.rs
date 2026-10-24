@@ -607,7 +607,9 @@ pub fn search_template(link: &str) -> Option<String> {
         return None;
     }
     let template = fill(link, &bang_values(&arguments, MARK)).replace(MARK, "{query}");
-    crate::web::check_template(&template).ok().map(|()| template)
+    crate::web::check_template(&template)
+        .ok()
+        .map(|()| template)
 }
 
 /// Whether `link` contains `{clipboard}`.

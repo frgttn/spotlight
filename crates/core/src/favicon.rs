@@ -43,9 +43,7 @@ pub fn candidates(html: &str, page: &str, size: u32) -> Vec<String> {
         };
         let rel = get("rel").unwrap_or_default().to_ascii_lowercase();
         let rels: Vec<&str> = rel.split_ascii_whitespace().collect();
-        let touch = rels
-            .iter()
-            .any(|rel| rel.starts_with("apple-touch-icon"));
+        let touch = rels.iter().any(|rel| rel.starts_with("apple-touch-icon"));
         if !touch && !rels.contains(&"icon") {
             continue;
         }
@@ -53,7 +51,11 @@ pub fn candidates(html: &str, page: &str, size: u32) -> Vec<String> {
             continue;
         };
         let svg = get("type").is_some_and(|kind| kind.contains("svg"))
-            || href.split(['?', '#']).next().unwrap_or_default().ends_with(".svg")
+            || href
+                .split(['?', '#'])
+                .next()
+                .unwrap_or_default()
+                .ends_with(".svg")
             || href.starts_with("data:");
         if svg || href.is_empty() {
             continue;

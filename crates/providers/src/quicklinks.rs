@@ -511,7 +511,12 @@ mod tests {
                 "Delete Quicklink"
             ]
         );
-        let id = github.id.strip_prefix("quicklinks:").unwrap().parse().unwrap();
+        let id = github
+            .id
+            .strip_prefix("quicklinks:")
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(
             github.actions[2].command,
             Command::SetSearchEngine {

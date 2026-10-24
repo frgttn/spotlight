@@ -734,7 +734,11 @@ impl Launcher {
         });
         favicon::spawn(site_keys.collect(), size, tx.clone());
         if !shell.is_empty() {
-            icons::spawn(shell.iter().map(|&ix| names[ix].clone()).collect(), size, tx);
+            icons::spawn(
+                shell.iter().map(|&ix| names[ix].clone()).collect(),
+                size,
+                tx,
+            );
         }
 
         let store = self.store.clone();

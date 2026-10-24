@@ -593,7 +593,9 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             state.rank_by_usage.set(*enabled);
             state
                 .launcher
-                .update(cx, |launcher, _, cx| launcher.set_rank_by_usage(*enabled, cx))
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_rank_by_usage(*enabled, cx)
+                })
                 .ok();
             save_setting(state, RANK_BY_USAGE_SETTING, enabled.to_string(), cx);
         }

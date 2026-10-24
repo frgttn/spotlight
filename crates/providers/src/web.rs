@@ -171,7 +171,10 @@ impl Provider for Web {
         let (name, template) = self.resolved();
         let url = template.replace("{query}", &encode_query(query));
         vec![
-            SearchItem::new(item_id(ID, "search"), format!("Search {name} for “{query}”"))
+            SearchItem::new(
+                item_id(ID, "search"),
+                format!("Search {name} for “{query}”"),
+            )
             .subtitle("Web Search")
             .icon(Icon::Glyph(glyph::SEARCH))
             .action("Search in Browser", Command::OpenUrl(url.clone()))

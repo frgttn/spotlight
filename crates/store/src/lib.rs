@@ -1234,7 +1234,9 @@ mod tests {
             bgra: vec![1, 2, 3, 4],
             saved_at: 0,
         };
-        store.save_icons(&[icon("a"), icon("b")], 48, 1_000).unwrap();
+        store
+            .save_icons(&[icon("a"), icon("b")], 48, 1_000)
+            .unwrap();
         let names = ["a".to_owned(), "c".to_owned()];
         let found = store.icons(&names, 48).unwrap();
         assert_eq!(found.len(), 1);

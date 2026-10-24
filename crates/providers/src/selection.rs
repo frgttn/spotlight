@@ -71,7 +71,10 @@ mod tests {
 
     #[test]
     fn commands_take_the_selection() {
-        let selection = Selection::new(Arc::new(Web::new(SearchEngine::default(), None)), "ru".into());
+        let selection = Selection::new(
+            Arc::new(Web::new(SearchEngine::default(), None)),
+            "ru".into(),
+        );
         let items = selection.catalog();
         for item in &items {
             assert!(item.actions[0].command.needs_selection(), "{}", item.title);

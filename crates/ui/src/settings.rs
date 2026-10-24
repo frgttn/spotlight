@@ -618,7 +618,8 @@ impl Settings {
         let custom = chip("engine-custom", "Custom…", custom_selected)
             .on_click(cx.listener(|this, _, window, cx| this.edit_custom_engine(window, cx)));
         // Chosen in the launcher; picking anything else here replaces it.
-        let quicklink = (matches!(self.search_engine, SearchEngine::Quicklink(_)) && !custom_selected)
+        let quicklink = (matches!(self.search_engine, SearchEngine::Quicklink(_))
+            && !custom_selected)
             .then(|| chip("engine-quicklink", self.engine_name.clone(), true));
         let hint = div()
             .text_size(px(11.))

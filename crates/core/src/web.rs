@@ -169,14 +169,10 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        for engine in PRESETS
-            .iter()
-            .map(SearchEngine::Preset)
-            .chain([
-                SearchEngine::Custom("https://www.startpage.com/do/search?q={query}".into()),
-                SearchEngine::Quicklink(42),
-            ])
-        {
+        for engine in PRESETS.iter().map(SearchEngine::Preset).chain([
+            SearchEngine::Custom("https://www.startpage.com/do/search?q={query}".into()),
+            SearchEngine::Quicklink(42),
+        ]) {
             assert_eq!(
                 SearchEngine::from_setting(&engine.to_setting()),
                 Some(engine)
