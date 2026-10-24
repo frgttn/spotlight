@@ -37,7 +37,7 @@ use spotlight_core::{
     web::SearchEngine,
 };
 use spotlight_platform_win::{
-    clipboard as system_clipboard, commands, expander,
+    clipboard as system_clipboard, commands, expander, favicon,
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
@@ -351,6 +351,8 @@ pub struct Launcher {
     live_generation: u64,
     /// The window's scale as last seen, for icons that arrive later.
     window_scale: f32,
+    /// Rows whose site icon [`Self::load_site_icons`] already asked for.
+    asked_icons: HashSet<String>,
     /// What a root search starts with to search files ("*"); empty: off.
     file_prefix: String,
     /// The files found for root search's text after the file prefix.
@@ -511,6 +513,7 @@ impl Launcher {
             live_cancel: None,
             live_generation: 0,
             window_scale: window.scale_factor(),
+            asked_icons: HashSet::new(),
             file_prefix: spotlight_core::file_search::DEFAULT_PREFIX.to_owned(),
             prefix_rows: Vec::new(),
             visible: false,
@@ -625,7 +628,7 @@ impl Launcher {
         }
         let shell_icons: Vec<(String, String)> = items
             .iter()
-            .filter_map(|item| Some((item.id.clone(), shell_name(&item.icon)?)))
+            .filter_map(|item| Some((item.id.clone(), icon_source(&item.icon)?)))
             .collect();
 
         self.search.set_catalog(provider, items);
@@ -637,9 +640,31 @@ impl Launcher {
         cx.notify();
     }
 
-    /// Extracts shell icons in the background; rows switch from badges to icons
-    /// as they arrive. `items` holds (item id, shell parsing name) pairs; each
-    /// distinct icon is extracted once (every Settings page has the same one).
+    /// Sites' icons for rows this query brought that no catalog has (the
+    /// stock quicklink `!yt` opens): saved ones at once, the rest fetched.
+    /// Each is asked for once per run.
+    fn load_site_icons(&mut self, cx: &mut Context<Self>) {
+        let rows: Vec<(String, String)> = self
+            .results
+            .iter()
+            .filter_map(|row| match row {
+                Row::Computed(item) if matches!(item.icon, Icon::Site { .. }) => {
+                    Some((item.id.clone(), icon_source(&item.icon)?))
+                }
+                _ => None,
+            })
+            .collect();
+        let wanted: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|(id, _)| !self.icons.contains_key(id) && self.asked_icons.insert(id.clone()))
+            .collect();
+        self.load_icons(wanted, self.window_scale, cx);
+    }
+
+    /// Extracts shell icons and fetches sites' icons in the background; rows
+    /// switch from badges to icons as they arrive. `items` holds (item id,
+    /// [`icon_source`]) pairs; each distinct icon is loaded once (every
+    /// Settings page has the same one).
     fn load_icons(
         &mut self,
         items: Vec<(String, String)>,
@@ -688,7 +713,12 @@ impl Launcher {
                 }
             }
         }
-        let wanted: Vec<usize> = (0..names.len()).filter(|&ix| !fresh[ix]).collect();
+        // Shell icons first: `icons::spawn` numbers them from 0, and sites
+        // are numbered after them.
+        let (shell, sites): (Vec<usize>, Vec<usize>) = (0..names.len())
+            .filter(|&ix| !fresh[ix])
+            .partition(|&ix| !names[ix].starts_with(SITE_ICON));
+        let wanted: Vec<usize> = shell.iter().chain(&sites).copied().collect();
         eprintln!(
             "[spotlight] icons: {} saved, {} to extract",
             names.len() - wanted.len(),
@@ -698,11 +728,14 @@ impl Launcher {
             return;
         }
         let (tx, rx) = async_channel::unbounded();
-        icons::spawn(
-            wanted.iter().map(|&ix| names[ix].clone()).collect(),
-            size,
-            tx,
-        );
+        let site_keys = sites.iter().enumerate().map(|(k, &ix)| {
+            let origin = names[ix].trim_start_matches(SITE_ICON).to_owned();
+            (shell.len() + k, origin)
+        });
+        favicon::spawn(site_keys.collect(), size, tx.clone());
+        if !shell.is_empty() {
+            icons::spawn(shell.iter().map(|&ix| names[ix].clone()).collect(), size, tx);
+        }
 
         let store = self.store.clone();
         cx.spawn(async move |this, cx| {
@@ -1062,6 +1095,7 @@ impl Launcher {
         self.search_live(cx);
         self.search_prefix(cx);
         let filter_ms = self.refilter(&query);
+        self.load_site_icons(cx);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
         self.stats.paint.borrow_mut().arm(changed_at, Probe::Key);
@@ -1956,7 +1990,7 @@ impl Launcher {
                 subtitle: item.subtitle.clone(),
                 image: self.icons.get(&item.id).cloned(),
                 glyph: match item.icon {
-                    Icon::Glyph(glyph) => Some(glyph),
+                    Icon::Glyph(glyph) | Icon::Site { glyph, .. } => Some(glyph),
                     _ => None,
                 },
             })
@@ -2434,7 +2468,7 @@ impl Launcher {
             .items_center()
             .justify_center();
         match item.icon {
-            Icon::Glyph(glyph) => badge
+            Icon::Glyph(glyph) | Icon::Site { glyph, .. } => badge
                 .bg(rgba(0xffffff1a))
                 .font_family(icon_font())
                 .text_size(px(15. * scale))
@@ -2990,11 +3024,16 @@ fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
         }))
 }
 
-/// What to extract the icon from, for icons that come from the shell.
-fn shell_name(icon: &Icon) -> Option<String> {
+/// Where a site's icon is fetched from, in [`icon_source`]'s names.
+const SITE_ICON: &str = "favicon:";
+
+/// What to load the icon from: a shell parsing name, or [`SITE_ICON`] and
+/// a site's origin. Also its name in the store's icon cache.
+fn icon_source(icon: &Icon) -> Option<String> {
     match icon {
         Icon::App(launch_id) => Some(format!("shell:AppsFolder\\{launch_id}")),
         Icon::Shell(name) => Some(name.clone()),
+        Icon::Site { origin, .. } => Some(format!("{SITE_ICON}{origin}")),
         Icon::Glyph(_) | Icon::None => None,
     }
 }
@@ -3016,6 +3055,10 @@ pub(crate) fn icon_font() -> &'static str {
 /// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
 /// `RgbaImage` type is only the buffer container here.
 fn render_image(icon: icons::Icon) -> Option<Arc<RenderImage>> {
+    // Remembered as having none (a site without a usable icon).
+    if icon.width == 0 || icon.height == 0 {
+        return None;
+    }
     let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }

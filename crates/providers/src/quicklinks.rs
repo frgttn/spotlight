@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use spotlight_core::{
+    favicon,
     item::{Action, Command, Icon, SearchItem},
     item_id,
     provider::Provider,
@@ -397,10 +398,17 @@ fn is_stock(link: &Quicklink) -> bool {
 
 /// The browser it opens in, the folder or file it opens, or a link symbol.
 fn icon(link: &Quicklink) -> Icon {
+    let target = link.link.trim();
+    // A site's own icon says more than the browser it opens in.
+    if let Some(origin) = favicon::origin(target) {
+        return Icon::Site {
+            origin,
+            glyph: glyph::LINK,
+        };
+    }
     if let Some(app) = &link.open_with {
         return Icon::Shell(app.clone());
     }
-    let target = link.link.trim();
     if !quicklink::is_url(target) && !target.contains(['{', '%']) {
         return Icon::Shell(target.to_owned());
     }

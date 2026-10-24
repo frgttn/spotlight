@@ -88,6 +88,9 @@ pub enum Icon {
     Shell(String),
     /// A symbol from the system icon font (Segoe Fluent Icons / Segoe MDL2 Assets).
     Glyph(char),
+    /// The icon of the site at `origin` (`https://github.com`, see
+    /// [`crate::favicon`]); `glyph` is drawn until it arrives, or without one.
+    Site { origin: String, glyph: char },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -189,7 +189,7 @@ impl Launcher {
                 .items
                 .iter()
                 .filter(|item| !self.icons.contains_key(&item.id))
-                .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
                 .collect(),
             _ => Vec::new(),
         };
@@ -320,7 +320,7 @@ impl Launcher {
                     .items
                     .iter()
                     .filter(|item| !this.icons.contains_key(&item.id))
-                    .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                    .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
                     .collect();
                 this.prefix_rows = rows.items;
                 let query = this.query(cx);
@@ -363,7 +363,7 @@ impl Launcher {
             .items
             .iter()
             .filter(|item| !self.icons.contains_key(&item.id))
-            .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+            .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
             .collect();
         let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
             return;
