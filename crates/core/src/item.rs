@@ -174,6 +174,14 @@ pub enum Command {
     ClearClipboardHistory,
     /// Stops keeping copies made in this app.
     IgnoreClipApp(IgnoredApp),
+    /// Opens provider view `view` (as [`Command::OpenProviderView`]) with
+    /// `query` already typed in its search field: Search Files from root
+    /// search's file prefix.
+    SearchIn {
+        provider: String,
+        view: String,
+        query: String,
+    },
     /// Goes back to root search with this text in the search field, the
     /// cursor at its end: `!g` completed to `!gh `.
     Complete(String),

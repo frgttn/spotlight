@@ -208,11 +208,7 @@ fn main() {
     let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
     let snippet_expansion =
         setting(snippet::EXPANSION_SETTING).is_none_or(|value| value != "false");
-    let file_search = file_search::Config::from_settings(
-        setting(file_search::FOLDERS_SETTING).as_deref(),
-        setting(file_search::EXCLUSIONS_SETTING).as_deref(),
-        setting(file_search::HIDDEN_SETTING).as_deref(),
-    );
+    let file_search = file_search::Config::from_settings(setting);
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
     }
@@ -252,7 +248,7 @@ fn main() {
             data_dir.clone(),
             store.clone(),
             retention,
-            file_search,
+            file_search.clone(),
         );
         if !disabled_providers.iter().any(|id| id == FILES_PROVIDER) {
             files.start();
@@ -301,6 +297,7 @@ fn main() {
                 launcher.set_window_mode(window_mode, cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
+                launcher.set_file_prefix(file_search.prefix.clone());
                 // The self-test runs beside a normal instance, which expands them.
                 if !self_test {
                     launcher.start_expander();
@@ -353,6 +350,21 @@ fn main() {
             tray,
             settings: RefCell::new(None),
         });
+
+        // A busy folder File Search left out on its own is saved like a
+        // change made in Settings.
+        let (file_config_tx, file_config_rx) = async_channel::unbounded();
+        state
+            .files
+            .on_config_change(move |config| drop(file_config_tx.send_blocking(config.clone())));
+        let file_config_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(config) = file_config_rx.recv().await {
+                cx.update(|cx| save_file_search(&file_config_state, &config, cx))
+                    .ok();
+            }
+        })
+        .detach();
 
         let settings_state = state.clone();
         cx.on_action(move |_: &OpenSettings, cx| open_settings(&settings_state, cx));
@@ -639,24 +651,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             state
                 .files
                 .set_config(config.clone(), files_enabled(state, cx));
-            save_setting(
-                state,
-                file_search::FOLDERS_SETTING,
-                config.folders_setting(),
-                cx,
-            );
-            save_setting(
-                state,
-                file_search::EXCLUSIONS_SETTING,
-                config.exclusions_setting(),
-                cx,
-            );
-            save_setting(
-                state,
-                file_search::HIDDEN_SETTING,
-                config.include_hidden.to_string(),
-                cx,
-            );
+            let prefix = config.prefix.clone();
+            state
+                .launcher
+                .update(cx, |launcher, _, _| launcher.set_file_prefix(prefix))
+                .ok();
+            save_file_search(state, config, cx);
         }
         SettingsEvent::FileSearchRebuild => {
             if files_enabled(state, cx) {
@@ -685,6 +685,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
         }
+    }
+}
+
+fn save_file_search(state: &AppState, config: &file_search::Config, cx: &mut App) {
+    for (key, value) in config.to_settings() {
+        save_setting(state, key, value, cx);
     }
 }
 

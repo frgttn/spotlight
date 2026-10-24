@@ -63,6 +63,9 @@ pub struct Entry {
 
 /// The parent of an entry directly in a root.
 pub const ROOT: u32 = u32::MAX;
+/// The root of an [`FromService::Unavailable`] that refuses the whole
+/// connection (this program isn't the one the service was installed for).
+pub const ALL_ROOTS: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ToService {

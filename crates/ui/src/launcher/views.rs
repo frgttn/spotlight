@@ -213,18 +213,7 @@ impl Launcher {
             }
             // A live list's rows are only ever shown once (files found while
             // typing), so their icons go with it rather than pile up.
-            let prefix = format!("{provider}:");
-            let stale: Vec<String> = self
-                .icons
-                .keys()
-                .filter(|id| id.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for id in stale {
-                if let Some(image) = self.icons.remove(&id) {
-                    self.stale_images.push(image);
-                }
-            }
+            self.forget_icons(&provider);
         }
         self.enter_screen(window, cx);
     }
@@ -278,6 +267,82 @@ impl Launcher {
                 .ok();
         })
         .detach();
+    }
+
+    /// In root search after the file prefix, asks the files provider for the
+    /// rows of what follows it, like a live list. Without the prefix, lets go
+    /// of the rows found before.
+    pub(super) fn search_prefix(&mut self, cx: &mut Context<Self>) {
+        if !self.screens.is_empty() {
+            return;
+        }
+        let query = self.query(cx);
+        let Some(rest) = super::file_query(&self.file_prefix, &query).map(str::to_owned) else {
+            if !self.prefix_rows.is_empty() {
+                self.prefix_rows.clear();
+                self.forget_icons(super::FILES_PROVIDER);
+            }
+            return;
+        };
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == super::FILES_PROVIDER)
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(older) = self.live_cancel.take() {
+            older.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.live_cancel = Some(cancel.clone());
+        self.live_generation += 1;
+        let generation = self.live_generation;
+        let rows = cx
+            .background_executor()
+            .spawn(async move { provider.search_view(super::FILES_VIEW, &rest, None, &cancel) });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = rows.await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if generation != this.live_generation || !this.screens.is_empty() {
+                    return;
+                }
+                let icons: Vec<(String, String)> = rows
+                    .items
+                    .iter()
+                    .filter(|item| !this.icons.contains_key(&item.id))
+                    .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                    .collect();
+                this.prefix_rows = rows.items;
+                let query = this.query(cx);
+                this.refilter(&query);
+                this.load_icons(icons, this.window_scale, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Frees the icons of rows from `provider` that were only ever shown
+    /// once (files found while typing), so they don't pile up.
+    fn forget_icons(&mut self, provider: &str) {
+        let prefix = format!("{provider}:");
+        let stale: Vec<String> = self
+            .icons
+            .keys()
+            .filter(|id| id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for id in stale {
+            if let Some(image) = self.icons.remove(&id) {
+                self.stale_images.push(image);
+            }
+        }
     }
 
     /// Puts a live search's rows in the open list, unless a newer search or

@@ -97,7 +97,7 @@ pub fn all(
     retention: Retention,
     files: spotlight_core::file_search::Config,
 ) -> Builtins {
-    let files = Arc::new(files::Files::new(files));
+    let files = Arc::new(files::Files::new(files, store.clone()));
     let web = Arc::new(web::Web::new(engine));
     let clipboard = Arc::new(clipboard::ClipboardHistory::new(
         store.clone(),

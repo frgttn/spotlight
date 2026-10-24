@@ -90,6 +90,10 @@ const COMPACT_HEIGHT: f32 = 52.;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
+/// File Search: its provider and the live list root search's file prefix
+/// asks for rows.
+const FILES_PROVIDER: &str = "files";
+const FILES_VIEW: &str = "search";
 /// How long a footer toast stays.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
 /// HUD size in logical pixels, and how long it stays.
@@ -332,6 +336,10 @@ pub struct Launcher {
     live_generation: u64,
     /// The window's scale as last seen, for icons that arrive later.
     window_scale: f32,
+    /// What a root search starts with to search files ("*"); empty: off.
+    file_prefix: String,
+    /// The files found for root search's text after the file prefix.
+    prefix_rows: Vec<SearchItem>,
     visible: bool,
     window_mode: WindowMode,
     /// ↓ showed root search's results in compact mode; typing clears it.
@@ -485,6 +493,8 @@ impl Launcher {
             live_cancel: None,
             live_generation: 0,
             window_scale: window.scale_factor(),
+            file_prefix: spotlight_core::file_search::DEFAULT_PREFIX.to_owned(),
+            prefix_rows: Vec::new(),
             visible: false,
             window_mode: WindowMode::default(),
             revealed: false,
@@ -801,7 +811,26 @@ impl Launcher {
             aliases,
             ..
         } = self;
+        let after_prefix = file_query(&self.file_prefix, query).filter(|_| {
+            search
+                .providers()
+                .iter()
+                .position(|provider| provider.id() == FILES_PROVIDER)
+                .is_some_and(|ix| search.is_enabled(ix))
+        });
         self.results = match screens.last() {
+            // Files only, from the files provider (see `search_prefix`), and
+            // a row to go on in Search Files: first while nothing follows
+            // the prefix, so Enter opens it.
+            None if let Some(rest) = after_prefix => {
+                let open = Row::Computed(files_hint(rest));
+                let found = self.prefix_rows.iter().cloned().map(Row::Computed);
+                if rest.trim().is_empty() {
+                    std::iter::once(open).chain(found).collect()
+                } else {
+                    found.chain(std::iter::once(open)).collect()
+                }
+            }
             None => search.search(
                 query,
                 |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
@@ -928,6 +957,7 @@ impl Launcher {
         self.pending_link = None;
         self.window_scale = window.scale_factor();
         self.search_live(cx);
+        self.search_prefix(cx);
         let filter_ms = self.refilter(&query);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
@@ -1169,6 +1199,14 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // After the file prefix, Tab goes on in Search Files.
+        if self.screens.is_empty() {
+            let query = self.query(cx);
+            if let Some(rest) = file_query(&self.file_prefix, &query) {
+                let open = files_hint(rest).actions[0].command.clone();
+                return self.perform(&open, window, cx);
+            }
+        }
         if !self.step_filter(true, cx) {
             self.focus_field(true, window, cx);
         }
@@ -1360,6 +1398,13 @@ impl Launcher {
                 | Command::DeleteSnippet(_)
                 | Command::Complete(_)
         );
+        if !edits && !ranked {
+            // Item ids start with their provider's id.
+            let owner = id.split(':').next().unwrap_or_default();
+            if let Some(provider) = self.search.providers().iter().find(|p| p.id() == owner) {
+                provider.opened(&id);
+            }
+        }
         if ranked && !edits {
             self.record_visit(id, cx);
         }
@@ -1383,6 +1428,17 @@ impl Launcher {
             Command::ExportSnippets => self.export_snippets(cx),
             Command::OpenProviderView { provider, view } => {
                 self.open_provider_view(provider, view, window, cx)
+            }
+            Command::SearchIn {
+                provider,
+                view,
+                query,
+            } => {
+                self.open_provider_view(provider, view, window, cx);
+                if !query.is_empty() {
+                    self.input
+                        .update(cx, |input, cx| input.type_over(query.clone(), cx));
+                }
             }
             Command::Complete(text) => self.complete(text.clone(), window, cx),
             Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
@@ -1501,6 +1557,11 @@ impl Launcher {
     }
 
     /// Lets reading the selected text use Ctrl+C when an app doesn't share it.
+    /// What a root search starts with to search files; empty turns it off.
+    pub fn set_file_prefix(&mut self, prefix: String) {
+        self.file_prefix = prefix;
+    }
+
     pub fn set_selection_copy(&mut self, enabled: bool) {
         self.selection_copy = enabled;
     }
@@ -2640,6 +2701,35 @@ impl Render for Launcher {
 
 /// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
 /// contain `+` (the plus key displays as `=`, the same key).
+/// The text after `prefix` when `query` starts with it.
+fn file_query<'a>(prefix: &str, query: &'a str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return None;
+    }
+    query.trim_start().strip_prefix(prefix)
+}
+
+/// The row that goes on in Search Files with `rest` typed.
+fn files_hint(rest: &str) -> SearchItem {
+    let rest = rest.trim();
+    let title = if rest.is_empty() {
+        "Search Files".to_owned()
+    } else {
+        format!("Search Files for “{rest}”")
+    };
+    SearchItem::new(item_id("spotlight", "files-prefix"), title)
+        .subtitle("Tab")
+        .icon(Icon::Glyph('\u{E721}'))
+        .action(
+            "Search Files",
+            Command::SearchIn {
+                provider: FILES_PROVIDER.into(),
+                view: FILES_VIEW.into(),
+                query: rest.to_owned(),
+            },
+        )
+}
+
 fn hotkey_keys(hotkey: Hotkey) -> String {
     hotkey.to_string().replace('+', " ")
 }

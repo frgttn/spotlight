@@ -166,6 +166,8 @@ pub struct Settings {
     file_status: FileStatusReader,
     /// Where a new exclusion rule is typed.
     exclusion_input: Entity<TextInput>,
+    /// The file prefix of root search; Enter saves it.
+    prefix_input: Entity<TextInput>,
     /// Redraws the File Search page while indexing, for its count.
     status_refresh: Option<Task<()>>,
     /// The index service's installer or remover is running (behind its UAC
@@ -252,6 +254,12 @@ impl Settings {
             ignored_apps,
             excluded_apps,
         } = launcher(cx).unwrap_or_default();
+        let prefix = file_search.prefix.clone();
+        let prefix_input = cx.new(|cx| {
+            let mut input = TextInput::new("Off", cx);
+            input.set_text(prefix, cx);
+            input
+        });
         Self {
             hotkeys,
             hotkey,
@@ -282,6 +290,7 @@ impl Settings {
             file_search,
             file_status,
             exclusion_input: cx.new(|cx| TextInput::new("Folder name or path", cx)),
+            prefix_input,
             status_refresh: None,
             service_busy: false,
             service_message: None,
@@ -455,6 +464,12 @@ impl Settings {
         }
         if self.exclusion_input.focus_handle(cx).is_focused(window) {
             return self.add_exclusion(cx);
+        }
+        if self.prefix_input.focus_handle(cx).is_focused(window) {
+            let prefix = self.prefix_input.read(cx).text().trim().to_owned();
+            self.change_file_search(|config| config.prefix = prefix, cx);
+            window.focus(&self.focus);
+            return;
         }
         let Some((item_id, input)) = self.editing_alias.take() else {
             return;
@@ -1012,6 +1027,20 @@ impl Settings {
         }
     }
 
+    /// Takes back a busy folder: indexed again, and never left out
+    /// automatically again.
+    fn keep_busy_folder(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.file_search.hot.len() {
+            self.change_file_search(
+                |config| {
+                    let folder = config.hot.remove(ix);
+                    config.kept.push(folder);
+                },
+                cx,
+            );
+        }
+    }
+
     fn remove_exclusion(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.file_search.exclusions.len() {
             self.change_file_search(|config| drop(config.exclusions.remove(ix)), cx);
@@ -1052,6 +1081,37 @@ impl Settings {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Folders left out for changing all the time, each with a button to
+    /// take it back; nothing while there are none.
+    fn busy_folders(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.file_search.hot.is_empty() {
+            return None;
+        }
+        let rows = self.file_search.hot.iter().enumerate().map(|(ix, folder)| {
+            app_row(&IgnoredApp {
+                name: folder
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: folder.display().to_string(),
+            })
+            .child(
+                chip(("keep-busy", ix), "Stop excluding", false)
+                    .on_click(cx.listener(move |this, _, _, cx| this.keep_busy_folder(ix, cx))),
+            )
+        });
+        Some(
+            div()
+                .child(divider())
+                .child(row(
+                    "Left out automatically",
+                    "These folders changed all the time (caches, logs, build output), so they aren't indexed.",
+                ))
+                .child(div().px_4().pb_3().flex().flex_col().gap_1().children(rows))
+                .into_any_element(),
+        )
     }
 
     /// The index service's row: what it does, its state and a button.
@@ -1288,6 +1348,29 @@ impl Settings {
                                     .on_click(cx.listener(|this, _, _, cx| this.add_exclusion(cx))),
                             ),
                     ),
+            )
+            .children(self.busy_folders(cx))
+            .child(divider())
+            .child(
+                row(
+                    "In root search",
+                    "Start a search with this to find files right there; Tab goes on in Search Files. Empty turns it off.",
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(64.))
+                        .h(px(30.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgba(theme::SURFACE_BORDER))
+                        .bg(rgba(theme::SURFACE))
+                        .text_size(px(13.))
+                        .child(self.prefix_input.clone()),
+                ),
             )
             .child(divider())
             .child(self.service_row(cx))
@@ -1794,6 +1877,8 @@ impl Page {
                 "Folders",
                 "Leave out",
                 "Fast indexing service",
+                "In root search",
+                "Left out automatically",
                 "Hidden files",
             ],
             Page::Extension("selection") => &["Copy the selection", "Ctrl+C"],

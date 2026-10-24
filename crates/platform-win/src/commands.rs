@@ -121,6 +121,7 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::ImportSnippets
         | Command::ExportSnippets
         | Command::OpenProviderView { .. }
+        | Command::SearchIn { .. }
         | Command::RestoreClip { .. }
         | Command::PinClip { .. }
         | Command::DeleteClip(_)

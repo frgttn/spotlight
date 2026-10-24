@@ -14,6 +14,15 @@ pub const FOLDERS_SETTING: &str = "files_roots";
 pub const EXCLUSIONS_SETTING: &str = "files_exclusions";
 /// `true` indexes and shows hidden files too.
 pub const HIDDEN_SETTING: &str = "files_hidden";
+/// Busy folders left out automatically, one path per line.
+pub const HOT_SETTING: &str = "files_hot";
+/// Busy folders the user asked to keep anyway, one path per line.
+pub const KEPT_SETTING: &str = "files_kept";
+/// What a root search starts with to search files; empty turns it off.
+pub const PREFIX_SETTING: &str = "files_prefix";
+/// The prefix until the user picks another: Shift+8 in both the English and
+/// Russian layouts, and never the start of a calculation.
+pub const DEFAULT_PREFIX: &str = "*";
 
 /// Left out unless the user says otherwise: app data, the recycle bin, and
 /// folders that tools fill with thousands of files nobody opens by hand. A
@@ -36,6 +45,13 @@ pub struct Config {
     pub folders: Vec<PathBuf>,
     pub exclusions: Vec<String>,
     pub include_hidden: bool,
+    /// Folders left out for changing all the time (caches, build output),
+    /// found while following changes.
+    pub hot: Vec<PathBuf>,
+    /// Busy folders the user took back: never left out automatically again.
+    pub kept: Vec<PathBuf>,
+    /// What a root search starts with to search files; empty: off.
+    pub prefix: String,
 }
 
 impl Default for Config {
@@ -47,41 +63,78 @@ impl Default for Config {
                 .map(|&rule| rule.to_owned())
                 .collect(),
             include_hidden: false,
+            hot: Vec::new(),
+            kept: Vec::new(),
+            prefix: DEFAULT_PREFIX.to_owned(),
         }
     }
 }
 
 impl Config {
-    /// From the three settings, each `None` when never saved.
-    pub fn from_settings(
-        folders: Option<&str>,
-        exclusions: Option<&str>,
-        hidden: Option<&str>,
-    ) -> Self {
-        Self {
-            folders: folders
+    /// From the settings `setting` reads, by key; `None` for one never saved.
+    pub fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Self {
+        let paths = |key: &str| -> Vec<PathBuf> {
+            setting(key)
+                .as_deref()
                 .map(lines)
                 .unwrap_or_default()
                 .into_iter()
                 .map(PathBuf::from)
-                .collect(),
-            exclusions: exclusions
+                .collect()
+        };
+        Self {
+            folders: paths(FOLDERS_SETTING),
+            exclusions: setting(EXCLUSIONS_SETTING)
+                .as_deref()
                 .map(lines)
                 .unwrap_or_else(|| Self::default().exclusions),
-            include_hidden: hidden.is_some_and(|value| value == "true"),
+            include_hidden: setting(HIDDEN_SETTING).is_some_and(|value| value == "true"),
+            hot: paths(HOT_SETTING),
+            kept: paths(KEPT_SETTING),
+            prefix: setting(PREFIX_SETTING)
+                .map(|prefix| prefix.trim().to_owned())
+                .unwrap_or_else(|| DEFAULT_PREFIX.to_owned()),
         }
     }
 
-    pub fn folders_setting(&self) -> String {
-        self.folders
-            .iter()
-            .map(|folder| folder.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// Every setting, as (key, value), for saving.
+    pub fn to_settings(&self) -> Vec<(&'static str, String)> {
+        let paths = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        vec![
+            (FOLDERS_SETTING, paths(&self.folders)),
+            (EXCLUSIONS_SETTING, self.exclusions.join("\n")),
+            (HIDDEN_SETTING, self.include_hidden.to_string()),
+            (HOT_SETTING, paths(&self.hot)),
+            (KEPT_SETTING, paths(&self.kept)),
+            (PREFIX_SETTING, self.prefix.clone()),
+        ]
     }
 
-    pub fn exclusions_setting(&self) -> String {
-        self.exclusions.join("\n")
+    /// The text after the prefix when `query` starts with it.
+    pub fn after_prefix<'a>(&self, query: &'a str) -> Option<&'a str> {
+        if self.prefix.is_empty() {
+            return None;
+        }
+        query.trim_start().strip_prefix(self.prefix.as_str())
+    }
+
+    /// Path rules for the busy folders still left out.
+    pub fn hot_rules(&self) -> impl Iterator<Item = String> + '_ {
+        self.hot
+            .iter()
+            .filter(|hot| {
+                !self
+                    .kept
+                    .iter()
+                    .any(|kept| fold_path(kept) == fold_path(hot))
+            })
+            .map(|hot| hot.to_string_lossy().into_owned())
     }
 
     /// The user profile, then the added folders, each once. An added folder
@@ -183,24 +236,44 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        let config = Config::from_settings(Some("D:\\Work\n\n E:\\Photos "), None, Some("true"));
+        let saved = |key: &str| match key {
+            FOLDERS_SETTING => Some("D:\\Work\n\n E:\\Photos ".to_owned()),
+            HIDDEN_SETTING => Some("true".to_owned()),
+            HOT_SETTING => Some(r"C:\Users\me\cache".to_owned()),
+            _ => None,
+        };
+        let config = Config::from_settings(saved);
         assert_eq!(
             config.folders,
             [PathBuf::from(r"D:\Work"), PathBuf::from(r"E:\Photos")]
         );
         assert_eq!(config.exclusions, Config::default().exclusions);
         assert!(config.include_hidden);
-        let again = Config::from_settings(
-            Some(&config.folders_setting()),
-            Some(&config.exclusions_setting()),
-            Some("true"),
-        );
+        assert_eq!(config.prefix, DEFAULT_PREFIX);
+        let settings = config.to_settings();
+        let again = Config::from_settings(|key| {
+            settings
+                .iter()
+                .find(|(saved, _)| *saved == key)
+                .map(|(_, value)| value.clone())
+        });
         assert_eq!(again, config);
-        assert!(
-            Config::from_settings(None, Some(""), None)
-                .exclusions
-                .is_empty()
-        );
+        let cleared = Config::from_settings(|key| (key == EXCLUSIONS_SETTING).then(String::new));
+        assert!(cleared.exclusions.is_empty());
+    }
+
+    #[test]
+    fn prefix_and_busy_folders() {
+        let mut config = Config::default();
+        assert_eq!(config.after_prefix("*report"), Some("report"));
+        assert_eq!(config.after_prefix("  *.pdf"), Some(".pdf"));
+        assert_eq!(config.after_prefix("report"), None);
+        config.prefix.clear();
+        assert_eq!(config.after_prefix("*report"), None);
+
+        config.hot = vec![PathBuf::from(r"C:\a\cache"), PathBuf::from(r"C:\b\logs")];
+        config.kept = vec![PathBuf::from(r"c:\B\LOGS")];
+        assert_eq!(config.hot_rules().collect::<Vec<_>>(), [r"C:\a\cache"]);
     }
 
     #[test]

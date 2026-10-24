@@ -215,6 +215,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("deeplink", deeplink_round_trip(window, cx).await),
         ("switcher", switcher_round_trip(window, cx).await),
         ("files", files_round_trip(window, cx).await),
+        ("file prefix", prefix_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
@@ -599,6 +600,52 @@ async fn switcher_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) 
 /// Search Files: once the index is built, typing finds the Desktop folder
 /// of the user profile, Tab's Folders filter keeps it, and Esc goes back.
 /// Enter isn't pressed (it would open Explorer).
+/// `*desktop` in root search lists the Desktop folder (files only), and Tab
+/// goes on in Search Files with `desktop` typed.
+async fn prefix_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let titles = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.result_titles())
+            .unwrap_or_default()
+    };
+    let mut found = false;
+    for _ in 0..20 {
+        press(window, "ctrl-a", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text("*desktop", window, cx)
+            })
+            .ok();
+        executor.timer(Duration::from_millis(300)).await;
+        let rows = titles(cx);
+        if rows.iter().any(|title| title == "Desktop") {
+            if rows.iter().any(|title| title == "Calculator") {
+                return format!("root results mixed in: {rows:?}");
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return format!("*desktop gave {:?}", titles(cx));
+    }
+    press(window, "tab", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let opened = window
+        .update(cx, |launcher, _, cx| {
+            (launcher.screen_title(), launcher.query(cx))
+        })
+        .ok();
+    if opened != Some((Some("Search Files".into()), "desktop".into())) {
+        return format!("Tab gave {opened:?}");
+    }
+    if let Err(err) = back_to_search(window, cx).await {
+        return err;
+    }
+    "found Desktop, Tab opened Search Files with it, back to search".into()
+}
+
 async fn files_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
     /// Indexing a large profile takes a while; this is how long to wait.
     const TRIES: usize = 120;

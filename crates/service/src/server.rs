@@ -237,10 +237,19 @@ impl Server {
         let mut reader = unsafe { File::from_raw_handle(pipe.0) };
         let caller = caller_path(pipe)?;
         if !self.clients.contains(&fold(&caller)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} isn't a Spotlight the installer named", caller.display()),
-            ));
+            let why = format!(
+                "{} isn't the Spotlight the service was installed for; install it again from this one",
+                caller.display()
+            );
+            // Says why before closing; it names nothing but the caller.
+            let _ = send(
+                &Mutex::new(reader),
+                &FromService::Unavailable {
+                    root: index_service::ALL_ROOTS,
+                    why: why.clone(),
+                },
+            );
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
         }
         let gate = Arc::new(if self.check_access {
             Gate::of_caller(pipe)?
@@ -576,6 +585,14 @@ mod tests {
         let _ = client.send(&ToService::Watch {
             roots: vec![PathBuf::from(r"C:\Users\me")],
         });
+        // Told why, then nothing more.
+        assert!(matches!(
+            client.recv().unwrap(),
+            FromService::Unavailable {
+                root: index_service::ALL_ROOTS,
+                ..
+            }
+        ));
         assert!(client.recv().is_err());
         server.stop();
     }

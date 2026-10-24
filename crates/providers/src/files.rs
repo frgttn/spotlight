@@ -21,7 +21,7 @@ use std::{
 use spotlight_core::{
     clip,
     file_search::{Config, Status, profile, thousands},
-    frecency,
+    frecency::{self, Frecency},
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
@@ -34,27 +34,45 @@ use spotlight_files::{
 use spotlight_platform_win::{
     fswalk,
     fswatch::{self, Change, Watcher},
-    index_service::{Client, Entry as ServiceEntry, FromService, ROOT, ToService},
+    index_service::{ALL_ROOTS, Client, Entry as ServiceEntry, FromService, ROOT, ToService},
     ntfs,
 };
+
+use spotlight_store::Store;
 
 use crate::glyph;
 
 pub const ID: &str = "files";
+/// What file rows' ids start with: `files:C:\Users\me\plan.md`.
+const ITEM_PREFIX: &str = "files:";
 const SEARCH_VIEW: &str = "search";
 /// Rows a query shows.
 const LIMIT: usize = 50;
 /// Changes are applied in batches at most this often, so a burst (an unzip,
 /// a build) takes the write lock a few times rather than once per file.
 const APPLY_EVERY: Duration = Duration::from_millis(200);
+/// Files opened from Search Files shown first before anything is typed.
+const OPENED_FIRST: usize = 10;
+/// A folder is busy once it sees this many changes in a minute…
+const BUSY_PER_MINUTE: usize = 100;
+/// …for this many minutes in a row: caches and logs change all the time,
+/// an unzip or a copy is over in one.
+const BUSY_MINUTES: u32 = 3;
+/// How often the scope roots are checked for a drive that came back.
+const ROOT_CHECK: Duration = Duration::from_secs(5);
 
 fn rules(config: &Config) -> Exclusions {
-    Exclusions::new(&config.exclusions, !config.include_hidden)
+    Exclusions::new(
+        config.exclusions.iter().cloned().chain(config.hot_rules()),
+        !config.include_hidden,
+    )
 }
 
 pub struct Files {
     shared: Arc<Shared>,
 }
+
+type ConfigListener = Box<dyn Fn(&Config) + Send>;
 
 struct Shared {
     index: RwLock<Index>,
@@ -67,10 +85,26 @@ struct Shared {
     generation: AtomicU64,
     /// The scope roots' watchers; dropping them stops them.
     watchers: Mutex<Vec<Watcher>>,
+    /// Files opened from Spotlight, by folded path: their path and frecency.
+    opened: Mutex<HashMap<String, (PathBuf, Frecency)>>,
+    store: Option<Arc<Mutex<Store>>>,
+    /// Told when the config changes from here (a busy folder left out).
+    listener: Mutex<Option<ConfigListener>>,
 }
 
 impl Files {
-    pub fn new(config: Config) -> Self {
+    /// `store` keeps which files were opened; without it nothing is kept.
+    pub fn new(config: Config, store: Option<Arc<Mutex<Store>>>) -> Self {
+        let opened = store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.frecency().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, used)| {
+                let path = PathBuf::from(id.strip_prefix(ITEM_PREFIX)?);
+                Some((fold_path(&path), (path, used)))
+            })
+            .collect();
         Self {
             shared: Arc::new(Shared {
                 index: RwLock::new(Index::default()),
@@ -79,8 +113,17 @@ impl Files {
                 progress: AtomicUsize::new(0),
                 generation: AtomicU64::new(0),
                 watchers: Mutex::new(Vec::new()),
+                opened: Mutex::new(opened),
+                store,
+                listener: Mutex::new(None),
             }),
         }
+    }
+
+    /// Calls `listener` whenever the config changes from inside (a busy
+    /// folder found), so it can be saved.
+    pub fn on_config_change(&self, listener: impl Fn(&Config) + Send + 'static) {
+        *self.shared.listener.lock().expect("listener") = Some(Box::new(listener));
     }
 
     /// (Re)builds the index in the background, then keeps it current.
@@ -100,10 +143,20 @@ impl Files {
         self.shared.config.lock().expect("config").clone()
     }
 
-    /// Uses `config` from now on and indexes again if `running`.
+    /// Uses `config` from now on and, if `running` and what is indexed
+    /// changed (not just the prefix), indexes again.
     pub fn set_config(&self, config: Config, running: bool) {
-        *self.shared.config.lock().expect("config") = config;
-        if running {
+        let mut current = self.shared.config.lock().expect("config");
+        let scope_changed = Config {
+            prefix: String::new(),
+            ..current.clone()
+        } != Config {
+            prefix: String::new(),
+            ..config.clone()
+        };
+        *current = config;
+        drop(current);
+        if running && scope_changed {
             self.start();
         }
     }
@@ -118,11 +171,23 @@ impl Files {
     fn rows(&self, query: &str, filter: Option<&str>, cancel: &AtomicBool) -> Option<LiveRows> {
         let include_hidden = self.shared.config.lock().expect("config").include_hidden;
         let index = self.shared.index.read().expect("file index");
+        let now = frecency::now();
+        // Opened files, as entries of this index: found by path each time, so
+        // a rebuild loses none. A renamed file starts over, as a new path.
+        let opened: HashMap<EntryId, f64> = self
+            .shared
+            .opened
+            .lock()
+            .expect("opened")
+            .values()
+            .filter_map(|(path, used)| Some((index.resolve(path)?, used.score_at(now))))
+            .collect();
+        let boost = |id: EntryId| opened.get(&id).copied().unwrap_or(0.);
         let options = SearchOptions {
             limit: LIMIT,
-            now: frecency::now(),
+            now,
             include_hidden,
-            frecency: None,
+            frecency: Some(&boost),
             cancel: Some(cancel),
         };
         let typed = match filter {
@@ -130,12 +195,33 @@ impl Files {
             None => query.to_owned(),
         };
         let parsed = Query::parse(&typed);
-        let hits: Vec<Hit> = if parsed.is_empty() {
-            index.recent(&options)?
+        let hits: Vec<EntryId> = if parsed.is_empty() {
+            // The files opened most, then the ones changed last.
+            let mut first: Vec<(EntryId, f64)> =
+                opened.iter().map(|(&id, &score)| (id, score)).collect();
+            first.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut ids: Vec<EntryId> = first
+                .into_iter()
+                .take(OPENED_FIRST)
+                .map(|(id, _)| id)
+                .collect();
+            for hit in index.recent(&options)? {
+                if ids.len() >= LIMIT {
+                    break;
+                }
+                if !ids.contains(&hit.id) {
+                    ids.push(hit.id);
+                }
+            }
+            ids
         } else {
-            index.search(&parsed, &options)?
+            index
+                .search(&parsed, &options)?
+                .iter()
+                .map(|hit: &Hit| hit.id)
+                .collect()
         };
-        let items = hits.iter().map(|hit| file_item(&index, hit.id)).collect();
+        let items = hits.iter().map(|&id| file_item(&index, id)).collect();
         drop(index);
         let empty = match self.status() {
             Status::Idle => Some("File search is off. Turn it on in Settings → Extensions.".into()),
@@ -175,6 +261,9 @@ impl Shared {
         *self.status.lock().expect("status") = Status::Indexing(0);
         self.progress.store(0, Ordering::Relaxed);
         let started = Instant::now();
+        // Which roots are there now: a drive that comes back later (a USB
+        // disk, a network share) gets indexed then.
+        let present: Vec<bool> = roots.iter().map(|root| root.exists()).collect();
         let mut builder = Builder::default();
         let (changes_tx, changes_rx) = async_channel::unbounded();
 
@@ -235,7 +324,40 @@ impl Shared {
             from_service: roots.len() - walked.len(),
         };
 
-        self.follow(generation, &rules, &changes_rx);
+        self.watch_roots(generation, roots.clone(), present);
+        self.follow(generation, &roots, rules, &changes_rx);
+    }
+
+    /// Checks the roots every [`ROOT_CHECK`] on a thread of its own and
+    /// indexes again when one that was missing is back. One that goes away
+    /// keeps what was found in it until then.
+    fn watch_roots(self: &Arc<Self>, generation: u64, roots: Vec<PathBuf>, mut present: Vec<bool>) {
+        let shared = self.clone();
+        let spawned = thread::Builder::new()
+            .name("file-roots".into())
+            .spawn(move || {
+                while shared.current(generation) {
+                    thread::sleep(ROOT_CHECK);
+                    for (root, was) in roots.iter().zip(present.iter_mut()) {
+                        let is = root.exists();
+                        if is && !*was && shared.current(generation) {
+                            eprintln!("[files] {} is back; indexing again", root.display());
+                            shared.launch();
+                            return;
+                        }
+                        if !is && *was {
+                            eprintln!(
+                                "[files] {} went away; keeping what was found in it",
+                                root.display()
+                            );
+                        }
+                        *was = is;
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            eprintln!("[files] couldn't watch for drives coming back: {err}");
+        }
     }
 
     /// Fills `builder` with what the index service has for the roots on NTFS
@@ -309,6 +431,14 @@ impl Shared {
                         pending -= 1;
                     }
                 }
+                FromService::Unavailable {
+                    root: ALL_ROOTS,
+                    why,
+                } => {
+                    eprintln!("[files] the index service refused: {why}; walking instead");
+                    *builder = Builder::default();
+                    return none;
+                }
                 FromService::Unavailable { root, why } => {
                     if let Some(&ix) = asked.get(root as usize) {
                         eprintln!(
@@ -360,9 +490,12 @@ impl Shared {
     fn follow(
         self: &Arc<Self>,
         generation: u64,
-        rules: &Exclusions,
+        roots: &[PathBuf],
+        mut rules: Exclusions,
         changes: &async_channel::Receiver<Vec<Change>>,
     ) {
+        let mut busy = Busy::default();
+        let root_keys: Vec<String> = roots.iter().map(|root| fold_path(root)).collect();
         while let Ok(first) = changes.recv_blocking() {
             // Let a burst gather, then take everything that has arrived.
             thread::sleep(APPLY_EVERY);
@@ -382,7 +515,43 @@ impl Shared {
             }
             let mut index = self.index.write().expect("file index");
             for change in batch {
-                apply(&mut index, rules, change);
+                // Folders in the index, below a root, count towards busy.
+                if let Some(dir) = changed_folder(&change)
+                    && !root_keys.contains(&fold_path(dir))
+                    && index.resolve(dir).is_some()
+                {
+                    busy.count(dir);
+                }
+                apply(&mut index, &rules, change);
+            }
+            let hot = busy.tick(Instant::now());
+            if !hot.is_empty() {
+                let mut config = self.config.lock().expect("config");
+                for dir in hot {
+                    if config
+                        .kept
+                        .iter()
+                        .any(|kept| fold_path(kept) == fold_path(&dir))
+                        || config
+                            .hot
+                            .iter()
+                            .any(|known| fold_path(known) == fold_path(&dir))
+                    {
+                        continue;
+                    }
+                    eprintln!(
+                        "[files] {} changes all the time; leaving it out",
+                        dir.display()
+                    );
+                    if let Some(id) = index.resolve(&dir) {
+                        index.remove(id);
+                    }
+                    config.hot.push(dir);
+                }
+                rules = self::rules(&config);
+                if let Some(listener) = &*self.listener.lock().expect("listener") {
+                    listener(&config);
+                }
             }
             let compact = index.needs_compaction();
             drop(index);
@@ -412,6 +581,60 @@ impl Shared {
                 };
             }
         }
+    }
+}
+
+/// The folder a change happened in.
+fn changed_folder(change: &Change) -> Option<&Path> {
+    match change {
+        Change::Added(path) | Change::Removed(path) | Change::Modified(path) => path.parent(),
+        Change::Renamed { to, .. } => to.parent(),
+        Change::Overflow | Change::Stopped(_) => None,
+    }
+}
+
+/// Counts changes per folder, minute by minute, to find the ones that
+/// change all the time: [`BUSY_PER_MINUTE`] or more for [`BUSY_MINUTES`]
+/// minutes in a row.
+#[derive(Default)]
+struct Busy {
+    minute_started: Option<Instant>,
+    this_minute: HashMap<PathBuf, usize>,
+    /// Busy minutes in a row so far, per folder.
+    streak: HashMap<PathBuf, u32>,
+}
+
+impl Busy {
+    fn count(&mut self, dir: &Path) {
+        *self.this_minute.entry(dir.to_path_buf()).or_default() += 1;
+    }
+
+    /// Once a minute has passed: the folders that have now been busy long
+    /// enough. Each is reported once.
+    fn tick(&mut self, now: Instant) -> Vec<PathBuf> {
+        let started = *self.minute_started.get_or_insert(now);
+        if now.duration_since(started) < Duration::from_secs(60) {
+            return Vec::new();
+        }
+        self.minute_started = Some(now);
+        let minute = std::mem::take(&mut self.this_minute);
+        let busy = |dir: &PathBuf| minute.get(dir).is_some_and(|&n| n >= BUSY_PER_MINUTE);
+        self.streak.retain(|dir, _| busy(dir));
+        for (dir, &n) in &minute {
+            if n >= BUSY_PER_MINUTE {
+                *self.streak.entry(dir.clone()).or_default() += 1;
+            }
+        }
+        let hot: Vec<PathBuf> = self
+            .streak
+            .iter()
+            .filter(|(_, minutes)| **minutes >= BUSY_MINUTES)
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        for dir in &hot {
+            self.streak.remove(dir);
+        }
+        hot
     }
 }
 
@@ -588,6 +811,36 @@ impl Provider for Files {
             .then(|| self.rows(query, filter, cancel))
             .flatten()
     }
+
+    /// A file row was used: it ranks higher from now on, and first before
+    /// anything is typed.
+    fn opened(&self, item_id: &str) {
+        let Some(path) = item_id.strip_prefix(ITEM_PREFIX) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let now = frecency::now();
+        {
+            let mut opened = self.shared.opened.lock().expect("opened");
+            let (_, used) = opened
+                .entry(fold_path(&path))
+                .or_insert_with(|| (path.clone(), Frecency::default()));
+            *used = used.visit(now);
+        }
+        let Some(store) = self.shared.store.clone() else {
+            return;
+        };
+        let id = item_id.to_owned();
+        thread::spawn(move || {
+            let saved = store
+                .lock()
+                .map_err(|_| "store lock poisoned".to_owned())
+                .and_then(|mut store| store.record_visit(&id, now).map_err(|err| err.to_string()));
+            if let Err(err) = saved {
+                eprintln!("[files] could not remember opening {id:?}: {err}");
+            }
+        });
+    }
 }
 
 /// A result row: open, show, copy, or move to the Recycle Bin.
@@ -637,6 +890,10 @@ fn file_item(index: &Index, id: EntryId) -> SearchItem {
         body: PreviewBody::Thumbnail(text),
         metadata,
     })
+}
+
+fn fold_path(path: &Path) -> String {
+    path.to_string_lossy().trim_end_matches('\\').to_lowercase()
 }
 
 /// `~\Documents` for a folder in the user profile, else the path.
@@ -694,10 +951,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("zqx-before.txt"), "x").unwrap();
-        let files = Files::new(Config {
-            folders: vec![dir.clone()],
-            ..Config::default()
-        });
+        let files = Files::new(
+            Config {
+                folders: vec![dir.clone()],
+                ..Config::default()
+            },
+            None,
+        );
         files.start();
         assert!(eventually(|| matches!(
             files.status(),
@@ -740,6 +1000,76 @@ mod tests {
         assert_eq!(files.status(), Status::Idle);
         fs::remove_dir_all(&dir).unwrap();
         let _: PathBuf = dir;
+    }
+
+    #[test]
+    fn busy_folders_need_minutes_in_a_row() {
+        let mut busy = Busy::default();
+        let start = Instant::now();
+        let minute = |n: u64| start + Duration::from_secs(60 * n);
+        let cache = Path::new(r"C:\Users\me\cache");
+        let unzip = Path::new(r"C:\Users\me\Downloads\photos");
+        assert!(busy.tick(start).is_empty());
+        // An unzip: a thousand files in one minute, then quiet.
+        for _ in 0..1000 {
+            busy.count(unzip);
+        }
+        for n in 1..=3 {
+            for _ in 0..BUSY_PER_MINUTE {
+                busy.count(cache);
+            }
+            let hot = busy.tick(minute(n));
+            if n < 3 {
+                assert!(hot.is_empty(), "minute {n}: {hot:?}");
+            } else {
+                assert_eq!(hot, [cache.to_path_buf()]);
+            }
+        }
+        // Reported once.
+        for _ in 0..BUSY_PER_MINUTE {
+            busy.count(cache);
+        }
+        assert!(busy.tick(minute(4)).is_empty());
+    }
+
+    #[test]
+    fn opened_files_come_first_and_rank_higher() {
+        let dir = std::env::temp_dir().join(format!("spotlight-opened-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("zqo-report-old.txt"), "x").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(dir.join("zqo-report-new.txt"), "x").unwrap();
+        let files = Files::new(
+            Config {
+                folders: vec![dir.clone()],
+                ..Config::default()
+            },
+            None,
+        );
+        files.start();
+        assert!(eventually(|| matches!(
+            files.status(),
+            Status::Ready { .. }
+        )));
+        let never = AtomicBool::new(false);
+        let titles = |query: &str| -> Vec<String> {
+            files
+                .search_view(SEARCH_VIEW, query, None, &never)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.title)
+                .collect()
+        };
+        let old = format!("{ITEM_PREFIX}{}", dir.join("zqo-report-old.txt").display());
+        for _ in 0..3 {
+            files.opened(&old);
+        }
+        assert_eq!(titles("'zqo-report")[0], "zqo-report-old.txt");
+        assert_eq!(titles("")[0], "zqo-report-old.txt");
+        files.stop();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

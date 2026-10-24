@@ -51,6 +51,11 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// One of this provider's rows was used (any action but an edit). For
+    /// rows the provider ranks itself, which root search's frecency doesn't
+    /// cover: files opened from Search Files.
+    fn opened(&self, _item_id: &str) {}
+
     /// The rows of live list `view` ([`crate::view::ListView::live`]) for
     /// `query`, under the filter choice whose keyword is `filter`. Runs on
     /// a background thread for every keystroke; once `cancel` is set a newer
