@@ -53,6 +53,9 @@ pub struct LiveRows {
     pub items: Vec<SearchItem>,
     /// Shown when there are no items ("Indexing… 12,345 files so far").
     pub empty: Option<String>,
+    /// The rows will change without anything typed (files are still being
+    /// indexed): the list asks again a little later.
+    pub unsettled: bool,
 }
 
 /// One choice of a list's filter: items with `keyword` among their keywords.

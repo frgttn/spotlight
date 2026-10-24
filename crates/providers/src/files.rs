@@ -46,6 +46,8 @@ pub const ID: &str = "files";
 /// What file rows' ids start with: `files:C:\Users\me\plan.md`.
 const ITEM_PREFIX: &str = "files:";
 const SEARCH_VIEW: &str = "search";
+/// [`Command::ProviderAction`]: leave this file or folder out of the index.
+const EXCLUDE: &str = "exclude";
 /// Rows a query shows.
 const LIMIT: usize = 50;
 /// Changes are applied in batches at most this often, so a burst (an unzip,
@@ -90,6 +92,9 @@ struct Shared {
     store: Option<Arc<Mutex<Store>>>,
     /// Told when the config changes from here (a busy folder left out).
     listener: Mutex<Option<ConfigListener>>,
+    /// Set when the rules changed from outside the follow loop (Exclude
+    /// from Index), which then builds its own again.
+    rules_changed: AtomicBool,
 }
 
 impl Files {
@@ -116,6 +121,7 @@ impl Files {
                 opened: Mutex::new(opened),
                 store,
                 listener: Mutex::new(None),
+                rules_changed: AtomicBool::new(false),
             }),
         }
     }
@@ -159,6 +165,46 @@ impl Files {
         if running && scope_changed {
             self.start();
         }
+    }
+
+    /// Leaves `path` out of the index from now on: a rule of its own in
+    /// Settings, and gone from the index at once.
+    pub fn exclude(&self, path: &Path) -> Result<String, String> {
+        let shared = &self.shared;
+        let rule = path.to_string_lossy().trim_end_matches('\\').to_owned();
+        if rule.is_empty() {
+            return Err("Nothing to leave out".into());
+        }
+        let config = {
+            let mut config = shared.config.lock().expect("config");
+            if !config
+                .exclusions
+                .iter()
+                .any(|known| known.trim_end_matches('\\').eq_ignore_ascii_case(&rule))
+            {
+                config.exclusions.push(rule);
+            }
+            config.clone()
+        };
+        shared.rules_changed.store(true, Ordering::SeqCst);
+        {
+            let mut index = shared.index.write().expect("file index");
+            if let Some(id) = index.resolve(path) {
+                index.remove(id);
+            }
+        }
+        // A scan under way still has the old rules: start it over.
+        if matches!(*shared.status.lock().expect("status"), Status::Indexing(_)) {
+            shared.launch();
+        }
+        if let Some(listener) = &*shared.listener.lock().expect("listener") {
+            listener(&config);
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or(path.display().to_string());
+        Ok(format!("Left {name} out of the index"))
     }
 
     pub fn status(&self) -> Status {
@@ -223,13 +269,19 @@ impl Files {
         };
         let items = hits.iter().map(|&id| file_item(&index, id)).collect();
         drop(index);
-        let empty = match self.status() {
+        let status = self.status();
+        let unsettled = matches!(status, Status::Indexing(_));
+        let empty = match status {
             Status::Idle => Some("File search is off. Turn it on in Settings → Extensions.".into()),
             Status::Indexing(found) => Some(format!("Indexing… {} files so far", thousands(found))),
             Status::Ready { .. } if parsed.is_empty() => Some("No files yet".into()),
             Status::Ready { .. } => Some("No files match".into()),
         };
-        Some(LiveRows { items, empty })
+        Some(LiveRows {
+            items,
+            empty,
+            unsettled,
+        })
     }
 }
 
@@ -506,6 +558,9 @@ impl Shared {
             if !self.current(generation) {
                 return;
             }
+            if self.rules_changed.swap(false, Ordering::SeqCst) {
+                rules = self::rules(&self.config.lock().expect("config"));
+            }
             if batch
                 .iter()
                 .any(|change| matches!(change, Change::Overflow))
@@ -521,6 +576,9 @@ impl Shared {
                     && index.resolve(dir).is_some()
                 {
                     busy.count(dir);
+                }
+                if let Change::Renamed { from, to } = &change {
+                    self.moved(from, to);
                 }
                 apply(&mut index, &rules, change);
             }
@@ -581,6 +639,59 @@ impl Shared {
                 };
             }
         }
+    }
+}
+
+impl Shared {
+    /// `from` was renamed to `to`: files opened from Spotlight there (it, or
+    /// what is inside it) keep how often they were opened.
+    fn moved(&self, from: &Path, to: &Path) {
+        let from_text = from.to_string_lossy();
+        let from_text = from_text.trim_end_matches('\\');
+        let key = from_text.to_lowercase();
+        let inside = format!("{key}\\");
+        let mut opened = self.opened.lock().expect("opened");
+        let hit: Vec<String> = opened
+            .keys()
+            .filter(|known| **known == key || known.starts_with(&inside))
+            .cloned()
+            .collect();
+        let mut renamed = Vec::new();
+        for known in hit {
+            let Some((old, used)) = opened.remove(&known) else {
+                continue;
+            };
+            // What follows `from` in the old path; the same length, as the
+            // two differ in case at most.
+            let old_text = old.to_string_lossy().into_owned();
+            let Some(rest) = old_text.get(from_text.len()..) else {
+                continue;
+            };
+            let new = PathBuf::from(format!(
+                "{}{rest}",
+                to.to_string_lossy().trim_end_matches('\\')
+            ));
+            opened.insert(fold_path(&new), (new.clone(), used));
+            renamed.push((old_text, new.to_string_lossy().into_owned()));
+        }
+        drop(opened);
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        if renamed.is_empty() {
+            return;
+        }
+        thread::spawn(move || {
+            let Ok(store) = store.lock() else {
+                return;
+            };
+            for (old, new) in renamed {
+                let (old, new) = (format!("{ITEM_PREFIX}{old}"), format!("{ITEM_PREFIX}{new}"));
+                if let Err(err) = store.rename_frecency(&old, &new) {
+                    eprintln!("[files] could not carry over {old:?}: {err}");
+                }
+            }
+        });
     }
 }
 
@@ -778,14 +889,14 @@ impl Provider for Files {
         if id != SEARCH_VIEW {
             return None;
         }
-        let never = AtomicBool::new(false);
-        let rows = self.rows("", None, &never).unwrap_or_default();
+        // No rows yet: the list asks for them on a background thread as it
+        // opens (see `search_view`), as for every keystroke.
         let filter = |label: &str, keyword: Option<&str>| ListFilter::new(label, keyword);
         Some(View::List(ListView {
             title: "Search Files".into(),
             placeholder: Some("Search files and folders…".into()),
-            items: rows.items,
-            empty: rows.empty,
+            items: Vec::new(),
+            empty: None,
             filters: vec![
                 filter("All", None),
                 filter("Folders", Some("kind:folder")),
@@ -810,6 +921,16 @@ impl Provider for Files {
         (view == SEARCH_VIEW)
             .then(|| self.rows(query, filter, cancel))
             .flatten()
+    }
+
+    fn act(&self, action: &str, item_id: &str) -> Result<String, String> {
+        let path = item_id
+            .strip_prefix(ITEM_PREFIX)
+            .ok_or_else(|| format!("{item_id:?} is not a file"))?;
+        match action {
+            EXCLUDE => self.exclude(Path::new(path)),
+            _ => Err(format!("File Search can't {action}")),
+        }
     }
 
     /// A file row was used: it ranks higher from now on, and first before
@@ -853,7 +974,17 @@ fn file_item(index: &Index, id: EntryId) -> SearchItem {
         .subtitle(path.parent().map(shorten).unwrap_or_default())
         .icon(Icon::Shell(text.clone()))
         .action("Open", Command::Open(text.clone()))
-        .action("Show in Explorer", Command::ShowInFolder(text.clone()));
+        .action("Show in Explorer", Command::ShowInFolder(text.clone()))
+        .action(
+            "Open in Terminal",
+            Command::OpenTerminal(if dir {
+                text.clone()
+            } else {
+                path.parent()
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }),
+        );
     if !dir {
         item = item.action("Open With…", Command::OpenWith(text.clone()));
     }
@@ -863,6 +994,14 @@ fn file_item(index: &Index, id: EntryId) -> SearchItem {
         .action(
             if dir { "Copy Folder" } else { "Copy File" },
             Command::CopyFile(text.clone()),
+        )
+        .action(
+            "Exclude from Index",
+            Command::ProviderAction {
+                provider: ID.into(),
+                action: EXCLUDE.into(),
+                item: item_id(ID, &text),
+            },
         )
         .action("Move to Recycle Bin", Command::MoveToTrash(text.clone()));
     let kind = if dir {
@@ -1068,6 +1207,64 @@ mod tests {
         }
         assert_eq!(titles("'zqo-report")[0], "zqo-report-old.txt");
         assert_eq!(titles("")[0], "zqo-report-old.txt");
+        files.stop();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Exclude from Index takes a folder out now and for good; a renamed
+    /// file keeps how often it was opened.
+    #[test]
+    fn excluded_folders_and_renamed_files() {
+        let dir = std::env::temp_dir().join(format!("spotlight-exclude-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let drafts = dir.join("zqe-drafts");
+        fs::create_dir_all(&drafts).unwrap();
+        fs::write(drafts.join("zqe-a.txt"), "x").unwrap();
+        fs::write(dir.join("zqe-keep.txt"), "x").unwrap();
+        fs::write(dir.join("zqe-other.txt"), "x").unwrap();
+        let files = Files::new(
+            Config {
+                folders: vec![dir.clone()],
+                ..Config::default()
+            },
+            None,
+        );
+        files.start();
+        assert!(eventually(|| matches!(
+            files.status(),
+            Status::Ready { .. }
+        )));
+        let never = AtomicBool::new(false);
+        let titles = |query: &str| -> Vec<String> {
+            files
+                .search_view(SEARCH_VIEW, query, None, &never)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.title)
+                .collect()
+        };
+        assert_eq!(titles("'zqe-a"), ["zqe-a.txt"]);
+
+        let id = |path: PathBuf| format!("{ITEM_PREFIX}{}", path.display());
+        files.act(EXCLUDE, &id(drafts.clone())).unwrap();
+        assert!(titles("'zqe-a").is_empty());
+        assert!(titles("'zqe-drafts").is_empty());
+        assert!(
+            files
+                .config()
+                .exclusions
+                .contains(&drafts.to_string_lossy().into_owned())
+        );
+
+        for _ in 0..3 {
+            files.opened(&id(dir.join("zqe-keep.txt")));
+        }
+        fs::write(drafts.join("zqe-b.txt"), "x").unwrap();
+        fs::rename(dir.join("zqe-keep.txt"), dir.join("zqe-kept.txt")).unwrap();
+        assert!(eventually(|| titles("'zqe-kept") == ["zqe-kept.txt"]));
+        assert!(titles("'zqe-b").is_empty());
+        assert_eq!(titles("")[0], "zqe-kept.txt");
         files.stop();
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -677,6 +677,16 @@ impl Store {
         Ok(removed)
     }
 
+    /// Carries the uses of `from` over to `to` (a file that was renamed),
+    /// in place of any `to` had.
+    pub fn rename_frecency(&self, from: &str, to: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE OR REPLACE frecency SET item_id = ?2 WHERE item_id = ?1",
+            [from, to],
+        )?;
+        Ok(())
+    }
+
     /// Forgets every use of `item_id`.
     pub fn forget(&self, item_id: &str) -> Result<()> {
         self.conn
@@ -1043,6 +1053,21 @@ mod tests {
         store.forget("apps:never-used").unwrap();
         let left: Vec<_> = store.frecency().unwrap().into_keys().collect();
         assert_eq!(left, ["apps:b"]);
+    }
+
+    #[test]
+    fn rename_carries_uses_over() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.record_visit("files:a", 1).unwrap();
+        store.record_visit("files:a", 2).unwrap();
+        store.record_visit("files:b", 1).unwrap();
+        store.rename_frecency("files:a", "files:b").unwrap();
+        store
+            .rename_frecency("files:never-used", "files:c")
+            .unwrap();
+        let all = store.frecency().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all["files:b"].count, 2);
     }
 
     #[test]

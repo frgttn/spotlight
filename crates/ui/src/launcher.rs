@@ -749,6 +749,8 @@ impl Launcher {
             && self.screens.is_empty()
             && self.panel.is_none()
             && self.editor.is_none()
+            // A link's command waits on its row for Enter.
+            && self.pending_link.is_none()
             && self.input.read(cx).text().is_empty()
     }
 
@@ -1397,6 +1399,7 @@ impl Launcher {
                 | Command::SaveSnippet(_)
                 | Command::DeleteSnippet(_)
                 | Command::Complete(_)
+                | Command::ProviderAction { .. }
         );
         if !edits && !ranked {
             // Item ids start with their provider's id.
@@ -1441,6 +1444,11 @@ impl Launcher {
                 }
             }
             Command::Complete(text) => self.complete(text.clone(), window, cx),
+            Command::ProviderAction {
+                provider,
+                action,
+                item,
+            } => self.provider_action(provider, action, item, cx),
             Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
             Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
@@ -1470,12 +1478,51 @@ impl Launcher {
                 if let Some(Screen::List { origin, .. }) = self.screens.last_mut() {
                     *origin = Some((provider.to_owned(), id.to_owned()));
                 }
+                // A live list's rows come from a background search.
+                self.search_live(cx);
             }
             None => {
                 eprintln!("[spotlight] {provider} has no view {id:?}");
                 self.show_toast("Nothing to show".into(), cx);
             }
         }
+    }
+
+    /// Has `provider` do `action` to row `item` in the background, then says
+    /// how it went and searches again, so the row shows what it did (an
+    /// excluded file is gone).
+    fn provider_action(
+        &mut self,
+        provider: &str,
+        action: &str,
+        item: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .cloned()
+        else {
+            return;
+        };
+        let (action, item) = (action.to_owned(), item.to_owned());
+        let outcome = cx
+            .background_executor()
+            .spawn(async move { provider.act(&action, &item) });
+        cx.spawn(async move |this, cx| {
+            let message = match outcome.await {
+                Ok(message) | Err(message) => message,
+            };
+            this.update(cx, |this, cx| {
+                this.show_toast(message.into(), cx);
+                this.search_live(cx);
+                this.search_prefix(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Back to root search with `text` in the field, as if typed.

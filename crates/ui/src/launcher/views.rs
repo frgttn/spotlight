@@ -2,9 +2,12 @@
 //! launcher's screen stack, and how grids, details and forms are drawn. Lists
 //! reuse root search's rows, and every view keeps the action panel and Esc.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use gpui::{
@@ -27,6 +30,8 @@ const TILE_HEIGHT: f32 = 112.;
 const TILE_ICON: f32 = 44.;
 /// How far ↑/↓ scroll a detail view.
 const DETAIL_STEP: f32 = 48.;
+/// How soon a live list whose rows are still settling asks again.
+const UNSETTLED_RETRY: Duration = Duration::from_secs(1);
 
 /// One level of the screen stack above root search.
 pub(super) enum Screen {
@@ -321,6 +326,9 @@ impl Launcher {
                 let query = this.query(cx);
                 this.refilter(&query);
                 this.load_icons(icons, this.window_scale, cx);
+                if rows.unsettled {
+                    this.search_again(generation, Self::search_prefix, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -368,7 +376,32 @@ impl Launcher {
         let query = self.query(cx);
         self.refilter(&query);
         self.load_icons(icons, self.window_scale, cx);
+        if rows.unsettled {
+            self.search_again(generation, Self::search_live, cx);
+        }
         cx.notify();
+    }
+
+    /// While the rows still change by themselves (files being indexed),
+    /// runs `search` again in a moment, unless something newer was searched
+    /// meanwhile.
+    fn search_again(
+        &self,
+        generation: u64,
+        search: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) {
+        let timer = cx.background_executor().timer(UNSETTLED_RETRY);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if generation == this.live_generation {
+                    search(this, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Sets up the search field, the rows and the keyboard for the top screen.
@@ -434,6 +467,8 @@ impl Launcher {
             }
             _ => return self.pop_screen(window, cx),
         }
+        // A live list's rows come from a background search.
+        self.search_live(cx);
         let previous = self.selected;
         let query = self.query(cx);
         self.refilter(&query);

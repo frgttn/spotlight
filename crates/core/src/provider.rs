@@ -56,6 +56,14 @@ pub trait Provider: Send + Sync {
     /// cover: files opened from Search Files.
     fn opened(&self, _item_id: &str) {}
 
+    /// Does `action` of a [`Command::ProviderAction`] to row `item_id`, on a
+    /// background thread. `Ok` is what the toast says.
+    ///
+    /// [`Command::ProviderAction`]: crate::item::Command::ProviderAction
+    fn act(&self, action: &str, _item_id: &str) -> Result<String, String> {
+        Err(format!("{} can't {action}", self.name()))
+    }
+
     /// The rows of live list `view` ([`crate::view::ListView::live`]) for
     /// `query`, under the filter choice whose keyword is `filter`. Runs on
     /// a background thread for every keystroke; once `cancel` is set a newer

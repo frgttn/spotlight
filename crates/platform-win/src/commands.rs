@@ -9,7 +9,7 @@ use windows::{
     Win32::{
         System::{
             Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
-            Threading::CREATE_NO_WINDOW,
+            Threading::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW},
         },
         UI::{
             Shell::{
@@ -88,6 +88,7 @@ fn run_blocking(command: &Command) -> Outcome {
             .map(|_| None)
             .map_err(|err| format!("Couldn't ask which app to use: {err}")),
         Command::MoveToTrash(path) => move_to_trash(path),
+        Command::OpenTerminal(dir) => open_terminal(dir),
         Command::OpenUrl(url) => {
             let lower = url.to_ascii_lowercase();
             if URL_SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
@@ -122,6 +123,7 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::ExportSnippets
         | Command::OpenProviderView { .. }
         | Command::SearchIn { .. }
+        | Command::ProviderAction { .. }
         | Command::RestoreClip { .. }
         | Command::PinClip { .. }
         | Command::DeleteClip(_)
@@ -177,6 +179,24 @@ fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
         27 | 31 => Err("Couldn't open it: no app is set to open this".into()),
         code => Err(format!("Couldn't open it (error {code})")),
     }
+}
+
+/// Opens Windows Terminal in `dir`, or PowerShell where it isn't installed.
+fn open_terminal(dir: &str) -> Outcome {
+    if !std::path::Path::new(dir).is_dir() {
+        return Err("Couldn't open a terminal: the folder is gone".into());
+    }
+    let terminal = process::Command::new("wt.exe").arg("-d").arg(dir).spawn();
+    if terminal.is_ok() {
+        return Ok(None);
+    }
+    process::Command::new("powershell.exe")
+        .arg("-NoExit")
+        .current_dir(dir)
+        .creation_flags(CREATE_NEW_CONSOLE.0)
+        .spawn()
+        .map(|_| None)
+        .map_err(|err| format!("Couldn't open a terminal: {err}"))
 }
 
 /// Moves `path` to the Recycle Bin, without Explorer's own confirmation (the

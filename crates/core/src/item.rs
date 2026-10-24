@@ -115,6 +115,15 @@ pub enum Command {
     CopyFile(String),
     /// Moves this file or folder to the Recycle Bin.
     MoveToTrash(String),
+    /// Opens a terminal in this folder: Windows Terminal, else PowerShell.
+    OpenTerminal(String),
+    /// An action of provider `provider`'s own on its row `item` (an item
+    /// id), which the UI hands to `Provider::act`: Exclude from Index.
+    ProviderAction {
+        provider: String,
+        action: String,
+        item: String,
+    },
     /// Opens an `http`/`https` URL in the default browser, an `ms-settings:`
     /// page in the Settings app, or a game through its launcher (`steam://`…).
     /// The app refuses other schemes.
