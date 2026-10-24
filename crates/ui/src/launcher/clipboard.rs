@@ -176,11 +176,14 @@ impl Launcher {
 
     /// Whether the open list shows a preview beside its rows.
     pub(super) fn shows_previews(&self) -> bool {
-        matches!(
-            self.screens.last(),
-            Some(Screen::List { view, grid: false, .. })
-                if view.items.iter().any(|item| item.preview.is_some())
-        )
+        match self.screens.last() {
+            Some(Screen::List {
+                view, grid: false, ..
+            }) => view.items.iter().any(|item| item.preview.is_some()),
+            // Root search after the file prefix: only files, as in Search Files.
+            None => self.prefix_rows.iter().any(|item| item.preview.is_some()),
+            Some(_) => false,
+        }
     }
 
     /// The selected row's preview: its text, image or files, and the facts
@@ -243,12 +246,13 @@ impl Launcher {
                             .justify_center()
                             .child(picture),
                     )
+                    // The name; where it is comes with the facts below.
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
-                            .text_color(rgba(theme::TEXT_FAINT))
-                            .child(SharedString::from(path)),
+                            .text_size(px(13.))
+                            .text_color(rgba(theme::TEXT))
+                            .child(SharedString::from(item.title.clone())),
                     )
                     .into_any_element()
             }

@@ -2197,6 +2197,7 @@ impl Launcher {
         } else {
             item.subtitle.clone().unwrap_or_default().into()
         };
+        let stacked = !subtitle.is_empty() && self.shows_previews();
 
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
@@ -2222,12 +2223,44 @@ impl Launcher {
                     this.confirm(&Confirm, window, cx);
                 }))
                 .child(self.render_icon(item))
-                .child(
-                    div()
-                        .flex_1()
-                        .truncate()
-                        .child(SharedString::from(item.title.clone())),
-                )
+                .when(stacked, |row| {
+                    // Beside a preview the list is narrow: the name gets the
+                    // whole width, what's after it goes underneath.
+                    row.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(13.))
+                                    .line_height(px(17.))
+                                    .child(SharedString::from(item.title.clone())),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .line_height(px(15.))
+                                    .text_color(if confirming {
+                                        rgba(theme::ERROR)
+                                    } else {
+                                        rgba(0xffffff70)
+                                    })
+                                    .child(subtitle.clone()),
+                            ),
+                    )
+                })
+                .when(!stacked, |row| {
+                    row.child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(item.title.clone())),
+                    )
+                })
                 .when_some(self.aliases.get(&item.id), |row, alias| {
                     row.child(
                         div()
@@ -2244,17 +2277,19 @@ impl Launcher {
                 .when_some(self.item_hotkeys.get(&item.id), |row, hotkey| {
                     row.child(keycaps(&hotkey_keys(*hotkey)))
                 })
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(if confirming {
-                            rgba(theme::ERROR)
-                        } else {
-                            rgba(0xffffff70)
-                        })
-                        .child(subtitle),
-                ),
+                .when(!stacked, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.))
+                            .text_color(if confirming {
+                                rgba(theme::ERROR)
+                            } else {
+                                rgba(0xffffff70)
+                            })
+                            .child(subtitle),
+                    )
+                }),
         )
     }
 
