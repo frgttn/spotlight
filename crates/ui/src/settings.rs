@@ -166,7 +166,7 @@ pub struct Settings {
     file_status: FileStatusReader,
     /// Where a new exclusion rule is typed.
     exclusion_input: Entity<TextInput>,
-    /// The file prefix of root search; Enter saves it.
+    /// The file prefix of root search, saved as it is typed.
     prefix_input: Entity<TextInput>,
     /// Redraws the File Search page while indexing, for its count.
     status_refresh: Option<Task<()>>,
@@ -191,7 +191,7 @@ pub struct Settings {
     relayout: bool,
     focus: FocusHandle,
     recorder: FocusHandle,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
 }
 
 impl EventEmitter<SettingsEvent> for Settings {}
@@ -227,6 +227,12 @@ impl Settings {
         let search = cx.new(|cx| TextInput::new("Search settings…", cx));
         // Recording takes every key press system-wide, so it ends as soon as
         // the user clicks elsewhere in the window or switches to another one.
+        let prefix = file_search.prefix.clone();
+        let prefix_input = cx.new(|cx| {
+            let mut input = TextInput::new("Off", cx);
+            input.set_text(prefix, cx);
+            input
+        });
         let subscriptions = [
             cx.on_blur(&recorder, window, |this, _, cx| this.stop_recording(cx)),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -244,6 +250,17 @@ impl Settings {
                 window,
                 |this, _, _: &text_input::Changed, _, cx| this.search_changed(cx),
             ),
+            // Only root search reads it, so nothing is indexed again.
+            cx.subscribe_in(
+                &prefix_input,
+                window,
+                |this, input, _: &text_input::Changed, _, cx| {
+                    let prefix = input.read(cx).text().trim().to_owned();
+                    if prefix != this.file_search.prefix {
+                        this.change_file_search(|config| config.prefix = prefix, cx);
+                    }
+                },
+            ),
         ];
         let focus = cx.focus_handle();
         window.focus(&search.focus_handle(cx));
@@ -254,12 +271,6 @@ impl Settings {
             ignored_apps,
             excluded_apps,
         } = launcher(cx).unwrap_or_default();
-        let prefix = file_search.prefix.clone();
-        let prefix_input = cx.new(|cx| {
-            let mut input = TextInput::new("Off", cx);
-            input.set_text(prefix, cx);
-            input
-        });
         Self {
             hotkeys,
             hotkey,
@@ -455,7 +466,7 @@ impl Settings {
     }
 
     /// Enter: saves the alias, the custom search URL or the exclusion rule
-    /// being typed.
+    /// being typed, or leaves the prefix field.
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = &self.custom_engine
             && input.focus_handle(cx).is_focused(window)
@@ -465,9 +476,8 @@ impl Settings {
         if self.exclusion_input.focus_handle(cx).is_focused(window) {
             return self.add_exclusion(cx);
         }
+        // Saved as typed: Enter just leaves the field.
         if self.prefix_input.focus_handle(cx).is_focused(window) {
-            let prefix = self.prefix_input.read(cx).text().trim().to_owned();
-            self.change_file_search(|config| config.prefix = prefix, cx);
             window.focus(&self.focus);
             return;
         }
