@@ -8,7 +8,7 @@ use crate::{
     quicklink::{self, Quicklink},
     snippet::Snippet,
     view::{Preview, View},
-    web::encode_query,
+    web::{SearchEngine, encode_query},
     window::WindowCommand,
 };
 
@@ -143,6 +143,11 @@ pub enum Command {
     /// Saves a new (id 0) or edited quicklink. The UI checks it first.
     SaveQuicklink(Quicklink),
     DeleteQuicklink(i64),
+    /// Makes `engine` (named `name`) the web search engine, as in Settings.
+    SetSearchEngine {
+        engine: SearchEngine,
+        name: String,
+    },
     /// Saves a new (id 0) or edited snippet. The UI checks it first.
     SaveSnippet(Snippet),
     DeleteSnippet(i64),
@@ -230,6 +235,23 @@ impl Command {
             }
             Command::OpenQuicklink { link, app } => Command::OpenQuicklink {
                 link: quicklink::fill_selection(link, text),
+                app: app.clone(),
+            },
+            command => command.clone(),
+        }
+    }
+
+    /// Whether it's a quicklink with `{clipboard}`, which the app fills in
+    /// with the clipboard's text before running it.
+    pub fn needs_clipboard(&self) -> bool {
+        matches!(self, Command::OpenQuicklink { link, .. } if quicklink::has_clipboard(link))
+    }
+
+    /// The command with `text` in place of `{clipboard}`.
+    pub fn with_clipboard(&self, text: &str) -> Command {
+        match self {
+            Command::OpenQuicklink { link, app } => Command::OpenQuicklink {
+                link: quicklink::fill_clipboard(link, text),
                 app: app.clone(),
             },
             command => command.clone(),

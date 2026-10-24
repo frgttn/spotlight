@@ -2,8 +2,8 @@
 //! deeplink), with placeholders filled in when they're opened.
 //!
 //! Placeholders, as in Raycast (see [`crate::placeholder`]): `{query}`,
-//! `{argument …}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}` and
-//! `{selection}`. Anything else in braces is left as it is.
+//! `{argument …}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}`,
+//! `{selection}` and `{clipboard}`. Anything else in braces is left as it is.
 
 use crate::placeholder::{self, Placeholder};
 pub use crate::placeholder::{Argument, Moment, arguments, field_id, with_field_ids};
@@ -593,9 +593,37 @@ pub fn has_selection(link: &str) -> bool {
 
 /// `link` with `{selection}` replaced by `text`, encoded as typed values are.
 pub fn fill_selection(link: &str, text: &str) -> String {
+    fill_with(link, &Placeholder::Selection, text)
+}
+
+/// `link` as a web search template (see [`crate::web`]): `{query}` where its
+/// first free-text argument goes, the other arguments at their defaults.
+/// `None` unless it is an `http(s)` URL with such an argument.
+pub fn search_template(link: &str) -> Option<String> {
+    // Alphanumeric, so `fill` leaves it as it is.
+    const MARK: &str = "SPOTLIGHTQUERYMARK";
+    let arguments = arguments(link);
+    if !arguments.iter().any(Argument::is_free_text) {
+        return None;
+    }
+    let template = fill(link, &bang_values(&arguments, MARK)).replace(MARK, "{query}");
+    crate::web::check_template(&template).ok().map(|()| template)
+}
+
+/// Whether `link` contains `{clipboard}`.
+pub fn has_clipboard(link: &str) -> bool {
+    placeholder::contains(link, |placeholder| *placeholder == Placeholder::Clipboard)
+}
+
+/// `link` with `{clipboard}` replaced by `text`, encoded as typed values are.
+pub fn fill_clipboard(link: &str, text: &str) -> String {
+    fill_with(link, &Placeholder::Clipboard, text)
+}
+
+fn fill_with(link: &str, which: &Placeholder, text: &str) -> String {
     let value = encode_value(text.trim(), is_url(link));
     placeholder::replace(link, |placeholder| {
-        (*placeholder == Placeholder::Selection).then(|| value.clone())
+        (placeholder == which).then(|| value.clone())
     })
 }
 
@@ -764,6 +792,38 @@ mod tests {
         assert_eq!(
             expand_moment(link, &moment),
             r"C:\Notes\2026-10-23 14:05 u {query} Friday 2026-10-23 14:05.md"
+        );
+    }
+
+    #[test]
+    fn makes_search_templates() {
+        assert_eq!(
+            search_template("https://github.com/search?q={query}&type=repositories").as_deref(),
+            Some("https://github.com/search?q={query}&type=repositories")
+        );
+        assert_eq!(
+            search_template(
+                "https://x.com/{argument name=\"Lang\" options=\"en, de\"}/{argument name=\"Text\"}"
+            )
+            .as_deref(),
+            Some("https://x.com/en/{query}")
+        );
+        assert_eq!(search_template("https://x.com/home"), None);
+        assert_eq!(search_template(r"C:\Notes\{query}.md"), None);
+    }
+
+    #[test]
+    fn fills_the_clipboard() {
+        let link = "https://translate.google.com/?text={clipboard}&q={query}";
+        assert!(has_clipboard(link));
+        assert!(!has_clipboard("https://x.com/{selection}"));
+        assert_eq!(
+            fill_clipboard(link, " a&b c\n"),
+            "https://translate.google.com/?text=a%26b%20c&q={query}"
+        );
+        assert_eq!(
+            fill_clipboard(r"C:\Notes\{clipboard}.md", "todo"),
+            r"C:\Notes\todo.md"
         );
     }
 

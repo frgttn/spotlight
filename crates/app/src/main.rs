@@ -372,6 +372,22 @@ fn main() {
         })
         .detach();
 
+        // A quicklink made the web search engine from the launcher is
+        // applied and saved like a choice made in Settings.
+        let (engines_tx, engines_rx) = async_channel::unbounded();
+        window
+            .update(cx, |launcher, _, _| launcher.set_engine_sender(engines_tx))
+            .ok();
+        let engines_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(engine) = engines_rx.recv().await {
+                let event = SettingsEvent::SearchEngineChanged(engine);
+                cx.update(|cx| settings_changed(&engines_state, &event, cx))
+                    .ok();
+            }
+        })
+        .detach();
+
         let settings_state = state.clone();
         cx.on_action(move |_: &OpenSettings, cx| open_settings(&settings_state, cx));
 
@@ -509,7 +525,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 file_status,
                 env!("SPOTLIGHT_VERSION"),
                 view_state.data_path.clone(),
-                launcher_reader(view_state.launcher),
+                launcher_reader(view_state.launcher, view_state.web.clone()),
                 window,
                 cx,
             )
@@ -750,15 +766,17 @@ fn record_clipboard(history: Arc<ClipboardHistory>) {
 
 /// How the settings window reads the launcher's aliases, item hotkeys and
 /// search sources.
-fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
+fn launcher_reader(launcher: WindowHandle<Launcher>, web: Arc<Web>) -> LauncherReader {
     Rc::new(move |cx: &App| {
         let launcher = launcher.read(cx).ok()?;
+        let (name, _) = web.resolved();
         Some(LauncherState {
             shortcuts: launcher.shortcuts(),
             items: launcher.extension_items(),
             sources: launcher.sources(),
             ignored_apps: launcher.ignored_clip_apps(),
             excluded_apps: launcher.excluded_snippet_apps(),
+            search_engine: (web.engine(), name),
         })
     })
 }

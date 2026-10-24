@@ -10,6 +10,7 @@ use spotlight_core::{
     provider::Provider,
     quicklink::{self, Argument, DEFAULTS, Quicklink},
     view::{Field, FieldKind, FormView, ListView, View},
+    web::SearchEngine,
 };
 use spotlight_platform_win::links::{self, Browser};
 use spotlight_store::Store;
@@ -88,6 +89,15 @@ impl Quicklinks {
             .collect();
         item.actions.push(open_action(link, &[]));
         let mut item = item.action("Copy Link", Command::Copy(link.link.clone()));
+        if self.editable() && quicklink::search_template(&link.link).is_some() {
+            item = item.action(
+                "Use as Web Search",
+                Command::SetSearchEngine {
+                    engine: SearchEngine::Quicklink(link.id),
+                    name: link.name.clone(),
+                },
+            );
+        }
         if self.editable() {
             let edit = self.edit_form("Edit Quicklink", link);
             item = item
@@ -268,8 +278,13 @@ impl Provider for Quicklinks {
             .take(BANG_SUGGESTIONS)
             .map(|link| {
                 let mut item = self.item(link);
-                if !complete {
-                    let trigger = link.keyword.as_deref().unwrap_or_default();
+                let trigger = link.keyword.as_deref().unwrap_or_default();
+                // A link that takes no typed text (`{clipboard}` only) opens
+                // on Enter once its keyword is typed in full.
+                let takes_text = quicklink::arguments(&link.link)
+                    .iter()
+                    .any(Argument::is_free_text);
+                if !complete && (takes_text || trigger != keyword) {
                     item.actions.insert(0, complete_action(trigger));
                 }
                 item
@@ -483,9 +498,18 @@ mod tests {
             [
                 "Open Quicklink",
                 "Copy Link",
+                "Use as Web Search",
                 "Edit Quicklink…",
                 "Delete Quicklink"
             ]
+        );
+        let id = github.id.strip_prefix("quicklinks:").unwrap().parse().unwrap();
+        assert_eq!(
+            github.actions[2].command,
+            Command::SetSearchEngine {
+                engine: SearchEngine::Quicklink(id),
+                name: "GitHub".into()
+            }
         );
         find(&catalog, "Create Quicklink");
     }
@@ -543,6 +567,32 @@ mod tests {
         let items = provider.answers("!gh ");
         assert_eq!(titles(&items), ["GitHub"]);
         assert_eq!(items[0].actions[0].title, "Open Quicklink");
+    }
+
+    #[test]
+    fn a_full_keyword_without_text_opens_directly() {
+        let provider = provider();
+        let link = Quicklink {
+            id: 0,
+            name: "Translate From Clipboard".into(),
+            link: "https://translate.google.com/?text={clipboard}".into(),
+            keyword: Some("tracl".into()),
+            open_with: None,
+        };
+        let store = provider.store.as_ref().unwrap();
+        store.lock().unwrap().save_quicklink(&link).unwrap();
+        provider.catalog();
+
+        let items = provider.answers("!tracl");
+        assert_eq!(titles(&items), ["Translate From Clipboard"]);
+        assert!(matches!(
+            items[0].actions[0].command,
+            Command::OpenQuicklink { .. }
+        ));
+        // Still being typed: Enter completes it.
+        let items = provider.answers("!tra");
+        let item = find(&items, "Translate From Clipboard");
+        assert_eq!(item.actions[0].command, Command::Complete("!tracl ".into()));
     }
 
     #[test]

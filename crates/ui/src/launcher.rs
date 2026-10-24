@@ -34,6 +34,7 @@ use spotlight_core::{
     item_id,
     provider::Provider,
     view::{ListView, View},
+    web::SearchEngine,
 };
 use spotlight_platform_win::{
     clipboard as system_clipboard, commands, expander,
@@ -325,6 +326,9 @@ pub struct Launcher {
     frecency: HashMap<String, Frecency>,
     /// Whether root search ranks by frecency. Off, usage is still recorded.
     rank_by_usage: bool,
+    /// Where search engines chosen here (a quicklink's "Use as Web Search")
+    /// go, so the app applies and saves them as it does Settings' choice.
+    engines: Option<async_channel::Sender<SearchEngine>>,
     /// `None` when the database couldn't be opened; usage is then not remembered.
     store: Option<Arc<Mutex<Store>>>,
     /// Item id → the user's alias for it.
@@ -494,6 +498,7 @@ impl Launcher {
             icons: HashMap::new(),
             frecency,
             rank_by_usage: true,
+            engines: None,
             store,
             aliases,
             item_hotkeys,
@@ -812,6 +817,10 @@ impl Launcher {
         self.scroll.set_enabled(enabled);
         self.set_detail_smooth_scrolling(enabled);
         cx.notify();
+    }
+
+    pub fn set_engine_sender(&mut self, engines: async_channel::Sender<SearchEngine>) {
+        self.engines = Some(engines);
     }
 
     pub fn set_rank_by_usage(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1492,6 +1501,7 @@ impl Launcher {
             command,
             Command::SaveQuicklink(_)
                 | Command::DeleteQuicklink(_)
+                | Command::SetSearchEngine { .. }
                 | Command::SaveSnippet(_)
                 | Command::DeleteSnippet(_)
                 | Command::Complete(_)
@@ -1550,6 +1560,12 @@ impl Launcher {
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
             Command::ClearClipboardHistory => self.clear_clips(window, cx),
             Command::IgnoreClipApp(app) => self.ignore_clip_app(app.clone(), cx),
+            Command::SetSearchEngine { engine, name } => {
+                if let Some(engines) = &self.engines {
+                    engines.try_send(engine.clone()).ok();
+                }
+                self.show_toast(format!("Web search uses “{name}” from now on").into(), cx);
+            }
             command => self.run_command(command, cx),
         }
     }
@@ -1659,6 +1675,14 @@ impl Launcher {
                     },
                     cx,
                 );
+            }
+            // Read here, before anything the command runs can change it.
+            command if command.needs_clipboard() => {
+                let text = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                self.run_in_background(command.with_clipboard(&text), cx);
             }
             command => self.run_in_background(command.clone(), cx),
         }

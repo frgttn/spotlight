@@ -24,7 +24,7 @@ impl Launcher {
             Ok(saved) => {
                 self.screens.clear();
                 self.enter_screen(window, cx);
-                self.reload_catalog(PROVIDER, window.scale_factor(), cx);
+                self.reload_quicklinks(window.scale_factor(), cx);
                 let message = match &saved.keyword {
                     Some(keyword) => format!("Saved “{}”. Type !{keyword} to open it", saved.name),
                     None => format!("Saved “{}”", saved.name),
@@ -130,7 +130,15 @@ impl Launcher {
         }
         let query = self.query(cx);
         self.refilter(&query);
-        self.reload_catalog(PROVIDER, window.scale_factor(), cx);
+        self.reload_quicklinks(window.scale_factor(), cx);
         self.show_toast(format!("Deleted “{title}”").into(), cx);
+    }
+
+    /// Quicklinks, and the web search rows, which name a quicklink engine
+    /// and carry its link.
+    fn reload_quicklinks(&mut self, scale: f32, cx: &mut Context<Self>) {
+        self.reload_catalog(PROVIDER, scale, cx);
+        self.reload_catalog("web", scale, cx);
+        self.reload_catalog("selection", scale, cx);
     }
 }

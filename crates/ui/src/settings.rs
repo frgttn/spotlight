@@ -68,6 +68,9 @@ pub struct LauncherState {
     pub ignored_apps: Vec<IgnoredApp>,
     /// Apps where snippet keywords don't expand.
     pub excluded_apps: Vec<IgnoredApp>,
+    /// The web search engine, which a quicklink's "Use as Web Search" in
+    /// the launcher changes too, and its name.
+    pub search_engine: (SearchEngine, String),
 }
 
 /// Reads the launcher's current state; `None` while the launcher can't be
@@ -149,6 +152,8 @@ pub struct Settings {
     window_mode: WindowMode,
     rank_by_usage: bool,
     search_engine: SearchEngine,
+    /// The engine's name: a quicklink engine's is only known to the launcher.
+    engine_name: String,
     /// The custom search URL field: shown while a custom engine is in use
     /// or being set up.
     custom_engine: Option<Entity<TextInput>>,
@@ -274,7 +279,13 @@ impl Settings {
             sources,
             ignored_apps,
             excluded_apps,
+            search_engine: (_, engine_name),
         } = launcher(cx).unwrap_or_default();
+        let engine_name = if engine_name.is_empty() {
+            search_engine.name()
+        } else {
+            engine_name
+        };
         Self {
             hotkeys,
             hotkey,
@@ -291,9 +302,10 @@ impl Settings {
             rank_by_usage,
             custom_engine: match &search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
-                SearchEngine::Preset(_) => None,
+                SearchEngine::Preset(_) | SearchEngine::Quicklink(_) => None,
             },
             search_engine,
+            engine_name,
             engine_message: None,
             sources,
             clipboard_retention,
@@ -340,6 +352,11 @@ impl Settings {
         self.sources = state.sources;
         self.ignored_apps = state.ignored_apps;
         self.excluded_apps = state.excluded_apps;
+        let (engine, name) = state.search_engine;
+        if engine != self.search_engine && self.custom_engine.is_none() {
+            self.search_engine = engine;
+        }
+        self.engine_name = name;
         cx.notify();
     }
 
@@ -600,6 +617,13 @@ impl Settings {
         });
         let custom = chip("engine-custom", "Custom…", custom_selected)
             .on_click(cx.listener(|this, _, window, cx| this.edit_custom_engine(window, cx)));
+        // Chosen in the launcher; picking anything else here replaces it.
+        let quicklink = (matches!(self.search_engine, SearchEngine::Quicklink(_)) && !custom_selected)
+            .then(|| chip("engine-quicklink", self.engine_name.clone(), true));
+        let hint = div()
+            .text_size(px(11.))
+            .text_color(rgba(theme::TEXT_FAINT))
+            .child("A quicklink with {query} can search too: Ctrl+K on it in the launcher, then Use as Web Search.");
         let field = self.custom_engine.as_ref().map(|input| {
             div()
                 .flex()
@@ -647,10 +671,12 @@ impl Settings {
                     .flex_wrap()
                     .gap_1p5()
                     .children(presets)
+                    .children(quicklink)
                     .child(custom),
             )
             .children(field)
             .children(message)
+            .when(self.custom_engine.is_none(), |row| row.child(hint))
     }
 
     fn toggle_smooth_scrolling(&mut self, cx: &mut Context<Self>) {
@@ -1509,7 +1535,7 @@ impl Settings {
             // Back to what is in use: a custom engine keeps its field.
             self.custom_engine = match &self.search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
-                SearchEngine::Preset(_) => None,
+                SearchEngine::Preset(_) | SearchEngine::Quicklink(_) => None,
             };
             self.engine_message = None;
             window.focus(&self.focus);

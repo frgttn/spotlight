@@ -1,14 +1,16 @@
 //! Opening URLs typed into the search field, and web search as the fallback.
 
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use spotlight_core::{
     item::{Command, Icon, SearchItem},
     item_id,
     provider::Provider,
+    quicklink,
     view::{Field, FieldKind, FormView, View},
-    web::{PRESETS, SearchEngine},
+    web::{PRESETS, SearchEngine, encode_query},
 };
+use spotlight_store::Store;
 
 use crate::glyph;
 
@@ -29,12 +31,19 @@ const TLDS: &[&str] = &[
 pub struct Web {
     /// Changed from the settings window while the app runs.
     engine: RwLock<SearchEngine>,
+    /// Where a quicklink engine's link is looked up.
+    store: Option<Arc<Mutex<Store>>>,
+    /// A quicklink engine's name and template, looked up again on every
+    /// catalog load (the launcher reloads it when quicklinks change).
+    quicklink: RwLock<Option<(String, String)>>,
 }
 
 impl Web {
-    pub fn new(engine: SearchEngine) -> Self {
+    pub fn new(engine: SearchEngine, store: Option<Arc<Mutex<Store>>>) -> Self {
         Self {
             engine: RwLock::new(engine),
+            store,
+            quicklink: RwLock::new(None),
         }
     }
 
@@ -42,6 +51,7 @@ impl Web {
         if let Ok(mut current) = self.engine.write() {
             *current = engine;
         }
+        self.forget_quicklink();
     }
 
     pub fn engine(&self) -> SearchEngine {
@@ -49,6 +59,39 @@ impl Web {
             .read()
             .map(|engine| engine.clone())
             .unwrap_or_default()
+    }
+
+    /// The engine's name and template (`{query}` where the text goes). A
+    /// quicklink that is gone or no longer searchable stands for the default.
+    pub fn resolved(&self) -> (String, String) {
+        let engine = self.engine();
+        let SearchEngine::Quicklink(id) = engine else {
+            return (engine.name(), engine.template().to_owned());
+        };
+        if let Some(found) = self.quicklink.read().ok().and_then(|cached| cached.clone()) {
+            return found;
+        }
+        let found = self.look_up(id).unwrap_or_else(|| {
+            let fallback = SearchEngine::default();
+            (fallback.name(), fallback.template().to_owned())
+        });
+        if let Ok(mut cached) = self.quicklink.write() {
+            *cached = Some(found.clone());
+        }
+        found
+    }
+
+    fn look_up(&self, id: i64) -> Option<(String, String)> {
+        let links = self.store.as_ref()?.lock().ok()?.quicklinks().ok()?;
+        let link = links.into_iter().find(|link| link.id == id)?;
+        let template = quicklink::search_template(&link.link)?;
+        Some((link.name, template))
+    }
+
+    fn forget_quicklink(&self) {
+        if let Ok(mut cached) = self.quicklink.write() {
+            *cached = None;
+        }
     }
 }
 
@@ -68,12 +111,13 @@ impl Provider for Web {
     /// "Search the Web…": a form to search with any engine, not only the
     /// one chosen in Settings (listed first, as it was at startup).
     fn catalog(&self) -> Vec<SearchItem> {
-        let current = self.engine();
-        let mut engines = vec![(current.name(), current.template().to_owned())];
+        self.forget_quicklink();
+        let (name, template) = self.resolved();
+        let mut engines = vec![(name, template.clone())];
         engines.extend(
             PRESETS
                 .iter()
-                .filter(|preset| SearchEngine::Preset(preset) != current)
+                .filter(|preset| preset.template != template)
                 .map(|preset| (preset.name.to_owned(), preset.template.to_owned())),
         );
         let form = View::Form(FormView {
@@ -124,13 +168,10 @@ impl Provider for Web {
     }
 
     fn fallbacks(&self, query: &str) -> Vec<SearchItem> {
-        let engine = self.engine();
-        let url = engine.url(query);
+        let (name, template) = self.resolved();
+        let url = template.replace("{query}", &encode_query(query));
         vec![
-            SearchItem::new(
-                item_id(ID, "search"),
-                format!("Search {} for “{query}”", engine.name()),
-            )
+            SearchItem::new(item_id(ID, "search"), format!("Search {name} for “{query}”"))
             .subtitle("Web Search")
             .icon(Icon::Glyph(glyph::SEARCH))
             .action("Search in Browser", Command::OpenUrl(url.clone()))
@@ -239,7 +280,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_web_search() {
-        let web = Web::new(SearchEngine::default());
+        let web = Web::new(SearchEngine::default(), None);
         let items = web.fallbacks("rust gpui");
         assert_eq!(
             items[0].actions[0].command,
@@ -249,7 +290,7 @@ mod tests {
 
     #[test]
     fn uses_the_chosen_engine() {
-        let web = Web::new(SearchEngine::default());
+        let web = Web::new(SearchEngine::default(), None);
         web.set_engine(SearchEngine::from_setting("duckduckgo").unwrap());
         let items = web.fallbacks("rust");
         assert_eq!(items[0].title, "Search DuckDuckGo for “rust”");
@@ -260,8 +301,32 @@ mod tests {
     }
 
     #[test]
+    fn searches_with_a_quicklink() {
+        let store = Store::open_in_memory().unwrap();
+        let link = store
+            .quicklinks()
+            .unwrap()
+            .into_iter()
+            .find(|link| link.name == "GitHub")
+            .unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let web = Web::new(SearchEngine::Quicklink(link.id), Some(store.clone()));
+        let items = web.fallbacks("a b");
+        assert_eq!(items[0].title, "Search GitHub for “a b”");
+        assert_eq!(
+            items[0].actions[0].command,
+            Command::OpenUrl("https://github.com/search?q=a+b".into())
+        );
+
+        // Gone: back to the default, once the catalog is loaded again.
+        store.lock().unwrap().delete_quicklink(link.id).unwrap();
+        web.catalog();
+        assert_eq!(web.fallbacks("x")[0].title, "Search Google for “x”");
+    }
+
+    #[test]
     fn search_form_offers_every_engine_once() {
-        let web = Web::new(SearchEngine::from_setting("bing").unwrap());
+        let web = Web::new(SearchEngine::from_setting("bing").unwrap(), None);
         let items = web.catalog();
         let Command::PushView(view) = &items[0].actions[0].command else {
             panic!("not a view");

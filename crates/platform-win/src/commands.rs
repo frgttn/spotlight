@@ -116,6 +116,7 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::PushView(_)
         | Command::SaveQuicklink(_)
         | Command::DeleteQuicklink(_)
+        | Command::SetSearchEngine { .. }
         | Command::SaveSnippet(_)
         | Command::DeleteSnippet(_)
         | Command::PasteSnippet { .. }
