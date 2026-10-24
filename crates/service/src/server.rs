@@ -251,11 +251,6 @@ impl Server {
             );
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
         }
-        let gate = Arc::new(if self.check_access {
-            Gate::of_caller(pipe)?
-        } else {
-            Gate::Open
-        });
         let writer = Arc::new(Mutex::new(reader.try_clone()?));
 
         match index_service::decode_to(&index_service::read_frame(&mut reader)?)? {
@@ -267,6 +262,13 @@ impl Server {
                 ));
             }
         }
+        // Only now: Windows lets a pipe server take its client's identity
+        // once it has read something from it (ERROR_CANT_IMPERSONATE_PIPE).
+        let gate = Arc::new(if self.check_access {
+            Gate::of_caller(pipe)?
+        } else {
+            Gate::Open
+        });
         let request = index_service::decode_to(&index_service::read_frame(&mut reader)?)?;
         let ToService::Watch { roots } = request else {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "expected Watch"));
@@ -489,6 +491,14 @@ mod tests {
     use crate::volume::fake::{self, FakeVolume};
 
     fn server(pipe: &str, clients: Vec<PathBuf>) -> (Arc<Server>, Arc<Mutex<fake::Disk>>) {
+        serve(pipe, clients, false)
+    }
+
+    fn serve(
+        pipe: &str,
+        clients: Vec<PathBuf>,
+        check_access: bool,
+    ) -> (Arc<Server>, Arc<Mutex<fake::Disk>>) {
         let disk = fake::disk();
         let source = disk.clone();
         let volumes = Arc::new(Volumes::new(
@@ -496,7 +506,7 @@ mod tests {
             None,
         ));
         let mut server = Server::new(pipe, &clients, volumes);
-        server.check_access = false;
+        server.check_access = check_access;
         let server = Arc::new(server);
         let serving = server.clone();
         thread::spawn(move || serving.serve());
@@ -568,6 +578,33 @@ mod tests {
                 changes: vec![Change::Added(r"C:\Users\me\plan.md".into())]
             }
         );
+        server.stop();
+    }
+
+    /// With the caller's rights checked, as in the installed service: the
+    /// service takes the caller's identity (after reading from it, or Windows
+    /// refuses) and checks each root as the caller.
+    #[test]
+    fn checks_roots_as_the_caller() {
+        let pipe = format!(r"\\.\pipe\spotlight-index-test-gate-{}", std::process::id());
+        let (server, _) = serve(&pipe, vec![std::env::current_exe().unwrap()], true);
+        let mut client = connect(&pipe);
+        let readable = std::env::temp_dir();
+        client
+            .send(&ToService::Watch {
+                roots: vec![PathBuf::from(r"C:\no such folder\zq"), readable],
+            })
+            .unwrap();
+        // Can't be opened as the caller: never reaches the drive.
+        let FromService::Unavailable { root: 0, why } = client.recv().unwrap() else {
+            panic!("root 0 answered otherwise");
+        };
+        assert_eq!(why, "the caller can't open it");
+        // Opened as the caller; the fake drive just doesn't have it.
+        let FromService::Unavailable { root: 1, why } = client.recv().unwrap() else {
+            panic!("root 1 answered otherwise");
+        };
+        assert_eq!(why, "no such folder");
         server.stop();
     }
 

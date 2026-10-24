@@ -62,11 +62,15 @@ fn scan(letter: char) -> Result<(), String> {
         journal.next
     );
     let root = Source::frn_of(&volume, Path::new(&format!("{letter}:\\")))
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!(r"opening {letter}:\: {err}"))?;
     let mut tree = Tree::new(root, PathBuf::from(format!("{letter}:\\")));
     let started = Instant::now();
-    Source::enumerate(&volume, &journal, &mut |record| tree.insert(&record))
-        .map_err(|err| err.to_string())?;
+    let mut records = 0usize;
+    Source::enumerate(&volume, &journal, &mut |record| {
+        records += 1;
+        tree.insert(&record)
+    })
+    .map_err(|err| format!("reading the MFT, after {records} records: {err}"))?;
     log!(
         "{} entries in {:.2} s, {:.1} MB",
         tree.len(),
@@ -77,7 +81,8 @@ fn scan(letter: char) -> Result<(), String> {
         && ntfs::drive_letter(&profile) == Some(letter)
     {
         let started = Instant::now();
-        let frn = ntfs::Volume::frn_of(&profile).map_err(|err| err.to_string())?;
+        let frn = ntfs::Volume::frn_of(&profile)
+            .map_err(|err| format!("opening {}: {err}", profile.display()))?;
         let entries = tree.subtree(frn, |_| true, |frn| volume.modified(frn));
         log!(
             "{}: {} entries with times in {:.2} s",
@@ -96,7 +101,7 @@ fn scan(letter: char) -> Result<(), String> {
                 log!("{change:?}");
             }
         })
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("reading the journal: {err}"))?;
     }
     Ok(())
 }

@@ -30,7 +30,7 @@ const FILETIME_UNIX_OFFSET: u64 = 116_444_736_000_000_000;
 /// The names in folder `dir`, without `.` and `..`. An empty folder lists
 /// nothing; one that can't be read is an error.
 pub fn list(dir: &Path) -> io::Result<Vec<Listed>> {
-    let pattern = HSTRING::from(long_path(dir) + "\\*");
+    let pattern = HSTRING::from(format!(r"{}\*", long_path(dir).trim_end_matches('\\')));
     let mut data = WIN32_FIND_DATAW::default();
     let found = unsafe {
         FindFirstFileExW(
@@ -123,11 +123,14 @@ pub(crate) fn unix_seconds(time: FILETIME) -> i64 {
         .map_or(0, |since| (since / 10_000_000) as i64)
 }
 
-/// `dir` with the `\\?\` prefix, so paths past 260 characters list too.
+/// `dir` with the `\\?\` prefix, so paths past 260 characters list too. A
+/// drive keeps its backslash: `\\?\C:` would be the volume itself.
 pub fn long_path(dir: &Path) -> String {
     let text = dir.to_string_lossy().replace('/', "\\");
     let text = text.trim_end_matches('\\');
-    if text.starts_with(r"\\?\") {
+    if text.len() == 2 && text.ends_with(':') {
+        format!(r"\\?\{text}\")
+    } else if text.starts_with(r"\\?\") {
         text.to_owned()
     } else if let Some(share) = text.strip_prefix(r"\\") {
         format!(r"\\?\UNC\{share}")
@@ -138,7 +141,7 @@ pub fn long_path(dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use super::*;
 
@@ -187,5 +190,17 @@ mod tests {
             r"\\?\UNC\server\share\x"
         );
         assert_eq!(long_path(Path::new(r"\\?\C:\x")), r"\\?\C:\x");
+        // The root folder, not the volume.
+        assert_eq!(long_path(Path::new(r"C:\")), r"\\?\C:\");
+        assert_eq!(long_path(Path::new("D:")), r"\\?\D:\");
+    }
+
+    #[test]
+    fn opens_a_drive_root() {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let root = PathBuf::from(format!(r"{drive}\"));
+        assert!(!list(&root).unwrap().is_empty());
+        // The index service's way in: the root folder's reference number.
+        assert!(crate::ntfs::Volume::frn_of(&root).is_ok());
     }
 }
