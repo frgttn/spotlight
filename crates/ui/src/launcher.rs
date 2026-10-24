@@ -281,12 +281,19 @@ impl WindowMode {
     }
 }
 
+/// How long the list of installed games is trusted before the next show reads it again.
+const GAMES_REFRESH: Duration = Duration::from_secs(60);
+
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
     search: RootSearch,
     /// Catalogs still loading at startup.
     loading: usize,
+    /// When the catalogs of installed games were last read; a game installed
+    /// while the launcher runs shows up on the next [`Self::show`] after
+    /// [`GAMES_REFRESH`].
+    games_loaded: Instant,
     results: Vec<Row>,
     selected: usize,
     /// The action panel (Ctrl+K) is open, with this action selected.
@@ -462,6 +469,7 @@ impl Launcher {
             hwnd,
             input,
             loading: 0,
+            games_loaded: Instant::now(),
             search,
             results: Vec::new(),
             selected: 0,
@@ -1069,6 +1077,10 @@ impl Launcher {
             self.previous_window = foreground;
         }
         self.hud = None;
+        if self.games_loaded.elapsed() >= GAMES_REFRESH {
+            self.games_loaded = Instant::now();
+            self.reload_catalog("games", window.scale_factor(), cx);
+        }
         if !self.screens.is_empty() {
             self.screens.clear();
             self.input.update(cx, |input, cx| {
