@@ -2197,7 +2197,7 @@ impl Launcher {
         } else {
             item.subtitle.clone().unwrap_or_default().into()
         };
-        let stacked = !subtitle.is_empty() && self.shows_previews();
+        let stacked = !subtitle.is_empty() && self.shows_previews(cx);
 
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
@@ -2645,7 +2645,7 @@ impl Render for Launcher {
         };
         // Lists with previews (clipboard history): rows on the left, the
         // selected row's preview on the right.
-        let results = if self.shows_previews() {
+        let results = if self.shows_previews(cx) {
             div()
                 .flex_1()
                 .min_h_0()

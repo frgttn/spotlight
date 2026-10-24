@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, Context, ObjectFit, RenderImage, SharedString, Window, div, img, prelude::*, px,
-    rgba,
+    AnyElement, App, Context, ObjectFit, RenderImage, SharedString, Window, div, img, prelude::*,
+    px, rgba,
 };
 use image::{Frame, ImageFormat};
 use spotlight_core::{
@@ -175,13 +175,18 @@ impl Launcher {
     }
 
     /// Whether the open list shows a preview beside its rows.
-    pub(super) fn shows_previews(&self) -> bool {
+    pub(super) fn shows_previews(&self, cx: &App) -> bool {
         match self.screens.last() {
             Some(Screen::List {
                 view, grid: false, ..
             }) => view.items.iter().any(|item| item.preview.is_some()),
-            // Root search after the file prefix: only files, as in Search Files.
-            None => self.prefix_rows.iter().any(|item| item.preview.is_some()),
+            // Root search after the file prefix: only files, as in Search
+            // Files. The rows of an earlier one stay until the next search,
+            // so the field decides.
+            None => {
+                super::file_query(&self.file_prefix, self.input.read(cx).text()).is_some()
+                    && self.prefix_rows.iter().any(|item| item.preview.is_some())
+            }
             Some(_) => false,
         }
     }
