@@ -88,6 +88,8 @@ pub enum SettingsEvent {
     SmoothScrollingChanged(bool),
     /// The launcher opens in this mode from now on.
     WindowModeChanged(WindowMode),
+    /// Root search ranks often-used items first (or no longer does).
+    RankByUsageChanged(bool),
     /// The web search engine is now this one; switch to it and save it.
     SearchEngineChanged(SearchEngine),
     /// The clipboard history now keeps this much; trim it and save it.
@@ -145,6 +147,7 @@ pub struct Settings {
     shortcut_message: Option<(String, SharedString, bool)>,
     smooth_scrolling: bool,
     window_mode: WindowMode,
+    rank_by_usage: bool,
     search_engine: SearchEngine,
     /// The custom search URL field: shown while a custom engine is in use
     /// or being set up.
@@ -203,6 +206,7 @@ impl Settings {
         hotkey: Option<Hotkey>,
         smooth_scrolling: bool,
         window_mode: WindowMode,
+        rank_by_usage: bool,
         search_engine: SearchEngine,
         clipboard_retention: Retention,
         win_v: bool,
@@ -284,6 +288,7 @@ impl Settings {
             shortcut_message: None,
             smooth_scrolling,
             window_mode,
+            rank_by_usage,
             custom_engine: match &search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
                 SearchEngine::Preset(_) => None,
@@ -653,6 +658,12 @@ impl Settings {
         self.nav_scroll.set_enabled(self.smooth_scrolling);
         self.page_scroll.set_enabled(self.smooth_scrolling);
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
+        cx.notify();
+    }
+
+    fn toggle_rank_by_usage(&mut self, cx: &mut Context<Self>) {
+        self.rank_by_usage = !self.rank_by_usage;
+        cx.emit(SettingsEvent::RankByUsageChanged(self.rank_by_usage));
         cx.notify();
     }
 
@@ -1869,6 +1880,9 @@ impl Page {
                 "Launcher hotkey",
                 "Appearance",
                 "Smooth scrolling",
+                "Search",
+                "Rank by usage",
+                "Frecency",
             ],
             Page::Extensions => &["Search sources", "Enabled"],
             Page::Shortcuts => &["Aliases", "Hotkeys"],
@@ -2265,6 +2279,20 @@ impl Settings {
                         "smooth-scrolling",
                         self.smooth_scrolling,
                         cx.listener(|this, _, _, cx| this.toggle_smooth_scrolling(cx)),
+                    )),
+                )
+                .into_any_element(),
+            section_title("Search"),
+            card()
+                .child(
+                    row(
+                        "Rank by Usage",
+                        "List apps and commands you open often first. Turned off, usage is still remembered.",
+                    )
+                    .child(switch(
+                        "rank-by-usage",
+                        self.rank_by_usage,
+                        cx.listener(|this, _, _, cx| this.toggle_rank_by_usage(cx)),
                     )),
                 )
                 .into_any_element(),

@@ -323,6 +323,8 @@ pub struct Launcher {
     icons: HashMap<String, Arc<RenderImage>>,
     /// In-memory copy of the store's frecency table, updated on every launch.
     frecency: HashMap<String, Frecency>,
+    /// Whether root search ranks by frecency. Off, usage is still recorded.
+    rank_by_usage: bool,
     /// `None` when the database couldn't be opened; usage is then not remembered.
     store: Option<Arc<Mutex<Store>>>,
     /// Item id → the user's alias for it.
@@ -491,6 +493,7 @@ impl Launcher {
             },
             icons: HashMap::new(),
             frecency,
+            rank_by_usage: true,
             store,
             aliases,
             item_hotkeys,
@@ -811,6 +814,13 @@ impl Launcher {
         cx.notify();
     }
 
+    pub fn set_rank_by_usage(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.rank_by_usage = enabled;
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+    }
+
     pub fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
         self.window_mode = mode;
         if !self.visible && self.hud.is_none() {
@@ -888,6 +898,7 @@ impl Launcher {
             list_searcher,
             search,
             frecency,
+            rank_by_usage,
             aliases,
             ..
         } = self;
@@ -913,7 +924,10 @@ impl Launcher {
             }
             None => search.search(
                 query,
-                |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
+                |id| match frecency.get(id) {
+                    Some(used) if *rank_by_usage => used.score_at(now),
+                    _ => 0.,
+                },
                 aliases,
             ),
             // The provider ranked them for this query (or is about to).

@@ -57,6 +57,8 @@ const HOTKEY_SETTING: &str = "hotkey";
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 /// `settings` key: `WindowMode`'s setting form; missing means expanded.
 const WINDOW_MODE_SETTING: &str = "window_mode";
+/// `settings` key: `"true"` or `"false"`; missing means on.
+const RANK_BY_USAGE_SETTING: &str = "rank_by_usage";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
@@ -85,6 +87,7 @@ struct AppState {
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
     window_mode: Cell<WindowMode>,
+    rank_by_usage: Cell<bool>,
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
@@ -157,6 +160,7 @@ fn main() {
             .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
+    let rank_by_usage = setting(RANK_BY_USAGE_SETTING).is_none_or(|value| value != "false");
     let window_mode = setting(WINDOW_MODE_SETTING)
         .and_then(|text| {
             let mode = WindowMode::from_setting(&text);
@@ -295,6 +299,7 @@ fn main() {
         window
             .update(cx, |launcher, _, cx| {
                 launcher.set_window_mode(window_mode, cx);
+                launcher.set_rank_by_usage(rank_by_usage, cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 launcher.set_file_prefix(file_search.prefix.clone());
@@ -338,6 +343,7 @@ fn main() {
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
             window_mode: Cell::new(window_mode),
+            rank_by_usage: Cell::new(rank_by_usage),
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
@@ -493,6 +499,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
                 view_state.window_mode.get(),
+                view_state.rank_by_usage.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
@@ -565,6 +572,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, cx| launcher.set_window_mode(*mode, cx))
                 .ok();
             save_setting(state, WINDOW_MODE_SETTING, mode.to_setting().to_owned(), cx);
+        }
+        SettingsEvent::RankByUsageChanged(enabled) => {
+            state.rank_by_usage.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.set_rank_by_usage(*enabled, cx))
+                .ok();
+            save_setting(state, RANK_BY_USAGE_SETTING, enabled.to_string(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
             if *id == CLIPBOARD_PROVIDER {
