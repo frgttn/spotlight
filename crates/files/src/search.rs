@@ -106,6 +106,8 @@ struct Plan<'a> {
     excluded: Option<Bits>,
     exts: Vec<ExtId>,
     kind: Option<Kind>,
+    /// Leave folders out (recent files).
+    files_only: bool,
     /// Bits every candidate's folders must have (the `in:` filters).
     folders_required: u32,
     /// Per entry, for folders only: see the mask bits above.
@@ -125,6 +127,26 @@ impl Index {
         self.rerank(query, &mut hits);
         hits.truncate(options.limit);
         Some(hits)
+    }
+
+    /// The most recently modified files (no folders), newest first: what
+    /// Search Files shows before anything is typed. `None` when cancelled.
+    pub fn recent(&self, options: &SearchOptions) -> Option<Vec<Hit>> {
+        if options.limit == 0 {
+            return Some(Vec::new());
+        }
+        let plan = Plan {
+            names: Vec::new(),
+            word_chars: Vec::new(),
+            excluded: None,
+            exts: Vec::new(),
+            kind: None,
+            files_only: true,
+            folders_required: 0,
+            masks: self.folder_masks(&[], &[]),
+            options,
+        };
+        self.scan(&plan, options.limit)
     }
 
     fn plan<'a>(&self, query: &Query, options: &'a SearchOptions<'a>) -> Option<Plan<'a>> {
@@ -214,6 +236,7 @@ impl Index {
             excluded,
             exts,
             kind: query.kind,
+            files_only: false,
             folders_required,
             masks,
             options,
@@ -227,6 +250,7 @@ impl Index {
             excluded: None,
             exts: Vec::new(),
             kind: None,
+            files_only: false,
             folders_required: 0,
             masks: Vec::new(),
             options,
@@ -449,6 +473,9 @@ impl Index {
             if !matches {
                 return None;
             }
+        }
+        if plan.files_only && entry.has(flag::DIR) {
+            return None;
         }
         if let Some(excluded) = &plan.excluded
             && excluded.get(entry.name)

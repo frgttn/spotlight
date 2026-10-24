@@ -70,6 +70,7 @@ fn windows_view(windows: Vec<WindowInfo>) -> ListView {
         items: windows.into_iter().map(window_item).collect(),
         empty: Some("No windows are open".into()),
         filters: Vec::new(),
+        live: false,
     }
 }
 
@@ -120,6 +121,7 @@ fn processes_view(processes: Vec<ProcessInfo>) -> ListView {
             ListFilter::new("All", None),
             ListFilter::new("With Windows", Some(HAS_WINDOWS)),
         ],
+        live: false,
     }
 }
 

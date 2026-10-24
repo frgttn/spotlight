@@ -13,6 +13,8 @@ async-channel.workspace = true
 # PNG for clipboard images.
 image = { workspace = true, features = ["png"] }
 spotlight-core.workspace = true
+# `Listed`, what a folder listing gives the file index.
+spotlight-files.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true

@@ -11,7 +11,13 @@ use windows::{
             Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
             Threading::CREATE_NO_WINDOW,
         },
-        UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        UI::{
+            Shell::{
+                FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+                SHFILEOPSTRUCTW, SHFileOperationW, ShellExecuteW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
     },
     core::{HSTRING, PCWSTR},
 };
@@ -76,6 +82,12 @@ fn run_blocking(command: &Command) -> Outcome {
                 .map(|_| None)
                 .map_err(|err| format!("Couldn't open Explorer: {err}"))
         }
+        Command::OpenWith(path) => process::Command::new("rundll32.exe")
+            .raw_arg(format!("shell32.dll,OpenAs_RunDLL {path}"))
+            .spawn()
+            .map(|_| None)
+            .map_err(|err| format!("Couldn't ask which app to use: {err}")),
+        Command::MoveToTrash(path) => move_to_trash(path),
         Command::OpenUrl(url) => {
             let lower = url.to_ascii_lowercase();
             if URL_SCHEMES.iter().any(|scheme| lower.starts_with(scheme)) {
@@ -98,6 +110,7 @@ fn run_blocking(command: &Command) -> Outcome {
             }
         }
         Command::Copy(_)
+        | Command::CopyFile(_)
         | Command::OpenCalculatorHistory
         | Command::PushView(_)
         | Command::SaveQuicklink(_)
@@ -165,9 +178,41 @@ fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
     }
 }
 
+/// Moves `path` to the Recycle Bin, without Explorer's own confirmation (the
+/// launcher asked for a second Enter) and without its progress window.
+fn move_to_trash(path: &str) -> Outcome {
+    // A list of paths, each ending in a NUL, the list in a second one.
+    let from: Vec<u16> = path.encode_utf16().chain([0, 0]).collect();
+    let mut operation = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        ..Default::default()
+    };
+    let code = unsafe { SHFileOperationW(&mut operation) };
+    if code != 0 {
+        return Err(format!(
+            "Couldn't move it to the Recycle Bin (error {code:#x})"
+        ));
+    }
+    if operation.fAnyOperationsAborted.as_bool() {
+        return Err("Moving it to the Recycle Bin was stopped".into());
+    }
+    Ok(Some("Moved to Recycle Bin".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moves_a_file_to_the_recycle_bin() {
+        let path = std::env::temp_dir().join(format!("spotlight-trash-{}.txt", std::process::id()));
+        std::fs::write(&path, "x").unwrap();
+        let outcome = run_blocking(&Command::MoveToTrash(path.to_string_lossy().into_owned()));
+        assert_eq!(outcome, Ok(Some("Moved to Recycle Bin".into())));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn reports_a_missing_file() {

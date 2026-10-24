@@ -5594,6 +5594,7 @@ dependencies = [
  "async-channel 2.5.0",
  "image",
  "spotlight-core",
+ "spotlight-files",
  "windows 0.61.3",
 ]
 
@@ -5601,10 +5602,12 @@ dependencies = [
 name = "spotlight-providers"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
  "fend-core",
  "image",
  "serde_json",
  "spotlight-core",
+ "spotlight-files",
  "spotlight-platform-win",
  "spotlight-store",
 ]

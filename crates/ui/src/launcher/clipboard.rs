@@ -17,7 +17,7 @@ use spotlight_core::{
 };
 use spotlight_platform_win::{
     clipboard::{self, Content, Image},
-    vault,
+    icons, vault,
 };
 use spotlight_store::Clip;
 
@@ -28,6 +28,8 @@ use crate::theme;
 pub(super) const PREVIEW_LIST_WIDTH: f32 = 290.;
 /// A file list in the preview stops after this many.
 const PREVIEW_FILES: usize = 50;
+/// Pixels a file's thumbnail is asked for at; it is scaled down to fit.
+const THUMBNAIL_SIZE: u32 = 512;
 
 /// The preview's image, decoded off the UI thread.
 pub(super) enum PreviewImage {
@@ -217,8 +219,41 @@ impl Launcher {
                 .text_color(rgba(theme::TEXT))
                 .child(SharedString::from(text))
                 .into_any_element(),
+            PreviewBody::Thumbnail(path) => {
+                let picture: AnyElement = match self.preview_image(&path, true, cx) {
+                    Some(image) => img(image)
+                        .size_full()
+                        .object_fit(ObjectFit::ScaleDown)
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(picture),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(rgba(theme::TEXT_FAINT))
+                            .child(SharedString::from(path)),
+                    )
+                    .into_any_element()
+            }
             PreviewBody::Image(path) => {
-                let content: AnyElement = match self.preview_image(&path, cx) {
+                let content: AnyElement = match self.preview_image(&path, false, cx) {
                     Some(image) => img(image)
                         .size_full()
                         .object_fit(ObjectFit::ScaleDown)
@@ -316,7 +351,21 @@ impl Launcher {
     /// The decoded image at `path`, or `None` while it loads (then the view
     /// redraws) or when it can't be read. One image is kept at a time; the
     /// one it replaces is freed on the next frame.
-    fn preview_image(&mut self, path: &str, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+    /// `thumbnail`: `path` is any file, shown as Explorer's thumbnail of it,
+    /// rather than a clipboard image.
+    fn preview_image(
+        &mut self,
+        path: &str,
+        thumbnail: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
+        // Kept apart from a clipboard image of the same path.
+        let key = if thumbnail {
+            format!("thumbnail:{path}")
+        } else {
+            path.to_owned()
+        };
+        let path = key.as_str();
         match &self.preview_image {
             Some(PreviewImage::Ready(loaded, image)) if loaded == path => {
                 return Some(image.clone());
@@ -329,7 +378,14 @@ impl Launcher {
         let path = path.to_owned();
         let load = cx.background_executor().spawn({
             let path = path.clone();
-            async move { decode(&path) }
+            async move {
+                match path.strip_prefix("thumbnail:") {
+                    Some(file) => icons::thumbnail(file, THUMBNAIL_SIZE)
+                        .ok()
+                        .and_then(super::render_image),
+                    None => decode(&path),
+                }
+            }
         });
         cx.spawn(async move |this, cx| {
             let image = load.await;

@@ -202,6 +202,7 @@ impl Provider for Quicklinks {
             items: rows,
             empty: Some("No quicklinks yet. Create one with Create Quicklink.".into()),
             filters: Vec::new(),
+            live: false,
         });
         items.push(
             SearchItem::new(item_id(ID, "search"), "Search Quicklinks")

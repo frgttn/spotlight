@@ -13,6 +13,8 @@ pub mod clipboard;
 pub mod commands;
 pub mod drives;
 pub mod expander;
+pub mod fswalk;
+pub mod fswatch;
 pub mod hotkey;
 pub mod icons;
 pub mod instance;

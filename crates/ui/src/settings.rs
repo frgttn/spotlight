@@ -11,16 +11,19 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Image, ImageFormat, KeyBinding, Pixels, ScrollHandle, SharedString, Stateful,
-    Subscription, Task, Window, WindowControlArea, actions, div, img, prelude::*, px, rgba,
+    FontWeight, Image, ImageFormat, KeyBinding, PathPromptOptions, Pixels, ScrollHandle,
+    SharedString, Stateful, Subscription, Task, Window, WindowControlArea, actions, div, img,
+    prelude::*, px, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     clip::{self, IgnoredApp, Retention},
+    file_search::{self, Config as FileSearchConfig, Status as FileSearchStatus},
     item::Command,
     web::{self, SearchEngine},
 };
@@ -71,6 +74,14 @@ pub struct LauncherState {
 /// read (it is mid-update, as when its Ctrl+, opens this window).
 pub type LauncherReader = Rc<dyn Fn(&App) -> Option<LauncherState>>;
 
+/// Reads how far file indexing has got.
+pub type FileStatusReader = Rc<dyn Fn() -> FileSearchStatus>;
+
+/// File Search's page id, as its provider names itself.
+const FILES_PAGE: &str = "files";
+/// How often the File Search page updates its count while indexing.
+const STATUS_REFRESH: Duration = Duration::from_millis(500);
+
 pub enum SettingsEvent {
     /// The launcher hotkey is now this one; persist it and update labels.
     HotkeyChanged(Hotkey),
@@ -91,6 +102,10 @@ pub enum SettingsEvent {
     SnippetExpansionChanged(bool),
     /// The apps where snippet keywords don't expand are now these; save them.
     ExcludedAppsChanged(Vec<IgnoredApp>),
+    /// What File Search indexes changed; save it and index again.
+    FileSearchChanged(FileSearchConfig),
+    /// Rebuild the file index from scratch.
+    FileSearchRebuild,
     /// Start at login was turned on or off here.
     AutostartChanged,
     /// The search provider with this id was turned on or off.
@@ -147,6 +162,12 @@ pub struct Settings {
     /// The apps with windows open, to add to `excluded_apps`; `Some` while
     /// the list is shown.
     app_choices: Option<Vec<IgnoredApp>>,
+    file_search: FileSearchConfig,
+    file_status: FileStatusReader,
+    /// Where a new exclusion rule is typed.
+    exclusion_input: Entity<TextInput>,
+    /// Redraws the File Search page while indexing, for its count.
+    status_refresh: Option<Task<()>>,
     autostart: bool,
     /// The build's version, shown on About.
     version: &'static str,
@@ -181,6 +202,8 @@ impl Settings {
         win_v: bool,
         selection_copy: bool,
         snippet_expansion: bool,
+        file_search: FileSearchConfig,
+        file_status: FileStatusReader,
         version: &'static str,
         data_path: SharedString,
         launcher: LauncherReader,
@@ -252,6 +275,10 @@ impl Settings {
             snippet_expansion,
             excluded_apps,
             app_choices: None,
+            file_search,
+            file_status,
+            exclusion_input: cx.new(|cx| TextInput::new("Folder name or path", cx)),
+            status_refresh: None,
             autostart: autostart::is_enabled(),
             version,
             data_path,
@@ -412,12 +439,16 @@ impl Settings {
         cx.notify();
     }
 
-    /// Enter: saves the alias or the custom search URL being edited.
+    /// Enter: saves the alias, the custom search URL or the exclusion rule
+    /// being typed.
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = &self.custom_engine
             && input.focus_handle(cx).is_focused(window)
         {
             return self.save_custom_engine(window, cx);
+        }
+        if self.exclusion_input.focus_handle(cx).is_focused(window) {
+            return self.add_exclusion(cx);
         }
         let Some((item_id, input)) = self.editing_alias.take() else {
             return;
@@ -913,6 +944,279 @@ impl Settings {
             .child(excluded)
     }
 
+    fn change_file_search(
+        &mut self,
+        change: impl FnOnce(&mut FileSearchConfig),
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.file_search);
+        cx.emit(SettingsEvent::FileSearchChanged(self.file_search.clone()));
+        cx.notify();
+    }
+
+    /// Asks for a folder and indexes it too.
+    fn add_file_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Index".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let folder = match picked.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Err(err)) => {
+                    eprintln!("[settings] the folder dialog failed: {err}");
+                    None
+                }
+                _ => None,
+            };
+            let Some(folder) = folder else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if !this.file_search.folders.contains(&folder) {
+                    this.change_file_search(|config| config.folders.push(folder), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_file_folder(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.file_search.folders.len() {
+            self.change_file_search(|config| drop(config.folders.remove(ix)), cx);
+        }
+    }
+
+    fn add_exclusion(&mut self, cx: &mut Context<Self>) {
+        let rule = self.exclusion_input.read(cx).text().trim().to_owned();
+        if rule.is_empty() {
+            return;
+        }
+        self.exclusion_input.update(cx, |input, cx| input.clear(cx));
+        if !self
+            .file_search
+            .exclusions
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&rule))
+        {
+            self.change_file_search(|config| config.exclusions.push(rule), cx);
+        }
+    }
+
+    fn remove_exclusion(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.file_search.exclusions.len() {
+            self.change_file_search(|config| drop(config.exclusions.remove(ix)), cx);
+        }
+    }
+
+    /// Keeps the File Search page's count moving while indexing, and stops
+    /// once it's done.
+    fn refresh_status_while_indexing(&mut self, cx: &mut Context<Self>) {
+        if self.status_refresh.is_some()
+            || !matches!((self.file_status)(), FileSearchStatus::Indexing(_))
+        {
+            return;
+        }
+        self.status_refresh = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(STATUS_REFRESH).await;
+                let indexing = this.update(cx, |this, cx| {
+                    cx.notify();
+                    matches!((this.file_status)(), FileSearchStatus::Indexing(_))
+                });
+                if !matches!(indexing, Ok(true)) {
+                    break;
+                }
+            }
+            this.update(cx, |this, _| this.status_refresh = None).ok();
+        }));
+    }
+
+    /// What is indexed, what is left out, and how far indexing has got.
+    fn files_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self
+            .sources
+            .iter()
+            .any(|source| source.id == FILES_PAGE && source.enabled);
+        let status = if on {
+            (self.file_status)().describe()
+        } else {
+            "The extension is off, so nothing is indexed.".to_owned()
+        };
+        let folders = file_search::profile()
+            .map(|profile| (profile, false))
+            .into_iter()
+            .chain(
+                self.file_search
+                    .folders
+                    .iter()
+                    .cloned()
+                    .map(|folder| (folder, true)),
+            )
+            .enumerate()
+            .map(|(ix, (folder, removable))| {
+                let name = folder
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| folder.display().to_string());
+                let row = app_row(&IgnoredApp {
+                    name: if removable {
+                        name
+                    } else {
+                        format!("{name} (your user folder)")
+                    },
+                    path: folder.display().to_string(),
+                });
+                if removable {
+                    row.child(remove_button(
+                        ("remove-folder", ix),
+                        cx.listener(move |this, _, _, cx| this.remove_file_folder(ix - 1, cx)),
+                    ))
+                } else {
+                    row
+                }
+            });
+        let rules = if self.file_search.exclusions.is_empty() {
+            div()
+                .text_size(px(12.))
+                .text_color(rgba(theme::TEXT_FAINT))
+                .child("Nothing is left out.")
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1p5()
+                .children(
+                    self.file_search
+                        .exclusions
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, rule)| {
+                            div()
+                                .h(px(28.))
+                                .pl_3()
+                                .pr_1()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(rgba(theme::SURFACE_BORDER))
+                                .text_size(px(12.))
+                                .text_color(rgba(theme::TEXT_MUTED))
+                                .child(rule.clone())
+                                .child(remove_button(
+                                    ("remove-exclusion", ix),
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.remove_exclusion(ix, cx)
+                                    }),
+                                ))
+                        }),
+                )
+                .into_any_element()
+        };
+        let defaults = FileSearchConfig::default().exclusions;
+        card()
+            .child(
+                row("Index", status).child(chip("rebuild-index", "Rebuild", false).on_click(
+                    cx.listener(|_, _, _, cx| {
+                        cx.emit(SettingsEvent::FileSearchRebuild);
+                    }),
+                )),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Folders",
+                    "Your user folder is always searched. Add other folders or whole drives.",
+                )
+                .child(
+                    chip("add-folder", "Add Folder…", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.add_file_folder(cx))),
+                ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(folders),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Leave out",
+                    "Folders with these names, anywhere, and these paths with everything in them.",
+                )
+                .when(self.file_search.exclusions != defaults, |row| {
+                    row.child(
+                        chip("default-exclusions", "Restore Defaults", false).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                let defaults = FileSearchConfig::default().exclusions;
+                                this.change_file_search(|config| config.exclusions = defaults, cx)
+                            }),
+                        ),
+                    )
+                }),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(rules)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(rgba(theme::SURFACE_BORDER))
+                                    .bg(rgba(theme::SURFACE))
+                                    .text_size(px(13.))
+                                    .child(self.exclusion_input.clone()),
+                            )
+                            .child(
+                                chip("add-exclusion", "Add", false)
+                                    .on_click(cx.listener(|this, _, _, cx| this.add_exclusion(cx))),
+                            ),
+                    ),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Hidden files",
+                    "Also index files and folders marked hidden, and names starting with a dot.",
+                )
+                .child(switch(
+                    "hidden-files",
+                    self.file_search.include_hidden,
+                    cx.listener(|this, _, _, cx| {
+                        this.change_file_search(
+                            |config| config.include_hidden = !config.include_hidden,
+                            cx,
+                        )
+                    }),
+                )),
+            )
+    }
+
     /// How long and how many entries to keep: a row of choices for each.
     fn clipboard_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.clipboard_retention;
@@ -1337,6 +1641,7 @@ impl Page {
                 "calc" => ('\u{E8EF}', ORANGE),
                 "clipboard" => ('\u{E77F}', RED),
                 "control-panel" => ('\u{E770}', TEAL),
+                FILES_PAGE => ('\u{E8B7}', YELLOW),
                 "games" => ('\u{E7FC}', GREEN),
                 "quicklinks" => ('\u{E71B}', PINK),
                 "selection" => ('\u{E8B3}', YELLOW),
@@ -1391,6 +1696,7 @@ impl Page {
                 "Data folder",
             ],
             Page::Extension("clipboard") => &["Keep for", "Keep at most", "Win+V", "Ignored apps"],
+            Page::Extension(FILES_PAGE) => &["Index", "Folders", "Leave out", "Hidden files"],
             Page::Extension("selection") => &["Copy the selection", "Ctrl+C"],
             Page::Extension("snippets") => &["Expand keywords", "Don't expand in"],
             Page::Extension("web") => &["Search engine", "Custom"],
@@ -2070,6 +2376,10 @@ impl Settings {
                 self.clipboard_card(cx).into_any_element(),
             ]),
             "selection" => body.push(self.selection_card(cx).into_any_element()),
+            FILES_PAGE => body.extend([
+                section_title("Files"),
+                self.files_card(cx).into_any_element(),
+            ]),
             "snippets" => body.extend([
                 section_title("Expansion"),
                 self.snippets_card(cx).into_any_element(),
@@ -2119,6 +2429,9 @@ impl Render for Settings {
             window.request_animation_frame();
         }
         let page = self.page();
+        if page == Page::Extension(FILES_PAGE) {
+            self.refresh_status_while_indexing(cx);
+        }
         let body = match page {
             Page::General => self.general_page(cx),
             Page::Extensions => self.extensions_page(cx),

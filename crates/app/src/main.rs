@@ -32,7 +32,7 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
-    deeplink, snippet,
+    deeplink, file_search, snippet,
     web::SearchEngine,
 };
 use spotlight_platform_win::{
@@ -41,7 +41,7 @@ use spotlight_platform_win::{
     instance::{self, Instance},
     metrics, protocol, vault, win,
 };
-use spotlight_providers::{Builtins, clipboard::ClipboardHistory, web::Web};
+use spotlight_providers::{Builtins, clipboard::ClipboardHistory, files::Files, web::Web};
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit, WindowMode},
@@ -67,6 +67,8 @@ const DISABLED_PROVIDERS_SETTING: &str = "disabled_providers";
 const CLIPBOARD_RETENTION_SETTING: &str = "clipboard_retention";
 /// The clipboard history provider's id: turning it off stops recording.
 const CLIPBOARD_PROVIDER: &str = "clipboard";
+/// File Search's provider id: turning it off stops indexing.
+const FILES_PROVIDER: &str = "files";
 /// `settings` key: `"true"` when Win+V opens the clipboard history; missing
 /// means off (Windows keeps it).
 const WIN_V_SETTING: &str = "clipboard_win_v";
@@ -88,6 +90,8 @@ struct AppState {
     web: Arc<Web>,
     /// The clipboard history, to change how much it keeps and whether it records.
     clipboard: Arc<ClipboardHistory>,
+    /// File Search, to index again when what it covers changes.
+    files: Arc<Files>,
     win_v: Cell<bool>,
     selection_copy: Cell<bool>,
     snippet_expansion: Cell<bool>,
@@ -204,6 +208,11 @@ fn main() {
     let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
     let snippet_expansion =
         setting(snippet::EXPANSION_SETTING).is_none_or(|value| value != "false");
+    let file_search = file_search::Config::from_settings(
+        setting(file_search::FOLDERS_SETTING).as_deref(),
+        setting(file_search::EXCLUSIONS_SETTING).as_deref(),
+        setting(file_search::HIDDEN_SETTING).as_deref(),
+    );
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
     }
@@ -237,12 +246,17 @@ fn main() {
             providers,
             web,
             clipboard: clipboard_history,
+            files,
         } = spotlight_providers::all(
             search_engine.clone(),
             data_dir.clone(),
             store.clone(),
             retention,
+            file_search,
         );
+        if !disabled_providers.iter().any(|id| id == FILES_PROVIDER) {
+            files.start();
+        }
         clipboard_history
             .set_recording(!disabled_providers.iter().any(|id| id == CLIPBOARD_PROVIDER));
         // The self-test runs beside a normal instance, which keeps the history.
@@ -330,6 +344,7 @@ fn main() {
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
+            files,
             win_v: Cell::new(win_v),
             selection_copy: Cell::new(selection_copy),
             snippet_expansion: Cell::new(snippet_expansion),
@@ -457,6 +472,8 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
         ..Default::default()
     };
     let view_state = state.clone();
+    let files = state.files.clone();
+    let file_status: settings::FileStatusReader = Rc::new(move || files.status());
     let opened = cx.open_window(options, move |window, cx| {
         let view = cx.new(|cx| {
             Settings::new(
@@ -469,6 +486,8 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.win_v.get(),
                 view_state.selection_copy.get(),
                 view_state.snippet_expansion.get(),
+                view_state.files.config(),
+                file_status,
                 env!("SPOTLIGHT_VERSION"),
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher),
@@ -539,6 +558,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
             if *id == CLIPBOARD_PROVIDER {
                 state.clipboard.set_recording(*enabled);
             }
+            // Off frees the index's memory; on builds it again.
+            if *id == FILES_PROVIDER {
+                if *enabled {
+                    state.files.start();
+                } else {
+                    state.files.stop();
+                }
+            }
             let disabled = state
                 .launcher
                 .update(cx, |launcher, window, cx| {
@@ -608,6 +635,34 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 cx,
             );
         }
+        SettingsEvent::FileSearchChanged(config) => {
+            state
+                .files
+                .set_config(config.clone(), files_enabled(state, cx));
+            save_setting(
+                state,
+                file_search::FOLDERS_SETTING,
+                config.folders_setting(),
+                cx,
+            );
+            save_setting(
+                state,
+                file_search::EXCLUSIONS_SETTING,
+                config.exclusions_setting(),
+                cx,
+            );
+            save_setting(
+                state,
+                file_search::HIDDEN_SETTING,
+                config.include_hidden.to_string(),
+                cx,
+            );
+        }
+        SettingsEvent::FileSearchRebuild => {
+            if files_enabled(state, cx) {
+                state.files.start();
+            }
+        }
         SettingsEvent::AutostartChanged => {
             if let Some(tray) = &state.tray {
                 tray.sync_autostart();
@@ -631,6 +686,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .ok();
         }
     }
+}
+
+/// Whether File Search is turned on in Settings.
+fn files_enabled(state: &AppState, cx: &App) -> bool {
+    state
+        .launcher
+        .read(cx)
+        .is_ok_and(|launcher| !launcher.disabled_providers().contains(&FILES_PROVIDER))
 }
 
 /// Makes Win+V open the clipboard history, or gives it back to Windows.

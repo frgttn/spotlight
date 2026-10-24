@@ -254,6 +254,7 @@ impl ClipboardHistory {
                     .map(|tag| ListFilter::new(tag.plural(), Some(&tag.keyword()))),
             )
             .collect(),
+            live: false,
         }
     }
 }

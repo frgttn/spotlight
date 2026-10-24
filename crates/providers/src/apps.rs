@@ -50,6 +50,7 @@ fn browse(apps: &[SearchItem]) -> SearchItem {
         items: apps.to_vec(),
         empty: Some("No apps found".into()),
         filters: Vec::new(),
+        live: false,
     });
     SearchItem::new(item_id(ID, "browse"), "Browse Apps")
         .subtitle("Applications")

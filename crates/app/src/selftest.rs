@@ -214,6 +214,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         ("quicklink", quicklink_round_trip(window, cx).await),
         ("deeplink", deeplink_round_trip(window, cx).await),
         ("switcher", switcher_round_trip(window, cx).await),
+        ("files", files_round_trip(window, cx).await),
     ] {
         eprintln!(
             "[selftest] {name} view: {outcome} {}",
@@ -593,6 +594,56 @@ async fn switcher_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) 
         "{} windows, {} processes, back to search",
         counts[0], counts[1]
     )
+}
+
+/// Search Files: once the index is built, typing finds the Desktop folder
+/// of the user profile, Tab's Folders filter keeps it, and Esc goes back.
+/// Enter isn't pressed (it would open Explorer).
+async fn files_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    /// Indexing a large profile takes a while; this is how long to wait.
+    const TRIES: usize = 120;
+    let executor = cx.background_executor().clone();
+    if let Err(err) = open_from_search(window, "search files", "Search Files", cx).await {
+        return err;
+    }
+    let titles = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.result_titles())
+            .unwrap_or_default()
+    };
+    let started = Instant::now();
+    let mut found = false;
+    for _ in 0..TRIES {
+        // Typed again each time: the list asks for rows as the text changes.
+        press(window, "ctrl-a", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text("desktop", window, cx)
+            })
+            .ok();
+        executor.timer(Duration::from_millis(500)).await;
+        if titles(cx).iter().any(|title| title == "Desktop") {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return format!(
+            "Desktop not found after {:.0} s",
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let waited = started.elapsed().as_secs_f64();
+    press(window, "tab", cx);
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let folders = titles(cx);
+    if !folders.iter().any(|title| title == "Desktop") {
+        return format!("the Folders filter dropped Desktop: {folders:?}");
+    }
+    if let Err(err) = back_to_search(window, cx).await {
+        return err;
+    }
+    format!("found Desktop after {waited:.1} s, kept by Folders, back to search")
 }
 
 async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {

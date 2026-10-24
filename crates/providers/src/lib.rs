@@ -5,6 +5,7 @@ pub mod apps;
 pub mod calc;
 pub mod clipboard;
 pub mod control_panel;
+pub mod files;
 pub mod games;
 pub mod quicklinks;
 pub mod rates;
@@ -81,18 +82,22 @@ pub struct Builtins {
     pub web: Arc<web::Web>,
     /// To feed it what is copied, and change how much it keeps.
     pub clipboard: Arc<clipboard::ClipboardHistory>,
+    /// To start and stop indexing, and change what it covers.
+    pub files: Arc<files::Files>,
 }
 
 /// Every built-in provider. `data_dir` is where providers keep caches
 /// (exchange rates) and files (clipboard images); `None` keeps nothing
 /// between runs. `store` holds what the user saves (quicklinks, clipboard
-/// history, snippets).
+/// history, snippets). File Search starts indexing only when the app asks.
 pub fn all(
     engine: SearchEngine,
     data_dir: Option<PathBuf>,
     store: Option<Arc<Mutex<Store>>>,
     retention: Retention,
+    files: spotlight_core::file_search::Config,
 ) -> Builtins {
+    let files = Arc::new(files::Files::new(files));
     let web = Arc::new(web::Web::new(engine));
     let clipboard = Arc::new(clipboard::ClipboardHistory::new(
         store.clone(),
@@ -107,6 +112,7 @@ pub fn all(
         Arc::new(system::System),
         Arc::new(windows::WindowManagement),
         Arc::new(switcher::Switcher),
+        files.clone(),
         clipboard.clone(),
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(store.clone())),
@@ -122,5 +128,6 @@ pub fn all(
         providers,
         web,
         clipboard,
+        files,
     }
 }

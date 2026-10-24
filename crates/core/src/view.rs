@@ -40,6 +40,19 @@ pub struct ListView {
     /// Choices that narrow the list (All, Images, Links…), which Tab steps
     /// through. Empty: no filter.
     pub filters: Vec<ListFilter>,
+    /// The rows come from the provider for what is typed
+    /// ([`crate::provider::Provider::search_view`]) instead of from
+    /// filtering `items`, which show until its first answer. For lists too
+    /// large to hand over whole: Search Files.
+    pub live: bool,
+}
+
+/// A live list's rows for one query.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveRows {
+    pub items: Vec<SearchItem>,
+    /// Shown when there are no items ("Indexing… 12,345 files so far").
+    pub empty: Option<String>,
 }
 
 /// One choice of a list's filter: items with `keyword` among their keywords.
@@ -81,6 +94,9 @@ pub enum PreviewBody {
     Image(String),
     /// File paths, one per row.
     Files(Vec<String>),
+    /// A file's thumbnail as Explorer shows it (pictures, videos, PDFs), or
+    /// its icon when it has none, with its path under it.
+    Thumbnail(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]

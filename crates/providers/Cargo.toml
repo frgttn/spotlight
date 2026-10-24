@@ -1,6 +1,6 @@
 [package]
 name = "spotlight-providers"
-description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web, quicklinks, clipboard history, snippets"
+description = "Built-in root-search providers for Spotlight: apps, system commands, calculator, web, quicklinks, clipboard history, snippets, file search"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-channel.workspace = true
 fend-core.workspace = true
 # Preview-sized copies of clipboard images.
 image = { workspace = true, features = ["png"] }
 serde_json.workspace = true
 spotlight-core.workspace = true
+spotlight-files.workspace = true
 spotlight-platform-win.workspace = true
 spotlight-store.workspace = true

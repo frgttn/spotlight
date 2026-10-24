@@ -109,6 +109,12 @@ pub enum Command {
     RunAsAdmin(String),
     /// Opens an Explorer window on the folder holding this file, with the file selected.
     ShowInFolder(String),
+    /// Asks which app to open this file with (Windows' Open With dialog).
+    OpenWith(String),
+    /// Puts this file on the clipboard, to paste in Explorer or a chat app.
+    CopyFile(String),
+    /// Moves this file or folder to the Recycle Bin.
+    MoveToTrash(String),
     /// Opens an `http`/`https` URL in the default browser, an `ms-settings:`
     /// page in the Settings app, or a game through its launcher (`steam://`…).
     /// The app refuses other schemes.
@@ -223,6 +229,7 @@ impl Command {
                 | Command::DeleteSnippet(_)
                 | Command::ClearClipboardHistory
                 | Command::ForceQuit(_)
+                | Command::MoveToTrash(_)
         )
     }
 }

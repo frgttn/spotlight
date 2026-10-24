@@ -6,15 +6,20 @@
 //! folder the user indexes) is an entry whose name is its full path. Removing
 //! an entry marks it deleted and leaves its descendants in place: search
 //! skips anything under a deleted folder, and [`Index::compact`] drops them.
+//!
+//! Change notifications name paths, so the index also maps each (folder,
+//! case-folded name) pair to its entry: [`Index::resolve`] walks a path down
+//! from its scope root one name at a time.
 
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    hash::{DefaultHasher, Hash, Hasher},
+    path::{Component, Path, PathBuf},
 };
 
 use crate::{
     kind::{ExtId, Exts},
-    names::{NameId, Names},
+    names::{NameId, Names, fold},
 };
 
 pub type EntryId = u32;
@@ -100,6 +105,8 @@ pub struct Builder {
     /// Name to its position in `order`, until `finish` assigns final ids.
     names: HashMap<Box<str>, NameId>,
     exts: Exts,
+    children: HashMap<u64, EntryId>,
+    roots: Vec<EntryId>,
 }
 
 impl Builder {
@@ -108,13 +115,15 @@ impl Builder {
             entries: Vec::with_capacity(entries),
             names: HashMap::with_capacity(entries / 2),
             exts: Exts::default(),
+            children: HashMap::with_capacity(entries),
+            roots: Vec::new(),
         }
     }
 
     /// Adds a scope root: a folder whose name is its full path.
     pub fn root(&mut self, path: &Path) -> EntryId {
         let name = self.intern(&path.to_string_lossy());
-        push(
+        let id = push(
             &mut self.entries,
             Entry {
                 parent: NO_PARENT,
@@ -123,9 +132,13 @@ impl Builder {
                 ext: 0,
                 flags: flag::DIR | flag::ROOT,
             },
-        )
+        );
+        self.roots.push(id);
+        id
     }
 
+    /// Adds an entry under `parent`. A scan lists each name once per folder,
+    /// so unlike [`Index::insert`] this doesn't look for one already there.
     pub fn add(&mut self, parent: EntryId, meta: Meta) -> EntryId {
         let ext = if meta.dir {
             0
@@ -133,7 +146,7 @@ impl Builder {
             self.exts.intern(meta.name)
         };
         let name = self.intern(meta.name);
-        push(
+        let id = push(
             &mut self.entries,
             Entry {
                 parent,
@@ -142,7 +155,9 @@ impl Builder {
                 ext,
                 flags: meta.flags(),
             },
-        )
+        );
+        self.children.insert(child_key(parent, meta.name), id);
+        id
     }
 
     pub fn len(&self) -> usize {
@@ -166,6 +181,8 @@ impl Builder {
             entries: self.entries,
             names,
             exts: self.exts,
+            children: self.children,
+            roots: self.roots,
             deleted: 0,
         }
     }
@@ -174,6 +191,16 @@ impl Builder {
         let next = self.names.len() as NameId;
         *self.names.entry(name.into()).or_insert(next)
     }
+}
+
+/// The key of `name` in folder `parent`, case-insensitive as NTFS is. A
+/// collision of two 64-bit hashes is checked for on lookup, so at worst it
+/// hides one of the two from [`Index::resolve`]; it never finds a wrong entry.
+fn child_key(parent: EntryId, name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    parent.hash(&mut hasher);
+    fold(name).hash(&mut hasher);
+    hasher.finish()
 }
 
 fn push(entries: &mut Vec<Entry>, entry: Entry) -> EntryId {
@@ -187,6 +214,9 @@ pub struct Index {
     pub(crate) entries: Vec<Entry>,
     pub(crate) names: Names,
     pub(crate) exts: Exts,
+    /// [`child_key`] of each live entry, to its id.
+    children: HashMap<u64, EntryId>,
+    roots: Vec<EntryId>,
     /// Entries marked deleted, not counting their descendants.
     deleted: usize,
 }
@@ -209,7 +239,7 @@ impl Index {
 
     pub fn add_root(&mut self, path: &Path) -> EntryId {
         let name = self.names.intern(&path.to_string_lossy());
-        push(
+        let id = push(
             &mut self.entries,
             Entry {
                 parent: NO_PARENT,
@@ -218,17 +248,33 @@ impl Index {
                 ext: 0,
                 flags: flag::DIR | flag::ROOT,
             },
-        )
+        );
+        self.roots.push(id);
+        id
     }
 
+    /// Adds `meta` under `parent`, or updates the entry already there by that
+    /// name: a scan and a change notification can both report a file. A file
+    /// where a folder was, or the other way round, replaces it.
     pub fn insert(&mut self, parent: EntryId, meta: Meta) -> EntryId {
+        if let Some(existing) = self.child(parent, meta.name) {
+            if self.entries[existing as usize].has(flag::DIR) == meta.dir {
+                self.update(existing, meta);
+                // Only the case may differ ("readme" became "README").
+                if self.name(existing) != meta.name {
+                    self.rename(existing, parent, meta.name);
+                }
+                return existing;
+            }
+            self.remove(existing);
+        }
         let ext = if meta.dir {
             0
         } else {
             self.exts.intern(meta.name)
         };
         let name = self.names.intern(meta.name);
-        push(
+        let id = push(
             &mut self.entries,
             Entry {
                 parent,
@@ -237,27 +283,87 @@ impl Index {
                 ext,
                 flags: meta.flags(),
             },
-        )
+        );
+        self.children.insert(child_key(parent, meta.name), id);
+        id
     }
 
     /// Marks the entry deleted, and with it everything under it.
     pub fn remove(&mut self, id: EntryId) {
-        let entry = &mut self.entries[id as usize];
-        if !entry.has(flag::DELETED) {
-            entry.flags |= flag::DELETED;
-            self.deleted += 1;
+        let entry = self.entries[id as usize];
+        if entry.has(flag::DELETED) {
+            return;
+        }
+        self.entries[id as usize].flags |= flag::DELETED;
+        self.deleted += 1;
+        let key = child_key(entry.parent, self.names.get(entry.name));
+        if self.children.get(&key) == Some(&id) {
+            self.children.remove(&key);
         }
     }
 
-    /// Renames or moves the entry; a folder takes its contents along.
+    /// Renames or moves the entry; a folder takes its contents along. An
+    /// entry already at the new place by that name is replaced.
     pub fn rename(&mut self, id: EntryId, parent: EntryId, name: &str) {
-        let dir = self.entries[id as usize].has(flag::DIR);
-        let ext = if dir { 0 } else { self.exts.intern(name) };
-        let name = self.names.intern(name);
+        if let Some(existing) = self.child(parent, name)
+            && existing != id
+        {
+            self.remove(existing);
+        }
+        let old = self.entries[id as usize];
+        let old_key = child_key(old.parent, self.names.get(old.name));
+        if self.children.get(&old_key) == Some(&id) {
+            self.children.remove(&old_key);
+        }
+        let ext = if old.has(flag::DIR) {
+            0
+        } else {
+            self.exts.intern(name)
+        };
+        let name_id = self.names.intern(name);
         let entry = &mut self.entries[id as usize];
         entry.parent = parent;
-        entry.name = name;
+        entry.name = name_id;
         entry.ext = ext;
+        if !entry.has(flag::DELETED) {
+            self.children.insert(child_key(parent, name), id);
+        }
+    }
+
+    /// The live entry named `name` (in any case) in folder `parent`.
+    pub fn child(&self, parent: EntryId, name: &str) -> Option<EntryId> {
+        let id = *self.children.get(&child_key(parent, name))?;
+        let entry = &self.entries[id as usize];
+        (entry.parent == parent
+            && !entry.has(flag::DELETED)
+            && fold(self.names.get(entry.name)) == fold(name))
+        .then_some(id)
+    }
+
+    /// The scope roots, in the order they were added.
+    pub fn roots(&self) -> &[EntryId] {
+        &self.roots
+    }
+
+    /// The live entry at `path`, found from the scope root it is under (the
+    /// innermost one, when roots nest). Case-insensitive.
+    pub fn resolve(&self, path: &Path) -> Option<EntryId> {
+        let (root, rest) = self
+            .roots
+            .iter()
+            .filter(|&&root| !self.entries[root as usize].has(flag::DELETED))
+            .filter_map(|&root| {
+                Some((root, strip_prefix_folded(path, Path::new(self.name(root)))?))
+            })
+            .min_by_key(|(_, rest)| rest.components().count())?;
+        let mut at = root;
+        for component in rest.components() {
+            let Component::Normal(name) = component else {
+                return None;
+            };
+            at = self.child(at, &name.to_string_lossy())?;
+        }
+        Some(at)
     }
 
     /// Updates what changes in place: modification time and attributes. The
@@ -376,6 +482,8 @@ impl Index {
     /// Approximate heap use, for Settings and the memory budget.
     pub fn memory_bytes(&self) -> usize {
         self.entries.capacity() * size_of::<Entry>()
+            // A key, an id and a control byte per slot.
+            + self.children.capacity() * (size_of::<u64>() + size_of::<EntryId>() + 1)
             + self.names.memory_bytes()
             + self.exts.memory_bytes()
     }
@@ -409,6 +517,18 @@ impl Index {
         }
         answer
     }
+}
+
+/// `path` without `prefix`, comparing components without case.
+fn strip_prefix_folded<'a>(path: &'a Path, prefix: &Path) -> Option<&'a Path> {
+    let mut rest = path.components();
+    for want in prefix.components() {
+        let got = rest.next()?;
+        if fold(&got.as_os_str().to_string_lossy()) != fold(&want.as_os_str().to_string_lossy()) {
+            return None;
+        }
+    }
+    Some(rest.as_path())
 }
 
 #[cfg(test)]

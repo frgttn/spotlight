@@ -410,3 +410,69 @@ fn dot_names_count_as_hidden() {
         [".vscode/settings.json"]
     );
 }
+
+#[test]
+fn insert_updates_what_is_already_there() {
+    let (mut index, root) = build();
+    let before = index.len();
+    let docs = index.child(root, "documents").unwrap();
+    let report = index.child(docs, "REPORT FINAL.PDF").unwrap();
+    let again = index.insert(
+        docs,
+        Meta {
+            name: "Report final.pdf",
+            modified: NOW,
+            ..Meta::default()
+        },
+    );
+    assert_eq!(again, report);
+    assert_eq!(index.len(), before);
+    assert_eq!(index.modified(report), NOW / 60 * 60);
+
+    // A folder where the file was replaces it.
+    let folder = index.insert(
+        docs,
+        Meta {
+            name: "Report final.pdf",
+            dir: true,
+            ..Meta::default()
+        },
+    );
+    assert_ne!(folder, report);
+    assert!(!index.is_live(report));
+    assert_eq!(index.child(docs, "report final.pdf"), Some(folder));
+}
+
+#[test]
+fn rename_over_an_existing_name_replaces_it() {
+    let (mut index, root) = build();
+    let docs = index.child(root, "Documents").unwrap();
+    let draft = index.child(docs, "report-draft.pdf").unwrap();
+    let final_ = index.child(docs, "Report final.pdf").unwrap();
+    index.rename(draft, docs, "Report final.pdf");
+    assert!(!index.is_live(final_));
+    assert_eq!(index.child(docs, "report final.pdf"), Some(draft));
+    assert_eq!(index.child(docs, "report-draft.pdf"), None);
+    assert_eq!(
+        index.resolve(Path::new(r"C:\Users\me\Documents\Report final.pdf")),
+        Some(draft)
+    );
+}
+
+#[test]
+fn recent_lists_files_newest_first() {
+    let (index, _) = build();
+    let recent: Vec<String> = index
+        .recent(&options())
+        .unwrap()
+        .into_iter()
+        .map(|hit| index.name(hit.id).to_owned())
+        .collect();
+    // Hidden AppData's log is left out, and folders are.
+    assert_eq!(recent[0], "04-file-search-plan.md");
+    assert!(
+        !recent
+            .iter()
+            .any(|name| name == "launcher.log" || name == "Documents")
+    );
+}

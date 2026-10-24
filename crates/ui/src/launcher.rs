@@ -15,7 +15,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     rc::Rc,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
@@ -325,6 +325,13 @@ pub struct Launcher {
     grid_scroll: UniformListScrollHandle,
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
+    /// Set to tell the live list's search under way that a newer one
+    /// replaced it.
+    live_cancel: Option<Arc<AtomicBool>>,
+    /// Bumped by every live search, so only the newest one's rows are shown.
+    live_generation: u64,
+    /// The window's scale as last seen, for icons that arrive later.
+    window_scale: f32,
     visible: bool,
     window_mode: WindowMode,
     /// ↓ showed root search's results in compact mode; typing clears it.
@@ -475,6 +482,9 @@ impl Launcher {
             focus: cx.focus_handle(),
             grid_scroll: UniformListScrollHandle::new(),
             list_searcher: Searcher::default(),
+            live_cancel: None,
+            live_generation: 0,
+            window_scale: window.scale_factor(),
             visible: false,
             window_mode: WindowMode::default(),
             revealed: false,
@@ -797,6 +807,12 @@ impl Launcher {
                 |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
                 aliases,
             ),
+            // The provider ranked them for this query (or is about to).
+            Some(Screen::List { view, .. }) if view.live => view
+                .items
+                .iter()
+                .map(|item| Row::Computed(item.clone()))
+                .collect(),
             Some(Screen::List { view, filter, .. }) => {
                 let shown: Vec<&SearchItem> = match view.filters.get(*filter) {
                     Some(filter) => view
@@ -905,11 +921,13 @@ impl Launcher {
         }
     }
 
-    fn query_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn query_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changed_at = Instant::now();
         let query = self.query(cx);
         self.revealed = false;
         self.pending_link = None;
+        self.window_scale = window.scale_factor();
+        self.search_live(cx);
         let filter_ms = self.refilter(&query);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
@@ -1422,6 +1440,13 @@ impl Launcher {
             Command::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
+            }
+            Command::CopyFile(path) => {
+                let content = system_clipboard::Content::Files(vec![path.clone()]);
+                hud = Some(match system_clipboard::write(self.hwnd, &content) {
+                    Ok(()) => "Copied to Clipboard".into(),
+                    Err(err) => err.into(),
+                });
             }
             // Hidden first, so it doesn't take the foreground back from a
             // window just brought up, and Windows doesn't activate another.
@@ -1980,6 +2005,7 @@ impl Launcher {
                 .collect(),
             empty: Some("No calculations yet. Copy a calculator answer to keep it here.".into()),
             filters: Vec::new(),
+            live: false,
         };
         self.push_view(View::List(list), window, cx);
     }

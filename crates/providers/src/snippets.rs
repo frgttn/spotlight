@@ -159,6 +159,7 @@ impl Provider for Snippets {
                 .collect(),
             empty: Some("No snippets yet. Create one with Create Snippet.".into()),
             filters: Vec::new(),
+            live: false,
         }))
     }
 }

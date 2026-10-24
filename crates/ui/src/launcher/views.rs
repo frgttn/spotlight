@@ -2,11 +2,16 @@
 //! launcher's screen stack, and how grids, details and forms are drawn. Lists
 //! reuse root search's rows, and every view keeps the action panel and Esc.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, ScrollHandle, ScrollStrategy,
     SharedString, Window, div, prelude::*, px, rgba, uniform_list,
 };
-use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, View};
+use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, LiveRows, View};
 
 use super::{Launcher, Row, keycaps};
 use crate::{
@@ -196,8 +201,109 @@ impl Launcher {
 
     /// Back to the screen below (root search at the bottom).
     pub(super) fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.screens.pop();
+        if let Some(Screen::List {
+            view,
+            origin: Some((provider, _)),
+            ..
+        }) = self.screens.pop()
+            && view.live
+        {
+            if let Some(cancel) = self.live_cancel.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            // A live list's rows are only ever shown once (files found while
+            // typing), so their icons go with it rather than pile up.
+            let prefix = format!("{provider}:");
+            let stale: Vec<String> = self
+                .icons
+                .keys()
+                .filter(|id| id.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for id in stale {
+                if let Some(image) = self.icons.remove(&id) {
+                    self.stale_images.push(image);
+                }
+            }
+        }
         self.enter_screen(window, cx);
+    }
+
+    /// In a live list, asks its provider for the rows of what is typed, on a
+    /// background thread. A newer search cancels this one, and only the
+    /// newest one's rows are shown.
+    pub(super) fn search_live(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::List {
+            view,
+            origin: Some((provider, id)),
+            filter,
+            ..
+        }) = self.screens.last()
+        else {
+            return;
+        };
+        if !view.live {
+            return;
+        }
+        let Some(provider) = self
+            .search
+            .providers()
+            .iter()
+            .find(|candidate| candidate.id() == provider)
+            .cloned()
+        else {
+            return;
+        };
+        let keyword = view
+            .filters
+            .get(*filter)
+            .and_then(|choice| choice.keyword.clone());
+        let id = id.clone();
+        if let Some(older) = self.live_cancel.take() {
+            older.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.live_cancel = Some(cancel.clone());
+        self.live_generation += 1;
+        let generation = self.live_generation;
+        let query = self.query(cx);
+        let rows = cx
+            .background_executor()
+            .spawn(async move { provider.search_view(&id, &query, keyword.as_deref(), &cancel) });
+        cx.spawn(async move |this, cx| {
+            let Some(rows) = rows.await else {
+                return;
+            };
+            this.update(cx, |this, cx| this.show_live_rows(generation, rows, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Puts a live search's rows in the open list, unless a newer search or
+    /// another screen has taken its place.
+    fn show_live_rows(&mut self, generation: u64, rows: LiveRows, cx: &mut Context<Self>) {
+        if generation != self.live_generation {
+            return;
+        }
+        let icons: Vec<(String, String)> = rows
+            .items
+            .iter()
+            .filter(|item| !self.icons.contains_key(&item.id))
+            .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+            .collect();
+        let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
+            return;
+        };
+        if !view.live {
+            return;
+        }
+        view.items = rows.items;
+        view.empty = rows.empty;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.load_icons(icons, self.window_scale, cx);
+        cx.notify();
     }
 
     /// Sets up the search field, the rows and the keyboard for the top screen.
@@ -292,6 +398,7 @@ impl Launcher {
         } else {
             (*filter + count - 1) % count
         };
+        self.search_live(cx);
         let query = self.query(cx);
         self.refilter(&query);
         cx.notify();

@@ -82,10 +82,10 @@ Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](
 | `crates/ui` | GPUI views: launcher (search field, result list, metrics footer), settings and text input |
 | `crates/core` | Domain types: `SearchItem`, actions and commands, the `Provider` trait, frecency |
 | `crates/search` | Root search: merges providers; ranking by fuzzy score (title and keywords), prefix bonus, frecency |
-| `crates/files` | File index for Search Files: entry table changed in place, unique names in an arena and an `fst`, ranked search with `neo_frizbee` (examples: `bench`, `walk`) |
+| `crates/files` | File index for Search Files: entry table changed in place, unique names in an arena and an `fst`, ranked search with `neo_frizbee`, a parallel walk with exclusions (examples: `bench`, `walk`) |
 | `crates/providers` | Built-in providers: apps, system commands, calculator, web, quicklinks |
 | `crates/store` | SQLCipher (`rusqlite`, bundled; encrypted SQLite): settings, frecency, clipboard history, snippets, quicklinks, with schema migrations |
-| `crates/platform-win` | Windows code: hotkey thread, single instance, app discovery and icons, running commands (launch, open URL, system commands), autostart, window placement, measurements |
+| `crates/platform-win` | Windows code: hotkey thread, single instance, app discovery and icons, running commands (launch, open URL, system commands), autostart, window placement, folder listing and change watching for the file index, measurements |
 | `vendor/libsqlite3-sys` | `libsqlite3-sys` patched so SQLCipher uses Windows CNG instead of OpenSSL (`sqlcipher/crypto_cng.c`); no OpenSSL or Perl needed to build |
 | `docs/` | Architecture plan and the UI framework decision |
 

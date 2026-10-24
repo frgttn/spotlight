@@ -1,6 +1,11 @@
 //! The interface every source of search results implements.
 
-use crate::{item::SearchItem, view::View};
+use std::sync::atomic::AtomicBool;
+
+use crate::{
+    item::SearchItem,
+    view::{LiveRows, View},
+};
 
 /// A source of root-search results. Providers return data only; they never
 /// touch the UI and never run actions themselves (see [`crate::item::Command`]).
@@ -43,6 +48,20 @@ pub trait Provider: Send + Sync {
     ///
     /// [`Command::OpenProviderView`]: crate::item::Command::OpenProviderView
     fn view(&self, _id: &str) -> Option<View> {
+        None
+    }
+
+    /// The rows of live list `view` ([`crate::view::ListView::live`]) for
+    /// `query`, under the filter choice whose keyword is `filter`. Runs on
+    /// a background thread for every keystroke; once `cancel` is set a newer
+    /// query has replaced this one, so it may stop and return `None`.
+    fn search_view(
+        &self,
+        _view: &str,
+        _query: &str,
+        _filter: Option<&str>,
+        _cancel: &AtomicBool,
+    ) -> Option<LiveRows> {
         None
     }
 }
