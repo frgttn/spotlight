@@ -43,7 +43,7 @@ use spotlight_platform_win::{
     selection, win,
 };
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
-use spotlight_store::{Calculation, Store};
+use spotlight_store::{CachedIcon, Calculation, Store};
 
 use self::{
     clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
@@ -83,6 +83,8 @@ const LIST_PADDING: f32 = 4.;
 const ICON_SIZE: f32 = 26.;
 /// Icons are extracted at the grid's tile size, so tiles are sharp too.
 const ICON_EXTRACT_SIZE: f32 = 44.;
+/// A saved icon older than this is extracted again (an app update may change it).
+const ICON_REFRESH_SECS: i64 = 7 * 24 * 3600;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
 /// The collapsed window's height in compact mode: just the search row.
@@ -652,15 +654,83 @@ impl Launcher {
         }
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
         let size = (ICON_EXTRACT_SIZE * window_scale).ceil() as u32;
-        let (tx, rx) = async_channel::unbounded();
-        icons::spawn(names, size, tx);
 
+        // What an earlier run saved shows at once; only icons that are missing
+        // or old are extracted again, and those replace the saved ones.
+        let now = frecency::now();
+        let mut fresh = vec![false; names.len()];
+        let cached = self
+            .store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.icons(&names, size).ok())
+            .unwrap_or_default();
+        for saved in cached {
+            let Some(ix) = names.iter().position(|name| *name == saved.name) else {
+                continue;
+            };
+            fresh[ix] = now - saved.saved_at < ICON_REFRESH_SECS;
+            let icon = icons::Icon {
+                width: saved.width,
+                height: saved.height,
+                bgra: saved.bgra,
+            };
+            if let Some(image) = render_image(icon) {
+                for id in &ids[ix] {
+                    self.icons.insert(id.clone(), image.clone());
+                }
+            }
+        }
+        let wanted: Vec<usize> = (0..names.len()).filter(|&ix| !fresh[ix]).collect();
+        eprintln!(
+            "[spotlight] icons: {} saved, {} to extract",
+            names.len() - wanted.len(),
+            wanted.len()
+        );
+        if wanted.is_empty() {
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded();
+        icons::spawn(
+            wanted.iter().map(|&ix| names[ix].clone()).collect(),
+            size,
+            tx,
+        );
+
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
                 // Apply whatever else has arrived too, so the list re-renders once per batch.
                 let batch: Vec<_> = std::iter::once(first)
                     .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    .map(|(wanted_ix, icon)| (wanted[wanted_ix], icon))
                     .collect();
+                let saved: Vec<CachedIcon> = batch
+                    .iter()
+                    .map(|(ix, icon)| CachedIcon {
+                        name: names[*ix].clone(),
+                        width: icon.width,
+                        height: icon.height,
+                        bgra: icon.bgra.clone(),
+                        saved_at: now,
+                    })
+                    .collect();
+                if let Some(store) = store.clone() {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let result = store
+                                .lock()
+                                .map_err(|_| "store lock poisoned".to_owned())
+                                .and_then(|mut store| {
+                                    store
+                                        .save_icons(&saved, size, now)
+                                        .map_err(|e| e.to_string())
+                                });
+                            if let Err(err) = result {
+                                eprintln!("[spotlight] could not save icons: {err}");
+                            }
+                        })
+                        .detach();
+                }
                 let updated = this.update(cx, |this, cx| {
                     for (ix, icon) in batch {
                         if let Some(image) = render_image(icon) {

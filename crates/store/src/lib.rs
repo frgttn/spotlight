@@ -93,7 +93,32 @@ const MIGRATIONS: &[&str] = &[
     // No schema change: swaps the first nine default quicklinks for the
     // current `quicklink::DEFAULTS`; see `refresh_default_quicklinks`.
     "SELECT 1;",
+    // Icons already extracted from the shell, so a start doesn't extract them
+    // all again. `name` is what the shell was asked for, `size` the pixel size.
+    "CREATE TABLE icons (
+        name     TEXT NOT NULL,
+        size     INTEGER NOT NULL,
+        width    INTEGER NOT NULL,
+        height   INTEGER NOT NULL,
+        bgra     BLOB NOT NULL,
+        saved_at INTEGER NOT NULL,
+        PRIMARY KEY (name, size)
+    );",
 ];
+
+/// An icon nobody asked for in this long is forgotten (about two months).
+const ICON_KEEP_SECS: i64 = 60 * 24 * 3600;
+
+/// A shell icon as saved: BGRA pixels with straight alpha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedIcon {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+    /// Unix seconds it was extracted.
+    pub saved_at: i64,
+}
 
 /// The migration that creates `quicklinks`: databases created before it get
 /// the default quicklinks once too, and deleting them later sticks.
@@ -286,6 +311,48 @@ impl Store {
             tx.commit()?;
         }
         Ok(Self { conn })
+    }
+
+    /// The saved icons among `names` at pixel size `size`.
+    pub fn icons(&self, names: &[String], size: u32) -> Result<Vec<CachedIcon>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT width, height, bgra, saved_at FROM icons WHERE name = ?1 AND size = ?2",
+        )?;
+        let mut found = Vec::new();
+        for name in names {
+            let icon = stmt
+                .query_row(params![name, size], |row| {
+                    Ok(CachedIcon {
+                        name: name.clone(),
+                        width: row.get(0)?,
+                        height: row.get(1)?,
+                        bgra: row.get(2)?,
+                        saved_at: row.get(3)?,
+                    })
+                })
+                .optional()?;
+            found.extend(icon);
+        }
+        Ok(found)
+    }
+
+    /// Saves `icons` at pixel size `size`, replacing earlier ones, and drops
+    /// icons nobody has asked for since `ICON_KEEP_SECS` before `now`.
+    pub fn save_icons(&mut self, icons: &[CachedIcon], size: u32, now: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for icon in icons {
+            tx.execute(
+                "INSERT OR REPLACE INTO icons (name, size, width, height, bgra, saved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![icon.name, size, icon.width, icon.height, icon.bgra, now],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM icons WHERE saved_at < ?1",
+            [now - ICON_KEEP_SECS],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -1155,5 +1222,30 @@ mod tests {
         assert_eq!(store.setting("a").unwrap().as_deref(), Some("b"));
         drop(store);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn icons_are_kept_per_size_and_old_ones_dropped() {
+        let mut store = Store::open_in_memory().unwrap();
+        let icon = |name: &str| CachedIcon {
+            name: name.into(),
+            width: 1,
+            height: 1,
+            bgra: vec![1, 2, 3, 4],
+            saved_at: 0,
+        };
+        store.save_icons(&[icon("a"), icon("b")], 48, 1_000).unwrap();
+        let names = ["a".to_owned(), "c".to_owned()];
+        let found = store.icons(&names, 48).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bgra, [1, 2, 3, 4]);
+        assert_eq!(found[0].saved_at, 1_000);
+        assert!(store.icons(&names, 55).unwrap().is_empty());
+
+        store
+            .save_icons(&[icon("c")], 48, 1_000 + ICON_KEEP_SECS + 1)
+            .unwrap();
+        assert_eq!(store.icons(&names, 48).unwrap().len(), 1);
+        assert_eq!(store.icons(&names, 48).unwrap()[0].name, "c");
     }
 }
