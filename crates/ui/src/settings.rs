@@ -2003,7 +2003,26 @@ impl Settings {
             card().children(links).into_any_element(),
             section_title("Data"),
             card()
-                .child(row("Data Folder", self.data_path.clone()))
+                .child(card_row_corners(
+                    row("Data Folder", self.data_path.clone())
+                        .id("data-folder")
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(theme::SURFACE)))
+                        .on_click({
+                            let path = self.data_path.to_string();
+                            move |_, _, _| show_in_explorer(&path)
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(icon_font())
+                                .text_size(px(11.))
+                                .text_color(rgba(theme::TEXT_FAINT))
+                                .child("\u{E8A7}"),
+                        ),
+                    0,
+                    1,
+                ))
                 .into_any_element(),
         ]
     }
@@ -2194,6 +2213,20 @@ fn logo() -> Arc<Image> {
 fn open_url(url: &str) {
     // Failures are logged by `commands`; there is nowhere better to show them.
     let _ = commands::spawn(Command::OpenUrl(url.to_owned()));
+}
+
+/// Shows the database file in Explorer, selected; without it (not created,
+/// or the shown text is a message), its folder if that exists.
+fn show_in_explorer(path: &str) {
+    let path = std::path::Path::new(path);
+    let command = if path.is_file() {
+        Command::ShowInFolder(path.display().to_string())
+    } else if let Some(folder) = path.parent().filter(|folder| folder.is_dir()) {
+        Command::Open(folder.display().to_string())
+    } else {
+        return;
+    };
+    let _ = commands::spawn(command);
 }
 
 /// A row that opens `url`: a glyph, the title, and an arrow for leaving the app.
