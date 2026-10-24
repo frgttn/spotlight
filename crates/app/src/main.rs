@@ -43,7 +43,7 @@ use spotlight_platform_win::{
 use spotlight_providers::{Builtins, clipboard::ClipboardHistory, web::Web};
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
-    launcher::{self, Launcher, OpenSettings, Quit},
+    launcher::{self, Launcher, OpenSettings, Quit, WindowMode},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
     text_input,
 };
@@ -54,6 +54,8 @@ use crate::tray::{Command, Tray};
 const HOTKEY_SETTING: &str = "hotkey";
 /// `settings` key: `"true"` or `"false"`; missing means on.
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
+/// `settings` key: `WindowMode`'s setting form; missing means expanded.
+const WINDOW_MODE_SETTING: &str = "window_mode";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
@@ -79,6 +81,7 @@ struct AppState {
     hotkeys: hotkey::Service,
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
+    window_mode: Cell<WindowMode>,
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
@@ -138,6 +141,15 @@ fn main() {
             .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
+    let window_mode = setting(WINDOW_MODE_SETTING)
+        .and_then(|text| {
+            let mode = WindowMode::from_setting(&text);
+            if mode.is_none() {
+                eprintln!("[spotlight] ignoring unknown window mode {text:?}");
+            }
+            mode
+        })
+        .unwrap_or_default();
     let search_engine = setting(SEARCH_ENGINE_SETTING)
         .and_then(|text| {
             let engine = SearchEngine::from_setting(&text);
@@ -259,7 +271,8 @@ fn main() {
             )
             .expect("failed to open the launcher window");
         window
-            .update(cx, |launcher, _, _| {
+            .update(cx, |launcher, _, cx| {
+                launcher.set_window_mode(window_mode, cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 // The self-test runs beside a normal instance, which expands them.
@@ -301,6 +314,7 @@ fn main() {
             hotkeys: hotkeys.clone(),
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
+            window_mode: Cell::new(window_mode),
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
@@ -429,6 +443,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkeys.clone(),
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
+                view_state.window_mode.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
@@ -491,6 +506,14 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
             save_setting(state, SMOOTH_SCROLLING_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::WindowModeChanged(mode) => {
+            state.window_mode.set(*mode);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.set_window_mode(*mode, cx))
+                .ok();
+            save_setting(state, WINDOW_MODE_SETTING, mode.to_setting().to_owned(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
             if *id == CLIPBOARD_PROVIDER {

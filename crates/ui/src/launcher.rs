@@ -82,6 +82,8 @@ const ICON_SIZE: f32 = 26.;
 const ICON_EXTRACT_SIZE: f32 = 44.;
 /// Launcher window size in logical (96-DPI) pixels.
 pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+/// The collapsed window's height in compact mode: just the search row.
+const COMPACT_HEIGHT: f32 = 52.;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
@@ -238,6 +240,33 @@ struct Stats {
     paint: Rc<RefCell<PaintProbe>>,
 }
 
+/// How the window opens, as set in Settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowMode {
+    /// Just the search field until there is something to show: a query, a
+    /// view, or ↓ to see root search's results.
+    Compact,
+    #[default]
+    Expanded,
+}
+
+impl WindowMode {
+    pub fn to_setting(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    pub fn from_setting(text: &str) -> Option<Self> {
+        match text {
+            "compact" => Some(Self::Compact),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
+}
+
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
@@ -282,6 +311,14 @@ pub struct Launcher {
     /// Ranks the rows of a list opened from root search.
     list_searcher: Searcher,
     visible: bool,
+    window_mode: WindowMode,
+    /// ↓ showed root search's results in compact mode; typing clears it.
+    revealed: bool,
+    /// The window currently has the collapsed (search field only) height.
+    window_collapsed: bool,
+    /// Stays up when it loses focus. For the self-test, which runs beside
+    /// the window that has it.
+    pinned: bool,
     /// The window that was active when the launcher opened, to paste into
     /// and read the selected text from.
     previous_window: isize,
@@ -326,10 +363,11 @@ impl Launcher {
                 |this, _, _: &text_input::Changed, window, cx| this.query_changed(window, cx),
             ),
             cx.observe_window_activation(window, |this, window, cx| {
-                if this.visible && !window.is_window_active() {
+                if this.visible && !this.pinned && !window.is_window_active() {
                     this.hide(cx);
                 }
             }),
+            cx.observe_self(Self::sync_window_height),
         ];
 
         if synthetic > 0 {
@@ -416,6 +454,10 @@ impl Launcher {
             grid_scroll: UniformListScrollHandle::new(),
             list_searcher: Searcher::default(),
             visible: false,
+            window_mode: WindowMode::default(),
+            revealed: false,
+            window_collapsed: false,
+            pinned: false,
             previous_window: 0,
             selection_copy: true,
             expander: None,
@@ -648,6 +690,61 @@ impl Launcher {
         cx.notify();
     }
 
+    pub fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
+        self.window_mode = mode;
+        if !self.visible && self.hud.is_none() {
+            self.prepare_next_show(cx);
+        }
+        cx.notify();
+    }
+
+    /// In compact mode, the window shows only the search field: root search
+    /// with nothing typed, and nothing asked for with ↓ or Ctrl+K.
+    fn collapsed(&self, cx: &App) -> bool {
+        self.window_mode == WindowMode::Compact
+            && !self.revealed
+            && self.screens.is_empty()
+            && self.panel.is_none()
+            && self.editor.is_none()
+            && self.input.read(cx).text().is_empty()
+    }
+
+    /// Grows or shrinks the window when [`Self::collapsed`] changes; runs
+    /// after every notify.
+    fn sync_window_height(&mut self, cx: &mut Context<Self>) {
+        let collapsed = self.collapsed(cx);
+        if !self.visible || self.hud.is_some() || collapsed == self.window_collapsed {
+            return;
+        }
+        self.window_collapsed = collapsed;
+        self.resize_window(cx);
+        cx.notify();
+    }
+
+    /// Gives the window the size `window_collapsed` says, from a task of its
+    /// own (see [`win::resize`]). Read when it runs: the HUD may have taken
+    /// the window meanwhile, and keeps its own size.
+    fn resize_window(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let target = this.read_with(cx, |this, _| {
+                this.hud
+                    .is_none()
+                    .then_some((this.hwnd, this.window_collapsed))
+            });
+            if let Ok(Some((hwnd, collapsed))) = target {
+                win::resize(hwnd, WINDOW_SIZE, collapsed.then_some(COMPACT_HEIGHT));
+            }
+        })
+        .detach();
+    }
+
+    /// While hidden, the window takes the size it opens with next, so that
+    /// `show` doesn't change it (GPUI would miss that).
+    fn prepare_next_show(&mut self, cx: &mut Context<Self>) {
+        self.window_collapsed = self.window_mode == WindowMode::Compact;
+        self.resize_window(cx);
+    }
+
     /// Shown in the footer.
     pub fn set_hotkey_label(&mut self, label: SharedString, cx: &mut Context<Self>) {
         self.stats.hotkey = label;
@@ -772,6 +869,7 @@ impl Launcher {
     fn query_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let changed_at = Instant::now();
         let query = self.query(cx);
+        self.revealed = false;
         let filter_ms = self.refilter(&query);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
@@ -830,6 +928,11 @@ impl Launcher {
         )
     }
 
+    /// Keeps the window up when it loses focus. For the self-test.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
+
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -885,9 +988,15 @@ impl Launcher {
         }
         self.input.update(cx, |input, cx| input.clear(cx));
         self.stats.filter_ms = Some(self.refilter(""));
+        self.revealed = false;
+        self.window_collapsed = self.collapsed(cx);
         // Explicit size: with `show: false` GPUI defers its own placement to
         // `activate()`, which we bypass, so the window would keep CW_USEDEFAULT.
-        win::show_on_active_monitor(self.hwnd, Some(WINDOW_SIZE));
+        win::show_on_active_monitor(
+            self.hwnd,
+            Some(WINDOW_SIZE),
+            self.window_collapsed.then_some(COMPACT_HEIGHT),
+        );
         self.visible = true;
         window.focus(&self.input.focus_handle(cx));
 
@@ -916,6 +1025,7 @@ impl Launcher {
         self.forget_preview_image();
         win::hide(self.hwnd);
         self.visible = false;
+        self.prepare_next_show(cx);
         cx.notify();
     }
 
@@ -923,6 +1033,11 @@ impl Launcher {
         if let Some(action) = self.panel {
             let count = self.selected_actions().len();
             self.panel = Some((action + 1).min(count.saturating_sub(1)));
+            cx.notify();
+            return;
+        }
+        if self.collapsed(cx) {
+            self.revealed = true;
             cx.notify();
             return;
         }
@@ -1026,6 +1141,10 @@ impl Launcher {
     /// Enter: saves the alias being edited, or runs the action picked in the
     /// panel, the one waiting for a second Enter, or the primary action.
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing is selected that the user can see.
+        if self.collapsed(cx) {
+            return;
+        }
         match &self.editor {
             Some(Editor::Alias { .. }) => return self.save_alias(window, cx),
             // The recorder hook takes every key; Enter can't arrive, but just in case.
@@ -1065,7 +1184,7 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.panel.is_some() || self.editor.is_some() {
+        if self.panel.is_some() || self.editor.is_some() || self.collapsed(cx) {
             return;
         }
         // A form's submit: Enter can't be it in a text area, where it starts
@@ -1672,6 +1791,7 @@ impl Launcher {
             this.update(cx, |this, cx| {
                 if this.hud_generation == generation && this.hud.take().is_some() {
                     win::hide(this.hwnd);
+                    this.prepare_next_show(cx);
                     cx.notify();
                 }
             })
@@ -1751,7 +1871,8 @@ impl Launcher {
     }
 
     /// Esc closes the alias editor or the action panel first, then goes back
-    /// from an opened list to root search, then hides the window.
+    /// from an opened list to root search, then collapses compact mode's
+    /// results shown with ↓, then hides the window.
     fn dismiss(&mut self, _: &Dismiss, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             self.close_editor(Some(window), cx);
@@ -1759,6 +1880,9 @@ impl Launcher {
             cx.notify();
         } else if !self.screens.is_empty() {
             self.pop_screen(window, cx);
+        } else if self.revealed && self.query(cx).is_empty() {
+            self.revealed = false;
+            cx.notify();
         } else {
             self.hide(cx);
         }
@@ -2155,6 +2279,28 @@ impl Launcher {
             })
     }
 
+    fn render_footer(&self) -> impl IntoElement {
+        div()
+            .h(px(30.))
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_4()
+            .bg(rgba(0x00000033))
+            .text_size(px(11.))
+            .text_color(rgba(0xffffff80))
+            .child(match &self.toast {
+                Some(toast) => div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(rgba(theme::SUCCESS))
+                    .child(toast.clone()),
+                None => div().flex_1().min_w_0().truncate().child(self.footer()),
+            })
+            .child(self.footer_hints())
+    }
+
     /// Paint-probe values here lag one frame (they are recorded while painting).
     fn footer(&self) -> String {
         let memory = metrics::memory();
@@ -2202,6 +2348,7 @@ impl Render for Launcher {
                 .into_any_element();
         }
         self.drop_stale_images(window);
+        let collapsed = self.window_collapsed;
         // Both run, so neither waits on the other's frame.
         let detail_moving = self.tick_detail_scroll();
         if self.scroll.tick() || detail_moving {
@@ -2372,29 +2519,11 @@ impl Render for Launcher {
                             }),
                     }),
             )
-            .child(div().h(px(1.)).bg(rgba(0xffffff14)))
-            .child(results)
-            .child(
-                div()
-                    .h(px(30.))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .bg(rgba(0x00000033))
-                    .text_size(px(11.))
-                    .text_color(rgba(0xffffff80))
-                    .child(match &self.toast {
-                        Some(toast) => div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(rgba(theme::SUCCESS))
-                            .child(toast.clone()),
-                        None => div().flex_1().min_w_0().truncate().child(self.footer()),
-                    })
-                    .child(self.footer_hints()),
-            )
+            .when(!collapsed, |root| {
+                root.child(div().h(px(1.)).bg(rgba(0xffffff14)))
+                    .child(results)
+                    .child(self.render_footer())
+            })
             .when_some(self.panel, |root, selected| {
                 root.child(self.render_panel(selected, cx))
             })

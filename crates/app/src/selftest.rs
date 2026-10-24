@@ -15,7 +15,7 @@ use spotlight_core::{
     view::{Field, FieldKind, FieldValue, FormView, View},
 };
 use spotlight_platform_win::metrics::{self, selftest::*};
-use spotlight_ui::launcher::Launcher;
+use spotlight_ui::launcher::{Launcher, WindowMode};
 
 pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     let executor = cx.background_executor().clone();
@@ -256,6 +256,9 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
 
     window.update(cx, |launcher, _, cx| launcher.hide(cx)).ok();
 
+    let compact = compact_round_trip(window, cx).await;
+    eprintln!("[selftest] compact mode: {compact}");
+
     // The HUD, for a look from outside: the line below says when it's up.
     sleep(SETTLE_MS).await;
     window
@@ -274,6 +277,74 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         summary.print(startup, idle);
     }
     cx.update(|cx| cx.quit()).ok();
+}
+
+/// Opens the launcher in compact mode and checks the window's height as it
+/// collapses and grows: search field only, ↓ shows the results, Esc hides
+/// them, typing shows them, clearing the query hides them. Returns how far
+/// it got, with the heights seen.
+async fn compact_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    let executor = cx.background_executor().clone();
+    let height = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |_, window, _| f32::from(window.viewport_size().height))
+            .unwrap_or_default()
+    };
+    // Set apart from showing, as in Settings: the hidden window takes the
+    // collapsed size meanwhile.
+    window
+        .update(cx, |launcher, _, cx| {
+            launcher.set_window_mode(WindowMode::Compact, cx);
+            launcher.set_pinned(true);
+        })
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.show(Instant::now(), window, cx)
+        })
+        .ok();
+    executor.timer(Duration::from_millis(SETTLE_MS)).await;
+    let mut seen = Vec::new();
+    // (step, whether the results should show)
+    let steps: [(&str, bool); 5] = [
+        ("open", false),
+        ("down", true),
+        ("escape", false),
+        ("type", true),
+        ("ctrl-backspace", false),
+    ];
+    let mut result = "OK".to_owned();
+    for (step, expanded) in steps {
+        match step {
+            "open" => {}
+            "type" => {
+                window
+                    .update(cx, |launcher, window, cx| {
+                        launcher.type_text("code", window, cx)
+                    })
+                    .ok();
+            }
+            keys => {
+                press(window, keys, cx);
+            }
+        }
+        executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        let height = height(cx);
+        seen.push(format!("{step} {height:.0}"));
+        // Collapsed is the search row alone (52); expanded is hundreds.
+        if (height > 100.) != expanded && result == "OK" {
+            result = format!("FAIL at {step}");
+        }
+    }
+    window
+        .update(cx, |launcher, _, cx| {
+            launcher.set_pinned(false);
+            launcher.hide(cx);
+            launcher.set_window_mode(WindowMode::Expanded, cx);
+        })
+        .ok();
+    format!("{result} ({})", seen.join(", "))
 }
 
 /// Sends `keystroke` through GPUI's key dispatch, as a real key press arrives.

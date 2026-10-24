@@ -31,7 +31,7 @@ use spotlight_platform_win::{
 };
 
 use crate::{
-    launcher::{ExtensionItem, Shortcut, Source, icon_font},
+    launcher::{ExtensionItem, Shortcut, Source, WindowMode, icon_font},
     smooth_scroll::{Scroller, capture_wheel},
     text_input::{self, TextInput},
     theme,
@@ -75,6 +75,8 @@ pub enum SettingsEvent {
     /// The launcher hotkey is now this one; persist it and update labels.
     HotkeyChanged(Hotkey),
     SmoothScrollingChanged(bool),
+    /// The launcher opens in this mode from now on.
+    WindowModeChanged(WindowMode),
     /// The web search engine is now this one; switch to it and save it.
     SearchEngineChanged(SearchEngine),
     /// The clipboard history now keeps this much; trim it and save it.
@@ -127,6 +129,7 @@ pub struct Settings {
     /// Outcome of the last change in the list: item id, text, and whether it is an error.
     shortcut_message: Option<(String, SharedString, bool)>,
     smooth_scrolling: bool,
+    window_mode: WindowMode,
     search_engine: SearchEngine,
     /// The custom search URL field: shown while a custom engine is in use
     /// or being set up.
@@ -172,6 +175,7 @@ impl Settings {
         hotkeys: hotkey::Service,
         hotkey: Option<Hotkey>,
         smooth_scrolling: bool,
+        window_mode: WindowMode,
         search_engine: SearchEngine,
         clipboard_retention: Retention,
         win_v: bool,
@@ -233,6 +237,7 @@ impl Settings {
             editing_alias: None,
             shortcut_message: None,
             smooth_scrolling,
+            window_mode,
             custom_engine: match &search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
                 SearchEngine::Preset(_) => None,
@@ -587,6 +592,106 @@ impl Settings {
         self.page_scroll.set_enabled(self.smooth_scrolling);
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
         cx.notify();
+    }
+
+    fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
+        if mode != self.window_mode {
+            self.window_mode = mode;
+            cx.emit(SettingsEvent::WindowModeChanged(mode));
+            cx.notify();
+        }
+    }
+
+    /// The two window modes side by side, each a small picture of the window.
+    fn window_mode_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let choices = [WindowMode::Compact, WindowMode::Expanded].map(|mode| {
+            let selected = mode == self.window_mode;
+            let (id, label) = match mode {
+                WindowMode::Compact => ("window-compact", "Compact"),
+                WindowMode::Expanded => ("window-expanded", "Expanded"),
+            };
+            // The launcher in miniature: a search bar, or a whole window.
+            let window = div()
+                .w(px(if mode == WindowMode::Compact {
+                    76.
+                } else {
+                    92.
+                }))
+                .h(px(if mode == WindowMode::Compact { 9. } else { 50. }))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(rgba(theme::SURFACE_BORDER))
+                .bg(rgba(theme::PANEL))
+                .flex()
+                .flex_col()
+                .child(
+                    div().h(px(7.)).px(px(4.)).flex().items_center().child(
+                        div()
+                            .w(px(24.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(rgba(theme::TEXT_FAINT)),
+                    ),
+                )
+                .when(mode == WindowMode::Expanded, |window| {
+                    window
+                        .child(div().h(px(1.)).bg(rgba(theme::HAIRLINE)))
+                        .children([40., 52., 34.].map(|width| {
+                            div().h(px(8.)).px(px(4.)).flex().items_center().child(
+                                div()
+                                    .w(px(width))
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(rgba(theme::SURFACE_HOVER)),
+                            )
+                        }))
+                });
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1p5()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.set_window_mode(mode, cx)))
+                .child(
+                    div()
+                        .w(px(132.))
+                        .h(px(76.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.))
+                        .border_2()
+                        .border_color(rgba(if selected {
+                            theme::ACCENT
+                        } else {
+                            theme::SURFACE_BORDER
+                        }))
+                        .bg(rgba(if selected {
+                            theme::ACCENT_SOFT
+                        } else {
+                            theme::SURFACE
+                        }))
+                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                        .child(window),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .rounded(px(5.))
+                        .text_size(px(12.))
+                        .line_height(px(20.))
+                        .when(selected, |label| label.bg(rgba(theme::SURFACE_HOVER)))
+                        .text_color(rgba(if selected {
+                            theme::TEXT
+                        } else {
+                            theme::TEXT_MUTED
+                        }))
+                        .child(label),
+                )
+        });
+        div().flex_none().flex().gap_3().children(choices)
     }
 
     fn toggle_source(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1642,6 +1747,15 @@ impl Settings {
                 .into_any_element(),
             section_title("Appearance"),
             card()
+                .child(
+                    row(
+                        "Window Mode",
+                        "Compact shows only the search field until you type or press ↓.",
+                    )
+                    .py_3()
+                    .child(self.window_mode_control(cx)),
+                )
+                .child(divider())
                 .child(
                     row(
                         "Smooth Scrolling",

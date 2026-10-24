@@ -23,13 +23,13 @@ use windows::{
             Threading::GetCurrentProcessId,
         },
         UI::{
-            HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
+            HiDpi::{GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI},
             WindowsAndMessaging::{
                 EnumWindows, GW_OWNER, GWL_EXSTYLE, GetCursorPos, GetWindow, GetWindowLongPtrW,
                 GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST,
                 IsWindowVisible, SET_WINDOW_POS_FLAGS, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SW_HIDE,
-                SW_SHOW, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-                SetWindowPos, ShowWindow, WS_EX_TOOLWINDOW,
+                SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+                SetForegroundWindow, SetWindowPos, ShowWindow, WS_EX_TOOLWINDOW,
             },
         },
     },
@@ -109,12 +109,21 @@ pub fn round_corners(raw: isize) {
     }
 }
 
-/// Shows the window topmost, horizontally centered and a fifth of the way down
+/// Shows the window topmost, centered (as Raycast places it) in
 /// the work area of the monitor under the mouse cursor, then takes focus.
 ///
 /// `logical_size` (in 96-DPI units) is scaled by that monitor's DPI and applied;
-/// pass `None` to keep the window's current size.
-pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
+/// pass `None` to keep the window's current size. With `client_height`, the
+/// window is placed as if it had `logical_size` but is only that tall inside
+/// (a collapsed launcher), so growing it later keeps its top edge.
+///
+/// GPUI misses a size change made here while it updates the window (see
+/// [`resize`]), so the window should already have the size asked for.
+pub fn show_on_active_monitor(
+    raw: isize,
+    logical_size: Option<(f32, f32)>,
+    client_height: Option<f32>,
+) {
     unsafe {
         let hwnd = hwnd(raw);
         let mut cursor = POINT::default();
@@ -142,7 +151,15 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
             };
             let work = info.rcWork;
             let x = work.left + (work.right - work.left - width) / 2;
-            let y = work.top + (work.bottom - work.top - height) / 5;
+            let y = work.top + (work.bottom - work.top - height) / 2;
+            let height = match client_height {
+                Some(client_height) => {
+                    let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+                    let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+                    window_height_for_client(client_height, dpi_x)
+                }
+                None => height,
+            };
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -158,6 +175,51 @@ pub fn show_on_active_monitor(raw: isize, logical_size: Option<(f32, f32)>) {
         // Allowed because our process just received the hotkey input event.
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+/// Changes the window's size, keeping its top-left corner and z-order.
+/// `logical_size` and `client_height` are as for [`show_on_active_monitor`].
+///
+/// GPUI learns the new size from WM_SIZE, which it can only take while no
+/// update of the window is running: call this from a spawned task, as GPUI's
+/// own resize does, or its layout keeps the old size.
+pub fn resize(raw: isize, logical_size: (f32, f32), client_height: Option<f32>) {
+    unsafe {
+        let hwnd = hwnd(raw);
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let scale = dpi as f32 / 96.;
+        let width = (logical_size.0 * scale).round() as i32;
+        let height = match client_height {
+            Some(client_height) => window_height_for_client(client_height, dpi),
+            None => (logical_size.1 * scale).round() as i32,
+        };
+        if (width, height) == (rect.right - rect.left, rect.bottom - rect.top) {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The window height whose client area is `logical_height` tall: GPUI insets
+/// it by the resize frame at the bottom and a pixel at the top.
+fn window_height_for_client(logical_height: f32, dpi: u32) -> i32 {
+    let scale = dpi as f32 / 96.;
+    let frame = unsafe {
+        GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    };
+    (logical_height * scale).round() as i32 + scale.round() as i32 + frame
 }
 
 /// Shows the window topmost, horizontally centered near the bottom of the work
