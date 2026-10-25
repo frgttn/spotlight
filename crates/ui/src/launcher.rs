@@ -25,7 +25,7 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
     Hsla, KeyBinding, KeyDownEvent, Keystroke, RenderImage, ScrollHandle, SharedString,
     Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla, img,
-    prelude::*, px, rgb, rgba, uniform_list,
+    prelude::*, px, relative, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -56,7 +56,7 @@ use self::{
     views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
 };
 use crate::{
-    smooth_scroll::{SmoothScroll, capture_wheel},
+    smooth_scroll::{SmoothScroll, capture_wheel, drag_track},
     text_input::{self, TextInput},
     theme,
 };
@@ -3599,12 +3599,51 @@ impl Render for Launcher {
                 true
             });
 
+            // A thin thumb at the right edge when there is more to scroll to.
+            // Its size needs the list's height: until GPUI has laid it out,
+            // draw again once it has.
+            if !self.scroll.is_laid_out() {
+                window.request_animation_frame();
+            }
+            // It can be dragged, and a click on its track jumps there.
+            let dragging = self.scroll.is_dragging();
+            let thumb = self.scroll.thumb(self.line_count()).map(|(top, length)| {
+                div()
+                    .id("scroll-track")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(12.))
+                    .group("scroll-track")
+                    .child(
+                        div()
+                            .absolute()
+                            .top(relative(top))
+                            .h(relative(length))
+                            .right(px(3.))
+                            .w(px(if dragging { 6. } else { 4. }))
+                            .py(px(4.))
+                            .group_hover("scroll-track", |thumb| thumb.w(px(6.)))
+                            .child(div().size_full().rounded_full().bg(rgba(if dragging {
+                                0xffffff66
+                            } else {
+                                0xffffff33
+                            }))),
+                    )
+                    .child(drag_track(cx.entity().downgrade(), |this: &mut Self| {
+                        let rows = this.line_count();
+                        (&mut this.scroll, rows)
+                    }))
+            });
+
             div()
                 .flex_1()
                 .relative()
                 .overflow_hidden()
                 .child(list)
                 .child(wheel)
+                .children(thumb)
                 .into_any_element()
         };
         // Lists with previews (clipboard history): rows on the left, the
