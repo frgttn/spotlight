@@ -47,7 +47,7 @@ use spotlight_platform_win::{
     selection, win,
     wm::{self, RunningApp},
 };
-use spotlight_search::{Candidate, RootSearch, Row, Searcher};
+use spotlight_search::{Candidate, RootSearch, Row, Searcher, Split};
 use spotlight_store::{CachedIcon, Calculation, Store};
 
 use self::{
@@ -81,19 +81,24 @@ actions!(
 );
 
 const CONTEXT: &str = "Launcher";
-const ROW_HEIGHT: f32 = 44.;
+const ROW_HEIGHT: f32 = 40.;
 /// Space above the first and below the last row.
 const LIST_PADDING: f32 = 4.;
+/// How much of a list's first line is hidden when it is a section heading,
+/// so the heading sits close to the search field, not a whole row below it.
+const HEADING_TRIM: f32 = 10.;
 /// Row icon size in logical pixels.
-const ICON_SIZE: f32 = 26.;
+const ICON_SIZE: f32 = 22.;
 /// Icons are extracted at the grid's tile size, so tiles are sharp too.
 const ICON_EXTRACT_SIZE: f32 = 44.;
 /// A saved icon older than this is extracted again (an app update may change it).
 const ICON_REFRESH_SECS: i64 = 7 * 24 * 3600;
 /// Launcher window size in logical (96-DPI) pixels.
-pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+pub const WINDOW_SIZE: (f32, f32) = (750., 475.);
 /// The collapsed window's height in compact mode: just the search row.
-const COMPACT_HEIGHT: f32 = 52.;
+const COMPACT_HEIGHT: f32 = 64.;
+/// How many recently used items root search suggests before anything is typed.
+const SUGGESTIONS: usize = 8;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
@@ -184,6 +189,10 @@ enum EntryKind {
     CopyDeeplink,
     /// Asks again before the item opens from a link.
     DistrustLink,
+    /// Adds the item to the favorites, or takes it out.
+    ToggleFavorite,
+    /// Moves a favorite up (-1) or down (1).
+    MoveFavorite(isize),
 }
 
 impl Entry {
@@ -313,6 +322,124 @@ impl WindowMode {
     }
 }
 
+/// What root search lists below its suggestions before anything is typed,
+/// each kind under its own heading; any of them can be hidden in Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeSection {
+    Commands,
+    Applications,
+    Quicklinks,
+    Snippets,
+    Games,
+    SystemSettings,
+    ControlPanel,
+}
+
+impl HomeSection {
+    /// In the order root search lists them.
+    pub const ALL: [Self; 7] = [
+        Self::Commands,
+        Self::Applications,
+        Self::Quicklinks,
+        Self::Snippets,
+        Self::Games,
+        Self::SystemSettings,
+        Self::ControlPanel,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Commands => "Commands",
+            Self::Applications => "Applications",
+            Self::Quicklinks => "Quicklinks",
+            Self::Snippets => "Snippets",
+            Self::Games => "Games",
+            Self::SystemSettings => "System Settings",
+            Self::ControlPanel => "Control Panel",
+        }
+    }
+
+    pub fn to_setting(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Applications => "apps",
+            Self::Quicklinks => "quicklinks",
+            Self::Snippets => "snippets",
+            Self::Games => "games",
+            Self::SystemSettings => "settings",
+            Self::ControlPanel => "control-panel",
+        }
+    }
+
+    pub fn from_setting(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|section| section.to_setting() == text)
+    }
+
+    /// The section catalog item `id` is listed in.
+    fn of(id: &str) -> Self {
+        match kind_of(id) {
+            "Application" => Self::Applications,
+            "Game" => Self::Games,
+            "System Setting" => Self::SystemSettings,
+            "Control Panel" => Self::ControlPanel,
+            "Quicklink" => Self::Quicklinks,
+            "Snippet" => Self::Snippets,
+            _ => Self::Commands,
+        }
+    }
+}
+
+/// How dense the launcher's tint over its blurred background is, in percent:
+/// [`Self::MIN`] lets the most of what's behind show through, 100 none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowOpacity(u8);
+
+impl Default for WindowOpacity {
+    fn default() -> Self {
+        Self(97)
+    }
+}
+
+impl WindowOpacity {
+    pub const MIN: u8 = 80;
+    pub const MAX: u8 = 100;
+
+    pub fn new(percent: u8) -> Self {
+        Self(percent.clamp(Self::MIN, Self::MAX))
+    }
+
+    pub fn percent(self) -> u8 {
+        self.0
+    }
+
+    /// The tint drawn over the blur, over a background `behind` this bright
+    /// (0 black, 1 white): this option's own density, or denser where that
+    /// would leave the window brighter than [`MAX_BRIGHTNESS`] — a light
+    /// background, blurred, stays light, and would turn the window grey.
+    pub fn tint(self, behind: Option<f32>) -> u32 {
+        /// The tint's colour, `0x1c`, as brightness.
+        const TINT: f32 = 28. / 255.;
+        const MAX_BRIGHTNESS: f32 = 0.24;
+        let own = f32::from(self.0) / 100.;
+        let needed = match behind {
+            Some(behind) if behind > MAX_BRIGHTNESS => (behind - MAX_BRIGHTNESS) / (behind - TINT),
+            _ => 0.,
+        };
+        let alpha = own.max(needed).min(1.);
+        0x1c1c1e00 | (alpha * 255.).round() as u32
+    }
+
+    pub fn to_setting(self) -> String {
+        self.0.to_string()
+    }
+
+    pub fn from_setting(text: &str) -> Option<Self> {
+        text.parse().ok().map(Self::new)
+    }
+}
+
 /// How long the list of installed games is trusted before the next show reads it again.
 const GAMES_REFRESH: Duration = Duration::from_secs(60);
 
@@ -371,6 +498,17 @@ pub struct Launcher {
     store: Option<Arc<Mutex<Store>>>,
     /// Item id → the user's alias for it.
     aliases: HashMap<String, String>,
+    /// Ids of the items pinned to the top of root search, in order.
+    favorites: Vec<String>,
+    /// Where root search's sections start, by row, with their headings.
+    sections: Vec<(usize, SharedString)>,
+    /// Whether the footer shows timings and memory (`SPOTLIGHT_STATS=1`).
+    show_stats: bool,
+    /// The kinds of items root search doesn't list before anything is typed.
+    hidden_sections: Vec<HomeSection>,
+    opacity: WindowOpacity,
+    /// How bright the screen was under the window when it last showed.
+    behind: Option<f32>,
     /// Item id → its registered hotkey.
     item_hotkeys: HashMap<String, Hotkey>,
     hotkeys: hotkey::Service,
@@ -444,6 +582,7 @@ impl Launcher {
             other => panic!("expected a Win32 window handle, got {other:?}"),
         };
         win::round_corners(hwnd);
+        win::set_border_color(hwnd, theme::WINDOW_BORDER);
 
         let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
         let panel_input = cx.new(|cx| TextInput::new("Search for actions…", cx));
@@ -484,6 +623,10 @@ impl Launcher {
             .as_ref()
             .and_then(|store| store.lock().ok()?.setting(links::TRUSTED_SETTING).ok()?)
             .map(|setting| links::parse_trusted(&setting).collect())
+            .unwrap_or_default();
+        let favorites = store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.favorites().ok())
             .unwrap_or_default();
         let (aliases, saved_hotkeys) = store
             .as_ref()
@@ -557,6 +700,12 @@ impl Launcher {
             store,
             aliases,
             item_hotkeys,
+            favorites,
+            sections: Vec::new(),
+            show_stats: std::env::var_os("SPOTLIGHT_STATS").is_some(),
+            hidden_sections: Vec::new(),
+            opacity: WindowOpacity::default(),
+            behind: None,
             hotkeys,
             editor: None,
             screens: Vec::new(),
@@ -922,6 +1071,18 @@ impl Launcher {
         cx.notify();
     }
 
+    pub fn set_hidden_sections(&mut self, hidden: Vec<HomeSection>, cx: &mut Context<Self>) {
+        self.hidden_sections = hidden;
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+    }
+
+    pub fn set_window_opacity(&mut self, opacity: WindowOpacity, cx: &mut Context<Self>) {
+        self.opacity = opacity;
+        cx.notify();
+    }
+
     pub fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
         self.window_mode = mode;
         if !self.visible && self.hud.is_none() {
@@ -994,6 +1155,8 @@ impl Launcher {
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
+        let home = (self.screens.is_empty() && query.trim().is_empty()).then(|| self.home());
+        let mut split = None;
         let Self {
             screens,
             list_searcher,
@@ -1036,14 +1199,19 @@ impl Launcher {
                     found.chain(std::iter::once(open)).collect()
                 }
             }
-            None => search.search(
-                query,
-                |id| match frecency.get(id) {
-                    Some(used) if *rank_by_usage => used.score_at(now),
-                    _ => 0.,
-                },
-                aliases,
-            ),
+            None if let Some((rows, _)) = &home => rows.clone(),
+            None => {
+                let rows = search.search(
+                    query,
+                    |id| match frecency.get(id) {
+                        Some(used) if *rank_by_usage => used.score_at(now),
+                        _ => 0.,
+                    },
+                    aliases,
+                );
+                split = Some(search.last_split());
+                rows
+            }
             // The provider ranked them for this query (or is about to).
             Some(Screen::List { view, .. }) if view.live => view
                 .items
@@ -1073,11 +1241,132 @@ impl Launcher {
             }
             Some(_) => Vec::new(),
         };
+        self.sections = match (home, split) {
+            (Some((_, sections)), _) => sections,
+            (None, Some(split)) => self.result_sections(split, query),
+            _ => Vec::new(),
+        };
         self.selected = 0;
         self.panel = None;
         self.confirming = None;
         self.scroll.reset();
         ms(started.elapsed())
+    }
+
+    /// Root search before anything is typed: the favorites, the items used
+    /// most lately (with Rank by Usage on), then everything else by kind,
+    /// each under its heading.
+    fn home(&self) -> (Vec<Row>, Vec<(usize, SharedString)>) {
+        let catalog = self.search.catalog();
+        let index = |id: &str| catalog.iter().position(|item| item.id == id);
+        let mut rows: Vec<usize> = Vec::new();
+        let mut sections = Vec::new();
+        let mut section = |title: &str, found: Vec<usize>, rows: &mut Vec<usize>| {
+            if !found.is_empty() {
+                sections.push((rows.len(), SharedString::from(title.to_owned())));
+                rows.extend(found);
+            }
+        };
+        let favorites: Vec<usize> = self.favorites.iter().filter_map(|id| index(id)).collect();
+        section("Favorites", favorites, &mut rows);
+        let now = frecency::now();
+        let mut used: Vec<(f64, usize)> = catalog
+            .iter()
+            .enumerate()
+            .filter(|_| self.rank_by_usage)
+            .filter(|(ix, _)| !rows.contains(ix))
+            .filter_map(|(ix, item)| {
+                let score = self.frecency.get(&item.id)?.score_at(now);
+                (score > 0.).then_some((score, ix))
+            })
+            .collect();
+        used.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let suggested = used
+            .into_iter()
+            .take(SUGGESTIONS)
+            .map(|(_, ix)| ix)
+            .collect();
+        section("Suggestions", suggested, &mut rows);
+        let mut kinds = vec![Vec::new(); HomeSection::ALL.len()];
+        for (ix, item) in catalog.iter().enumerate() {
+            if !rows.contains(&ix) {
+                kinds[HomeSection::of(&item.id) as usize].push(ix);
+            }
+        }
+        for (kind, mut found) in HomeSection::ALL.into_iter().zip(kinds) {
+            if self.hidden_sections.contains(&kind) {
+                continue;
+            }
+            found.sort_by_cached_key(|&ix| catalog[ix].title.to_lowercase());
+            section(kind.title(), found, &mut rows);
+        }
+        (rows.into_iter().map(Row::Catalog).collect(), sections)
+    }
+
+    /// The headings of a search's rows: what its answers are (Calculator),
+    /// "Results", then what the fallbacks do with the query.
+    fn result_sections(&self, split: Split, query: &str) -> Vec<(usize, SharedString)> {
+        let mut sections = Vec::new();
+        if split.answers > 0 {
+            let title = self
+                .results
+                .first()
+                .map(|row| answers_heading(&self.item(row).id))
+                .unwrap_or("Answers");
+            sections.push((0, SharedString::from(title)));
+        }
+        if split.matches > 0 {
+            sections.push((split.answers, "Results".into()));
+        }
+        if split.fallbacks > 0 {
+            sections.push((
+                split.answers + split.matches,
+                format!("Use “{}” with…", query.trim()).into(),
+            ));
+        }
+        sections
+    }
+
+    /// Where row `row` is in the list, with the section headings counted.
+    fn line_of(&self, row: usize) -> usize {
+        row + self
+            .sections
+            .iter()
+            .filter(|(start, _)| *start <= row)
+            .count()
+    }
+
+    fn line_count(&self) -> usize {
+        self.results.len() + self.sections.len()
+    }
+
+    /// What line `line` of the list shows: a heading, or a row.
+    fn line_at(&self, line: usize) -> Line {
+        for (ix, (start, title)) in self.sections.iter().enumerate() {
+            let heading = start + ix;
+            if line < heading {
+                return Line::Row(line - ix);
+            }
+            if line == heading {
+                return Line::Heading(title.clone());
+            }
+        }
+        Line::Row(line - self.sections.len())
+    }
+
+    /// Scrolls so the selected row shows, with its heading when it starts a
+    /// section.
+    fn reveal_selected(&mut self) {
+        let line = self.line_of(self.selected);
+        let count = self.line_count();
+        let heading = self
+            .sections
+            .iter()
+            .any(|(start, _)| *start == self.selected);
+        if heading {
+            self.scroll.reveal(line - 1, count);
+        }
+        self.scroll.reveal(line, count);
     }
 
     /// The item's actions, then the ones the launcher adds to catalog items.
@@ -1120,7 +1409,30 @@ impl Launcher {
                 EntryKind::Command(Command::ForceQuit(app.pid)),
             ));
         }
+        let favorite = self.favorites.iter().position(|id| *id == item.id);
         let mut add = |entry: Entry| entries.push(entry);
+        match favorite {
+            Some(ix) => {
+                add(
+                    Entry::new("Remove from Favorites", EntryKind::ToggleFavorite)
+                        .with_shortcut(shortcut::FAVORITE),
+                );
+                if ix > 0 {
+                    add(Entry::new(
+                        "Move Up in Favorites",
+                        EntryKind::MoveFavorite(-1),
+                    ));
+                }
+                if ix + 1 < self.favorites.len() {
+                    add(Entry::new(
+                        "Move Down in Favorites",
+                        EntryKind::MoveFavorite(1),
+                    ));
+                }
+            }
+            None => add(Entry::new("Add to Favorites", EntryKind::ToggleFavorite)
+                .with_shortcut(shortcut::FAVORITE)),
+        }
         if self.aliases.contains_key(&item.id) {
             add(Entry::new("Change Alias…", EntryKind::EditAlias));
             add(Entry::new("Remove Alias", EntryKind::RemoveAlias));
@@ -1252,6 +1564,14 @@ impl Launcher {
         self.visible
     }
 
+    /// Headings of root search's sections, top first. For the self-test.
+    pub fn section_titles(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .map(|(_, title)| title.to_string())
+            .collect()
+    }
+
     /// Titles of the current results, top first. For the self-test.
     pub fn result_titles(&self) -> Vec<String> {
         self.results
@@ -1321,7 +1641,7 @@ impl Launcher {
         self.window_collapsed = self.collapsed(cx);
         // Explicit size: with `show: false` GPUI defers its own placement to
         // `activate()`, which we bypass, so the window would keep CW_USEDEFAULT.
-        win::show_on_active_monitor(
+        self.behind = win::show_on_active_monitor(
             self.hwnd,
             Some(WINDOW_SIZE),
             self.window_collapsed.then_some(COMPACT_HEIGHT),
@@ -1379,7 +1699,7 @@ impl Launcher {
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
             self.confirming = None;
-            self.scroll.reveal(self.selected, self.results.len());
+            self.reveal_selected();
             cx.notify();
         }
     }
@@ -1397,7 +1717,7 @@ impl Launcher {
         if self.selected > 0 {
             self.selected -= 1;
             self.confirming = None;
-            self.scroll.reveal(self.selected, self.results.len());
+            self.reveal_selected();
             cx.notify();
         }
     }
@@ -1652,6 +1972,8 @@ impl Launcher {
             }
             EntryKind::ClearCalculations => return self.clear_calculations(cx),
             EntryKind::OpenLink { always } => return self.open_pending_link(always, window, cx),
+            EntryKind::ToggleFavorite => return self.toggle_favorite(&id, &title, cx),
+            EntryKind::MoveFavorite(step) => return self.move_favorite(&id, step, cx),
             EntryKind::CopyDeeplink => {
                 return self.run_command(&Command::Copy(deeplink::for_item(&id)), cx);
             }
@@ -1959,6 +2281,61 @@ impl Launcher {
         self.run_prefix = prefix;
     }
 
+    /// What the search field's right end says while a prefix is typed:
+    /// where it goes, and the key that goes on there.
+    fn prefix_hint(&self, cx: &App) -> Option<(SharedString, Option<&'static str>)> {
+        if !self.screens.is_empty() {
+            return None;
+        }
+        let query = self.query(cx);
+        if file_query(&self.file_prefix, &query).is_some() {
+            return Some(("Search Files".into(), Some("Tab")));
+        }
+        spotlight_core::run::after_prefix(&self.run_prefix, &query).map(|_| ("Run".into(), None))
+    }
+
+    /// Adds item `id` to the favorites, or takes it out.
+    fn toggle_favorite(&mut self, id: &str, title: &str, cx: &mut Context<Self>) {
+        let message = if let Some(ix) = self.favorites.iter().position(|known| known == id) {
+            self.favorites.remove(ix);
+            format!("Removed {title} from Favorites")
+        } else {
+            self.favorites.push(id.to_owned());
+            format!("Added {title} to Favorites")
+        };
+        self.favorites_changed(cx);
+        self.show_toast(message.into(), cx);
+    }
+
+    /// Moves favorite `id` up (`step` -1) or down (1) among the favorites.
+    fn move_favorite(&mut self, id: &str, step: isize, cx: &mut Context<Self>) {
+        let Some(ix) = self.favorites.iter().position(|known| known == id) else {
+            return;
+        };
+        let to = ix as isize + step;
+        if to < 0 || to as usize >= self.favorites.len() {
+            return;
+        }
+        self.favorites.swap(ix, to as usize);
+        self.favorites_changed(cx);
+        // The moved item stays selected in its new place.
+        if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
+            self.selected = row;
+            self.reveal_selected();
+        }
+    }
+
+    /// Saves the favorites and shows them in their new order.
+    fn favorites_changed(&mut self, cx: &mut Context<Self>) {
+        let ids = self.favorites.clone();
+        self.persist(cx, move |store| store.set_favorites(&ids));
+        let selected = self.selected;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.selected = selected.min(self.results.len().saturating_sub(1));
+        cx.notify();
+    }
+
     pub fn set_selection_copy(&mut self, enabled: bool) {
         self.selection_copy = enabled;
     }
@@ -2174,6 +2551,7 @@ impl Launcher {
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);
             self.results = vec![Row::Catalog(ix)];
+            self.sections.clear();
             self.confirming = Some((id.to_owned(), 0));
             cx.notify();
             return;
@@ -2509,7 +2887,7 @@ impl Launcher {
         // Keep the same item selected where it now ranks.
         if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
             self.selected = row;
-            self.scroll.reveal(row, self.results.len());
+            self.reveal_selected();
         }
         cx.notify();
 
@@ -2697,6 +3075,19 @@ impl Launcher {
             item.subtitle.clone().unwrap_or_default().into()
         };
         let stacked = !subtitle.is_empty() && self.shows_previews(cx);
+        // Root search's catalog rows: the title, then where it's from, and
+        // its kind at the right; other rows keep their subtitle at the right.
+        let catalog_row = self.screens.is_empty() && matches!(self.results[row], Row::Catalog(_));
+        let notice = confirming || (selected && self.link_pending_for(&item.id));
+        let (detail, accessory): (Option<SharedString>, SharedString) = if catalog_row && !notice {
+            let kind = kind_of(&item.id);
+            (
+                detail_of(item.subtitle.as_deref(), kind).map(SharedString::from),
+                kind.into(),
+            )
+        } else {
+            (None, subtitle.clone())
+        };
 
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
@@ -2708,8 +3099,8 @@ impl Launcher {
                 .flex()
                 .items_center()
                 .gap_3()
-                .rounded(px(6.))
-                .when(selected, |row| row.bg(rgba(0xffffff1f)))
+                .rounded(px(8.))
+                .when(selected, |row| row.bg(rgba(0xffffff1c)))
                 .when(!selected, |row| {
                     row.hover(|style| style.bg(rgba(0xffffff0f)))
                 })
@@ -2756,8 +3147,28 @@ impl Launcher {
                     row.child(
                         div()
                             .flex_1()
-                            .truncate()
-                            .child(SharedString::from(item.title.clone())),
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(420.))
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .child(SharedString::from(item.title.clone())),
+                            )
+                            .when_some(detail, |title, detail| {
+                                title.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(13.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .child(detail),
+                                )
+                            }),
                     )
                 })
                 .when_some(self.aliases.get(&item.id), |row, alias| {
@@ -2780,13 +3191,13 @@ impl Launcher {
                     row.child(
                         div()
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(if confirming {
                                 rgba(theme::ERROR)
                             } else {
-                                rgba(0xffffff70)
+                                rgba(theme::TEXT_FAINT)
                             })
-                            .child(subtitle),
+                            .child(accessory),
                     )
                 }),
         )
@@ -3044,14 +3455,15 @@ impl Launcher {
 
     fn render_footer(&self) -> impl IntoElement {
         div()
-            .h(px(30.))
-            .px_4()
+            .h(px(40.))
+            .px(px(16.))
             .flex()
             .items_center()
             .gap_4()
-            .bg(rgba(0x00000033))
-            .text_size(px(11.))
-            .text_color(rgba(0xffffff80))
+            .border_t_1()
+            .border_color(rgba(theme::HAIRLINE))
+            .text_size(px(12.))
+            .text_color(rgba(theme::TEXT_MUTED))
             .child(match &self.toast {
                 Some(toast) => div()
                     .flex_1()
@@ -3059,7 +3471,14 @@ impl Launcher {
                     .truncate()
                     .text_color(rgba(theme::SUCCESS))
                     .child(toast.clone()),
-                None => div().flex_1().min_w_0().truncate().child(self.footer()),
+                None if self.show_stats => div().flex_1().min_w_0().truncate().child(self.footer()),
+                None => div().flex_1().min_w_0().child(
+                    div()
+                        .font_family(icon_font())
+                        .text_size(px(14.))
+                        .text_color(rgba(theme::TEXT_FAINT))
+                        .child(SharedString::from('\u{E721}'.to_string())),
+                ),
             })
             .child(self.footer_hints())
     }
@@ -3144,17 +3563,30 @@ impl Render for Launcher {
                 })
                 .into_any_element()
         } else {
+            let trim = if self.sections.first().is_some_and(|(start, _)| *start == 0) {
+                HEADING_TRIM
+            } else {
+                0.
+            };
+            self.scroll.set_top_inset(trim);
             let list = uniform_list(
                 "results",
-                self.results.len(),
+                self.line_count(),
                 cx.processor(|this, range: Range<usize>, _window, cx| {
                     range
-                        .map(|row| this.render_row(row, cx))
+                        .map(|line| match this.line_at(line) {
+                            Line::Row(row) => this.render_row(row, cx).into_any_element(),
+                            Line::Heading(title) => render_heading(line, title),
+                        })
                         .collect::<Vec<_>>()
                 }),
             )
             .track_scroll(self.scroll.handle())
-            .size_full()
+            .absolute()
+            .top(px(-trim))
+            .left_0()
+            .right_0()
+            .bottom_0()
             .py(px(LIST_PADDING));
 
             // Wheel notches are animated instead; everything else falls through to GPUI.
@@ -3162,7 +3594,7 @@ impl Render for Launcher {
                 if !this.scroll.is_enabled() {
                     return false;
                 }
-                this.scroll.scroll_by(delta, this.results.len());
+                this.scroll.scroll_by(delta, this.line_count());
                 cx.notify();
                 true
             });
@@ -3170,6 +3602,7 @@ impl Render for Launcher {
             div()
                 .flex_1()
                 .relative()
+                .overflow_hidden()
                 .child(list)
                 .child(wheel)
                 .into_any_element()
@@ -3218,18 +3651,29 @@ impl Render for Launcher {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(theme::BACKGROUND_TINT))
+            .bg(rgba(self.opacity.tint(self.behind)))
             .text_color(rgb(0xececec))
             .text_size(px(14.))
             .child(
                 div()
-                    .px_4()
-                    .py_3()
+                    .px(px(20.))
+                    .py(px(18.))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .text_size(px(20.))
+                    .gap_3()
+                    .text_size(px(18.))
                     .line_height(px(28.))
+                    // Root search: a search glyph, as Raycast shows its logo.
+                    .when(self.screens.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .font_family(icon_font())
+                                .text_size(px(16.))
+                                .text_color(rgba(theme::TEXT_MUTED))
+                                .child(SharedString::from('\u{E721}'.to_string())),
+                        )
+                    })
                     .map(|row| match self.screens.last() {
                         // Views without a search field show their title there.
                         Some(screen) if !screen.has_search() => row
@@ -3266,6 +3710,19 @@ impl Render for Launcher {
                                 )
                             })
                             .child(div().flex_1().min_w_0().child(self.input.clone()))
+                            .when_some(self.prefix_hint(cx), |row, (label, keys)| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(13.))
+                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .child(label)
+                                        .children(keys.map(keycaps)),
+                                )
+                            })
                             .when_some(self.filter_label(), |row, label| {
                                 row.child(
                                     div()
@@ -3293,7 +3750,7 @@ impl Render for Launcher {
                     }),
             )
             .when(!collapsed, |root| {
-                root.child(div().h(px(1.)).bg(rgba(0xffffff14)))
+                root.child(div().h(px(1.)).bg(rgba(theme::HAIRLINE)))
                     .child(results)
                     .child(self.render_footer())
             })
@@ -3315,6 +3772,73 @@ impl Render for Launcher {
 
 /// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
 /// contain `+` (the plus key displays as `=`, the same key).
+/// A line of the result list: a section heading, or a row of the results.
+enum Line {
+    Heading(SharedString),
+    Row(usize),
+}
+
+/// A section heading, as tall as a row so the list's lines stay uniform;
+/// the text sits at the bottom, close to the rows it heads.
+fn render_heading(line: usize, title: SharedString) -> AnyElement {
+    div()
+        .id(("heading", line))
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .px(px(20.))
+        .pb(px(6.))
+        .flex()
+        .items_end()
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgba(theme::TEXT_MUTED))
+        .child(title)
+        .into_any_element()
+}
+
+/// The heading over a search's answers, by the provider of the first one.
+fn answers_heading(id: &str) -> &'static str {
+    match id.split(':').next().unwrap_or_default() {
+        "calc" => "Calculator",
+        "web" => "Open",
+        "quicklinks" => "Quicklinks",
+        "run" => "Run",
+        "files" => "Files",
+        "clipboard" => "Clipboard",
+        _ => "Answers",
+    }
+}
+
+/// What kind of thing a catalog item is, shown at the right of its row as
+/// Raycast does: "Application", "Quicklink", "Command".
+fn kind_of(id: &str) -> &'static str {
+    let (provider, instance) = id.split_once(':').unwrap_or((id, ""));
+    let saved = instance.parse::<i64>().is_ok();
+    match provider {
+        "apps" => "Application",
+        "games" => "Game",
+        "settings" => "System Setting",
+        "control-panel" => "Control Panel",
+        "quicklinks" if saved => "Quicklink",
+        "snippets" if saved => "Snippet",
+        _ => "Command",
+    }
+}
+
+/// What goes after a catalog item's title: its subtitle, without the kind
+/// already shown at the right ("!gh  ·  Quicklink" → "!gh").
+fn detail_of(subtitle: Option<&str>, kind: &str) -> Option<String> {
+    let subtitle = subtitle?.trim();
+    let subtitle = subtitle
+        .strip_suffix(kind)
+        .map(|rest| rest.trim_end().trim_end_matches('·').trim_end())
+        .unwrap_or(subtitle);
+    let redundant = subtitle.is_empty()
+        || subtitle.eq_ignore_ascii_case(kind)
+        || matches!(subtitle, "Application" | "Applications" | "Command");
+    (!redundant).then(|| subtitle.to_owned())
+}
+
 /// The text after `prefix` when `query` starts with it.
 fn file_query<'a>(prefix: &str, query: &'a str) -> Option<&'a str> {
     if prefix.is_empty() {
@@ -3578,6 +4102,48 @@ mod tests {
         assert_eq!(keys_label("ctrl-shift-c"), "Ctrl Shift C");
         assert_eq!(keys_label("ctrl-alt-enter"), "Ctrl Alt Enter");
         assert_eq!(keys_label("ctrl-."), "Ctrl .");
+    }
+
+    #[test]
+    fn darkens_the_tint_over_light_backgrounds() {
+        let alpha = |tint: u32| tint & 0xff;
+        // Over a dark background each option keeps its own density.
+        let translucent = WindowOpacity::new(80);
+        assert_eq!(alpha(translucent.tint(Some(0.1))), 204);
+        assert_eq!(alpha(translucent.tint(None)), 204);
+        assert_eq!(alpha(WindowOpacity::new(97).tint(Some(1.))), 247);
+        assert_eq!(WindowOpacity::new(10), WindowOpacity::new(80));
+        assert_eq!(
+            WindowOpacity::from_setting("88"),
+            Some(WindowOpacity::new(88))
+        );
+        // Over white a see-through tint gets denser, enough to stay dark.
+        let over_white = alpha(translucent.tint(Some(1.)));
+        assert!((210..=225).contains(&over_white), "{over_white}");
+    }
+
+    #[test]
+    fn names_kinds_and_details_as_raycast() {
+        assert_eq!(
+            kind_of("apps:Microsoft.WindowsCalculator!App"),
+            "Application"
+        );
+        assert_eq!(kind_of("quicklinks:7"), "Quicklink");
+        assert_eq!(kind_of("quicklinks:-3"), "Quicklink");
+        assert_eq!(kind_of("quicklinks:search"), "Command");
+        assert_eq!(kind_of("snippets:12"), "Snippet");
+        assert_eq!(kind_of("system:lock"), "Command");
+        assert_eq!(detail_of(Some("Application"), "Application"), None);
+        assert_eq!(
+            detail_of(Some("!gh  ·  Quicklink"), "Quicklink").as_deref(),
+            Some("!gh")
+        );
+        assert_eq!(detail_of(Some("Quicklink"), "Quicklink"), None);
+        assert_eq!(
+            detail_of(Some("System"), "Command").as_deref(),
+            Some("System")
+        );
+        assert_eq!(detail_of(None, "Command"), None);
     }
 
     #[test]

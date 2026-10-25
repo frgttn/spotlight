@@ -114,6 +114,11 @@ const MIGRATIONS: &[&str] = &[
         runs    INTEGER NOT NULL,
         used_at INTEGER NOT NULL
     );",
+    // Items the user pinned to the top of root search, in their order.
+    "CREATE TABLE favorites (
+        item_id  TEXT PRIMARY KEY,
+        position INTEGER NOT NULL
+    );",
 ];
 
 /// An icon nobody asked for in this long is forgotten (about two months).
@@ -725,6 +730,27 @@ impl Store {
             .optional()
     }
 
+    /// The favorite items' ids, in order.
+    pub fn favorites(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id FROM favorites ORDER BY position")?;
+        stmt.query_map([], |row| row.get(0))?.collect()
+    }
+
+    /// Makes `ids` the favorites, in this order.
+    pub fn set_favorites(&self, ids: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM favorites", [])?;
+        for (position, id) in ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO favorites (item_id, position) VALUES (?1, ?2)",
+                params![id, position as i64],
+            )?;
+        }
+        tx.commit()
+    }
+
     /// Commands run from Run, most recently run first, at most `limit`.
     pub fn run_history(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self
@@ -1161,6 +1187,17 @@ mod tests {
         assert_eq!(contents(store.clips(None).unwrap()), ["b"]);
         assert_eq!(store.delete_clip(b).unwrap().unwrap().content, "b");
         assert!(store.clips(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeps_favorites_in_order() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.favorites().unwrap().is_empty());
+        let ids = ["apps:b".to_owned(), "system:lock".to_owned()];
+        store.set_favorites(&ids).unwrap();
+        assert_eq!(store.favorites().unwrap(), ids);
+        store.set_favorites(&[ids[1].clone()]).unwrap();
+        assert_eq!(store.favorites().unwrap(), [ids[1].clone()]);
     }
 
     #[test]

@@ -246,6 +246,40 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    // Sections: before anything is typed (the catalog by kind),
+    // and around a search's answer, results and fallbacks.
+    let mut sections = Vec::new();
+    for query in ["", "12*12"] {
+        press(window, "ctrl-a", cx);
+        press(window, "backspace", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(query, window, cx)
+            })
+            .ok();
+        sleep(SETTLE_MS).await;
+        sections.push(
+            window
+                .update(cx, |launcher, _, _| launcher.section_titles())
+                .unwrap_or_default(),
+        );
+    }
+    eprintln!(
+        "[selftest] sections: {sections:?} {}",
+        if ["Commands", "Applications"]
+            .iter()
+            .all(|title| sections[0].iter().any(|known| known == title))
+            && sections[1].first().map(String::as_str) == Some("Calculator")
+            && sections[1]
+                .last()
+                .is_some_and(|title| title.starts_with("Use “12*12”"))
+        {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     let alias = alias_round_trip(window, cx).await;
     eprintln!(
         "[selftest] alias: {alias} {}",
@@ -396,7 +430,7 @@ async fn compact_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         executor.timer(Duration::from_millis(SETTLE_MS)).await;
         let height = height(cx);
         seen.push(format!("{step} {height:.0}"));
-        // Collapsed is the search row alone (52); expanded is hundreds.
+        // Collapsed is the search row alone (64); expanded is hundreds.
         if (height > 100.) != expanded && result == "OK" {
             result = format!("FAIL at {step}");
         }

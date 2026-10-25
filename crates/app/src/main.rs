@@ -47,7 +47,7 @@ use spotlight_providers::{
 };
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
-    launcher::{self, Launcher, OpenSettings, Quit, WindowMode},
+    launcher::{self, HomeSection, Launcher, OpenSettings, Quit, WindowMode, WindowOpacity},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
     text_input,
 };
@@ -62,6 +62,11 @@ const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 const WINDOW_MODE_SETTING: &str = "window_mode";
 /// `settings` key: `"true"` or `"false"`; missing means on.
 const RANK_BY_USAGE_SETTING: &str = "rank_by_usage";
+/// `settings` key: the root search sections hidden before anything is
+/// typed, `HomeSection`'s setting forms comma-separated; missing means none.
+const HIDDEN_SECTIONS_SETTING: &str = "hidden_home_sections";
+/// `settings` key: the launcher's opacity in percent; missing means the default.
+const WINDOW_OPACITY_SETTING: &str = "window_opacity";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
@@ -91,6 +96,8 @@ struct AppState {
     smooth_scrolling: Cell<bool>,
     window_mode: Cell<WindowMode>,
     rank_by_usage: Cell<bool>,
+    hidden_sections: RefCell<Vec<HomeSection>>,
+    opacity: Cell<WindowOpacity>,
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
@@ -169,6 +176,16 @@ fn main() {
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
     let rank_by_usage = setting(RANK_BY_USAGE_SETTING).is_none_or(|value| value != "false");
+    let hidden_sections: Vec<HomeSection> = setting(HIDDEN_SECTIONS_SETTING)
+        .map(|text| {
+            text.split(',')
+                .filter_map(|name| HomeSection::from_setting(name.trim()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let opacity = setting(WINDOW_OPACITY_SETTING)
+        .and_then(|text| WindowOpacity::from_setting(&text))
+        .unwrap_or_default();
     let window_mode = setting(WINDOW_MODE_SETTING)
         .and_then(|text| {
             let mode = WindowMode::from_setting(&text);
@@ -320,6 +337,8 @@ fn main() {
             .update(cx, |launcher, window, cx| {
                 launcher.set_window_mode(window_mode, cx);
                 launcher.set_rank_by_usage(rank_by_usage, cx);
+                launcher.set_hidden_sections(hidden_sections.clone(), cx);
+                launcher.set_window_opacity(opacity, cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 launcher.set_file_prefix(file_search.prefix.clone());
@@ -365,6 +384,8 @@ fn main() {
             smooth_scrolling: Cell::new(smooth_scrolling),
             window_mode: Cell::new(window_mode),
             rank_by_usage: Cell::new(rank_by_usage),
+            hidden_sections: RefCell::new(hidden_sections),
+            opacity: Cell::new(opacity),
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
@@ -540,6 +561,8 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.smooth_scrolling.get(),
                 view_state.window_mode.get(),
                 view_state.rank_by_usage.get(),
+                view_state.hidden_sections.borrow().clone(),
+                view_state.opacity.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
@@ -624,6 +647,31 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
             save_setting(state, RANK_BY_USAGE_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::HiddenSectionsChanged(hidden) => {
+            *state.hidden_sections.borrow_mut() = hidden.clone();
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_hidden_sections(hidden.clone(), cx)
+                })
+                .ok();
+            let text = hidden
+                .iter()
+                .map(|section| section.to_setting())
+                .collect::<Vec<_>>()
+                .join(",");
+            save_setting(state, HIDDEN_SECTIONS_SETTING, text, cx);
+        }
+        SettingsEvent::WindowOpacityChanged(opacity) => {
+            state.opacity.set(*opacity);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_window_opacity(*opacity, cx)
+                })
+                .ok();
+            save_setting(state, WINDOW_OPACITY_SETTING, opacity.to_setting(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
             if *id == CLIPBOARD_PROVIDER {

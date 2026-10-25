@@ -145,6 +145,9 @@ pub struct SmoothScroll {
     row_height: f32,
     /// The list's vertical padding, on each side.
     padding: f32,
+    /// How much of the list's top is hidden above its parent's edge: rows
+    /// scrolled up stop below it.
+    top_inset: f32,
     scroller: Scroller,
 }
 
@@ -155,6 +158,7 @@ impl SmoothScroll {
             handle,
             row_height,
             padding,
+            top_inset: 0.,
             scroller: Scroller::new(base, true),
         }
     }
@@ -170,6 +174,10 @@ impl SmoothScroll {
     /// Turning it off finishes a running animation at once.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.scroller.set_enabled(enabled);
+    }
+
+    pub fn set_top_inset(&mut self, inset: f32) {
+        self.top_inset = inset;
     }
 
     /// Jumps to the top, for a new set of results.
@@ -190,8 +198,8 @@ impl SmoothScroll {
         let from = self.scroller.heading();
         let top = ix as f32 * self.row_height;
         let bottom = top + self.row_height;
-        let to = if top < -from {
-            -top
+        let to = if top < -from + self.top_inset {
+            -(top - self.top_inset)
         } else if bottom > -from + viewport {
             -(bottom - viewport)
         } else {

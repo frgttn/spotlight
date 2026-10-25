@@ -242,6 +242,7 @@ impl Launcher {
             .position(|item| item.id == pending.item_id)
         {
             self.results = vec![Row::Catalog(ix)];
+            self.sections.clear();
             self.selected = 0;
             self.panel = None;
         }

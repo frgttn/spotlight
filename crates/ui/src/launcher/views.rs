@@ -481,7 +481,7 @@ impl Launcher {
                     .position(|row| self.item(row).id == keep)
             })
             .unwrap_or_else(|| previous.min(self.results.len().saturating_sub(1)));
-        self.scroll.reveal(self.selected, self.results.len());
+        self.reveal_selected();
         cx.notify();
     }
 

@@ -902,7 +902,7 @@ impl TextInput {
     fn display(&self, window: &Window) -> (SharedString, Vec<TextRun>) {
         let style = window.text_style();
         let (display_text, text_color) = if self.content.is_empty() {
-            (self.placeholder.clone(), hsla(0., 0., 1., 0.35))
+            (self.placeholder.clone(), hsla(0., 0., 1., 0.5))
         } else {
             (self.content.clone(), style.color)
         };

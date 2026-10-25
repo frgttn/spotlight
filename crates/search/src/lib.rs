@@ -4,7 +4,7 @@
 
 mod root;
 
-pub use root::{RootSearch, Row};
+pub use root::{RootSearch, Row, Split};
 
 use nucleo_matcher::{
     Config, Matcher, Utf32Str,

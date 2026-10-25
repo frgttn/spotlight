@@ -155,6 +155,8 @@ pub mod shortcut {
     pub const PIN: &str = "ctrl-.";
     /// Shows more about it: Show Details.
     pub const INFO: &str = "ctrl-i";
+    /// Adds it to (or removes it from) the favorites.
+    pub const FAVORITE: &str = "ctrl-shift-f";
     /// Pastes it another way: as plain text.
     pub const PASTE_PLAIN: &str = "ctrl-shift-v";
 }

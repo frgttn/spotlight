@@ -29,6 +29,17 @@ pub struct RootSearch {
     /// `catalogs` flattened in provider order, so empty-query order is stable
     /// whichever provider finishes loading first.
     catalog: Vec<SearchItem>,
+    /// How the last search's rows divide: answers, then catalog matches,
+    /// then fallbacks.
+    last_split: Split,
+}
+
+/// How a search's rows divide into its parts, by count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Split {
+    pub answers: usize,
+    pub matches: usize,
+    pub fallbacks: usize,
 }
 
 impl RootSearch {
@@ -39,7 +50,13 @@ impl RootSearch {
             catalogs: vec![Vec::new(); providers.len()],
             providers,
             catalog: Vec::new(),
+            last_split: Split::default(),
         }
+    }
+
+    /// How the rows of the last [`Self::search`] divide.
+    pub fn last_split(&self) -> Split {
+        self.last_split
     }
 
     pub fn providers(&self) -> &[Arc<dyn Provider>] {
@@ -97,6 +114,7 @@ impl RootSearch {
             .flat_map(|provider| provider.answers(query))
             .map(Row::Computed)
             .collect();
+        let answers = rows.len();
 
         let candidates = self.catalog.iter().map(|item| Candidate {
             title: &item.title,
@@ -110,6 +128,7 @@ impl RootSearch {
                 .into_iter()
                 .map(Row::Catalog),
         );
+        let matches = rows.len() - answers;
 
         if !query.is_empty() {
             rows.extend(
@@ -118,6 +137,11 @@ impl RootSearch {
                     .map(Row::Computed),
             );
         }
+        self.last_split = Split {
+            answers,
+            matches,
+            fallbacks: rows.len() - answers - matches,
+        };
         rows
     }
 }
