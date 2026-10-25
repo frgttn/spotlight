@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use spotlight_core::{
-    favicon,
+    deeplink, favicon,
     item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
@@ -196,6 +196,16 @@ impl Provider for Quicklinks {
         "Your saved links and !keyword searches."
     }
 
+    /// The form of a quicklink whose arguments all have defaults, for a
+    /// link that brings arguments (see `deeplink::ARGUMENTS_VIEW`).
+    fn view(&self, id: &str) -> Option<View> {
+        let id: i64 = id.strip_prefix(deeplink::ARGUMENTS_VIEW)?.parse().ok()?;
+        let links = self.links.read().ok()?;
+        let link = links.iter().find(|link| link.id == id)?;
+        let arguments = quicklink::arguments(&link.link);
+        (!arguments.is_empty()).then(|| arguments_form(link, &arguments, &[]))
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         let links = self.load();
         // The stock quicklinks are too many for root search: they're reached
@@ -232,13 +242,23 @@ impl Provider for Quicklinks {
                 open_with: None,
             };
             let create = self.edit_form("Create Quicklink", &blank);
-            items.push(
+            items.extend([
                 SearchItem::new(item_id(ID, "create"), "Create Quicklink")
                     .subtitle("Quicklinks")
                     .keywords(&["new quicklink", "add link", "bookmark"])
                     .icon(Icon::Glyph(glyph::ADD))
                     .action("Create Quicklink", Command::PushView(Box::new(create))),
-            );
+                SearchItem::new(item_id(ID, "import"), "Import Quicklinks")
+                    .subtitle("Quicklinks")
+                    .keywords(&["raycast", "json", "bookmarks"])
+                    .icon(Icon::Glyph(glyph::IMPORT))
+                    .action("Import from JSON…", Command::ImportQuicklinks),
+                SearchItem::new(item_id(ID, "export"), "Export Quicklinks")
+                    .subtitle("Quicklinks")
+                    .keywords(&["raycast", "json", "backup"])
+                    .icon(Icon::Glyph(glyph::EXPORT))
+                    .action("Export to JSON…", Command::ExportQuicklinks),
+            ]);
         }
         if let Ok(mut cached) = self.links.write() {
             *cached = links;
@@ -453,7 +473,15 @@ mod tests {
     fn stock_quicklinks_stay_out_of_root_search() {
         let provider = provider();
         let items = provider.catalog();
-        assert_eq!(titles(&items), ["Search Quicklinks", "Create Quicklink"]);
+        assert_eq!(
+            titles(&items),
+            [
+                "Search Quicklinks",
+                "Create Quicklink",
+                "Import Quicklinks",
+                "Export Quicklinks"
+            ]
+        );
         assert_eq!(all_links(&items).len(), DEFAULTS.len());
 
         // Changing one (or adding one) brings it to root search.
@@ -470,14 +498,14 @@ mod tests {
             .unwrap();
         let items = provider.catalog();
         assert_eq!(titles(&items)[0], "My GitHub");
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 5);
     }
 
     #[test]
     fn catalog_has_the_defaults_and_commands() {
         let provider = provider();
         let catalog = provider.catalog();
-        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.len(), 4);
         let items = all_links(&catalog);
         assert_eq!(items.len(), DEFAULTS.len());
         let github = find(&items, "GitHub");

@@ -122,6 +122,10 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::PasteSnippet { .. }
         | Command::ImportSnippets
         | Command::ExportSnippets
+        | Command::ImportSnippetsJson(_)
+        | Command::ImportQuicklinks
+        | Command::ExportQuicklinks
+        | Command::ImportQuicklinksJson(_)
         | Command::OpenProviderView { .. }
         | Command::SearchIn { .. }
         | Command::ProviderAction { .. }

@@ -224,6 +224,14 @@ pub enum Command {
     ImportSnippets,
     /// Asks where to save every snippet as JSON, as Raycast imports them.
     ExportSnippets,
+    /// Adds the snippets in this JSON, which a link brought (`?context=`).
+    ImportSnippetsJson(String),
+    /// Asks for a JSON file of quicklinks, as Raycast exports them, and adds them.
+    ImportQuicklinks,
+    /// Asks where to save every quicklink as JSON, as Raycast imports them.
+    ExportQuicklinks,
+    /// Adds the quicklinks in this JSON, which a link brought (`?context=`).
+    ImportQuicklinksJson(String),
     /// Opens a view on top of the current one; Esc comes back.
     PushView(Box<View>),
     /// Opens a view the provider `provider` builds when asked (see
@@ -356,6 +364,9 @@ impl Command {
                 | Command::ClearClipboardHistory
                 | Command::ForceQuit(_)
                 | Command::MoveToTrash(_)
+                // A link brought them: a web page can't add any by itself.
+                | Command::ImportSnippetsJson(_)
+                | Command::ImportQuicklinksJson(_)
         )
     }
 }

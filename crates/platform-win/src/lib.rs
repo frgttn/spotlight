@@ -11,6 +11,7 @@ pub mod apps;
 pub mod autostart;
 pub mod clipboard;
 pub mod commands;
+pub mod dialog;
 pub mod drives;
 pub mod expander;
 pub mod favicon;

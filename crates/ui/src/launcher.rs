@@ -2,6 +2,7 @@
 //! views opened on top of it (see `views`).
 
 mod clipboard;
+mod json_files;
 mod links;
 mod quicklinks;
 mod snippets;
@@ -1634,6 +1635,14 @@ impl Launcher {
 
     /// Opens a view, or carries out the command and hides the window.
     fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        // The user's own quicklink to one of our commands: run here, trusted.
+        if let Command::OpenQuicklink { link, .. } = command
+            && deeplink::parse(link).is_ok()
+            && !command.needs_selection()
+            && !command.needs_clipboard()
+        {
+            return self.open_own_link(link, window, cx);
+        }
         if command.needs_selection() {
             return self.run_with_selection(command.clone(), cx);
         }
@@ -1647,6 +1656,18 @@ impl Launcher {
             Command::PasteSnippet { text, paste } => self.paste_snippet(text, *paste, cx),
             Command::ImportSnippets => self.import_snippets(cx),
             Command::ExportSnippets => self.export_snippets(cx),
+            Command::ImportSnippetsJson(json) => {
+                let message = self.import_snippets_json(json);
+                self.hide(cx);
+                self.show_hud(message.into(), cx);
+            }
+            Command::ImportQuicklinks => self.import_quicklinks(cx),
+            Command::ExportQuicklinks => self.export_quicklinks(cx),
+            Command::ImportQuicklinksJson(json) => {
+                let message = self.import_quicklinks_json(json, cx);
+                self.hide(cx);
+                self.show_hud(message.into(), cx);
+            }
             Command::OpenProviderView { provider, view } => {
                 self.open_provider_view(provider, view, window, cx)
             }
@@ -2053,6 +2074,26 @@ impl Launcher {
             .collect();
         shortcuts.sort_by_cached_key(|shortcut| shortcut.title.to_lowercase());
         shortcuts
+    }
+
+    /// The commands that open from links without asking, as id and title,
+    /// by title.
+    pub fn trusted_links(&self) -> Vec<(String, String)> {
+        let mut trusted: Vec<(String, String)> = self
+            .trusted_links
+            .iter()
+            .map(|id| {
+                let title = self
+                    .search
+                    .catalog()
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map_or_else(|| id.clone(), |item| item.title.clone());
+                (id.clone(), title)
+            })
+            .collect();
+        trusted.sort_by_cached_key(|(_, title)| title.to_lowercase());
+        trusted
     }
 
     /// Every item that can take an alias or a hotkey (the ones that do

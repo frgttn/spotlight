@@ -534,6 +534,20 @@ impl Store {
         .collect()
     }
 
+    /// Adds new quicklinks (their ids are ignored) all at once, or none if
+    /// one fails. Returns how many were added.
+    pub fn add_quicklinks(&mut self, links: &[Quicklink]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        for link in links {
+            tx.execute(
+                "INSERT INTO quicklinks (name, link, keyword, open_with) VALUES (?1, ?2, ?3, ?4)",
+                params![link.name, link.link, link.keyword, link.open_with],
+            )?;
+        }
+        tx.commit()?;
+        Ok(links.len())
+    }
+
     /// Adds `link` (id 0) or replaces the one with its id. Returns its id.
     pub fn save_quicklink(&self, link: &Quicklink) -> Result<i64> {
         let Quicklink {

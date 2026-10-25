@@ -8,6 +8,10 @@
 //! - `?arguments={"Repo":"zed"}` fills a command's form fields by label (a
 //!   quicklink's arguments); `?fallbackText=…` goes in the search field of a
 //!   list the command opens.
+//! - `?context=…` is Raycast's launch context: the JSON Import Snippets and
+//!   Import Quicklinks add (`snippets/import?context=[…]`), or an object
+//!   whose fields fill a form without submitting it (`quicklinks/create`
+//!   with `{"name", "link"}`).
 
 use serde_json::Value;
 
@@ -19,6 +23,10 @@ use crate::{
 pub const SCHEME: &str = "spotlight";
 /// The one "author" there is so far; Raycast puts the extension's owner here.
 const OWNER: &str = "spotlight";
+/// A provider whose command doesn't always ask for its arguments (a
+/// quicklink whose arguments all have defaults) gives its form as view
+/// `arguments:{instance}`, for links that bring arguments.
+pub const ARGUMENTS_VIEW: &str = "arguments:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Deeplink {
@@ -35,6 +43,8 @@ pub struct CommandLink {
     /// Form field label and value pairs, in the link's order.
     pub arguments: Vec<(String, String)>,
     pub fallback_text: Option<String>,
+    /// Raycast's launch context, as the link had it (JSON).
+    pub context: Option<String>,
 }
 
 impl CommandLink {
@@ -85,11 +95,15 @@ pub fn parse(link: &str) -> Result<Deeplink, String> {
                 command: command.clone(),
                 arguments: Vec::new(),
                 fallback_text: None,
+                context: None,
             };
             for (key, value) in query_pairs(query) {
                 match key.as_str() {
                     "arguments" => link.arguments.extend(arguments(&value)?),
                     "fallbackText" if !value.is_empty() => link.fallback_text = Some(value),
+                    "context" | "launchContext" if !value.trim().is_empty() => {
+                        link.context = Some(value)
+                    }
                     _ => {}
                 }
             }
@@ -122,6 +136,59 @@ pub fn apply_arguments(command: Command, arguments: &[(String, String)]) -> Comm
         _ => return command,
     };
     let mut form = form.clone();
+    prefill(&mut form, arguments);
+    let values: Vec<FieldValue> = form
+        .fields
+        .iter()
+        .map(|field| match &field.kind {
+            FieldKind::Text { default, .. } | FieldKind::TextArea { default, .. } => {
+                FieldValue::Text(default.clone())
+            }
+            FieldKind::Checkbox { default } => FieldValue::Checkbox(*default),
+            FieldKind::Dropdown { default, .. } => FieldValue::Dropdown(*default),
+        })
+        .collect();
+    if form.check(&values).is_ok() {
+        form.fill(&values)
+    } else {
+        Command::PushView(Box::new(View::Form(form)))
+    }
+}
+
+/// What a command becomes with a link's launch `context`: an import takes
+/// the JSON to add (and so asks first), a form takes the fields of a JSON
+/// object as its values, without being submitted. Others stay as they are.
+pub fn apply_context(command: Command, context: Option<&str>) -> Command {
+    let Some(context) = context else {
+        return command;
+    };
+    match command {
+        Command::ImportSnippets => Command::ImportSnippetsJson(context.to_owned()),
+        Command::ImportQuicklinks => Command::ImportQuicklinksJson(context.to_owned()),
+        Command::PushView(view) => match *view {
+            View::Form(mut form) => {
+                if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(context) {
+                    let fields: Vec<(String, String)> = object
+                        .into_iter()
+                        .map(|(name, value)| match value {
+                            Value::String(text) => (name, text),
+                            other => (name, other.to_string()),
+                        })
+                        .collect();
+                    prefill(&mut form, &fields);
+                }
+                Command::PushView(Box::new(View::Form(form)))
+            }
+            view => Command::PushView(Box::new(view)),
+        },
+        command => command,
+    }
+}
+
+/// Puts `values` in `form`'s fields, matched to a field's label or id,
+/// ignoring case.
+fn prefill(form: &mut crate::view::FormView, values: &[(String, String)]) {
+    let arguments = values;
     for field in &mut form.fields {
         let Some((_, value)) = arguments.iter().find(|(name, _)| {
             name.eq_ignore_ascii_case(&field.label) || name.eq_ignore_ascii_case(&field.id)
@@ -142,30 +209,18 @@ pub fn apply_arguments(command: Command, arguments: &[(String, String)]) -> Comm
             }
         }
     }
-    let values: Vec<FieldValue> = form
-        .fields
-        .iter()
-        .map(|field| match &field.kind {
-            FieldKind::Text { default, .. } | FieldKind::TextArea { default, .. } => {
-                FieldValue::Text(default.clone())
-            }
-            FieldKind::Checkbox { default } => FieldValue::Checkbox(*default),
-            FieldKind::Dropdown { default, .. } => FieldValue::Dropdown(*default),
-        })
-        .collect();
-    if form.check(&values).is_ok() {
-        form.fill(&values)
-    } else {
-        Command::PushView(Box::new(View::Form(form)))
-    }
 }
 
 /// Raycast's slug: lowercase ASCII letters and digits, words joined by
-/// dashes. Raycast keeps accented letters without their accents; here every
-/// non-ASCII letter is dropped (titles are English so far).
+/// dashes. Latin letters keep their base letter without the accent (`Ç` is
+/// `c`, `ß` is `ss`); other letters (Cyrillic, CJK) are dropped.
 pub fn slug(title: &str) -> String {
     let mut slug = String::with_capacity(title.len());
     for ch in title.trim().chars() {
+        if let Some(plain) = unaccented(ch) {
+            slug.extend(plain.chars().map(|ch| ch.to_ascii_lowercase()));
+            continue;
+        }
         let ch = ch.to_ascii_lowercase();
         if ch.is_ascii_alphanumeric() {
             slug.push(ch);
@@ -177,6 +232,24 @@ pub fn slug(title: &str) -> String {
         slug.pop();
     }
     slug
+}
+
+/// A Latin letter with an accent (or a ligature) as plain ASCII letters.
+fn unaccented(ch: char) -> Option<&'static str> {
+    const FROM: &str = "ÀÁÂÃÄÅàáâãäåĀāĂăĄąÇçĆćĈĉĊċČčĎďĐđÈÉÊËèéêëĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħÌÍÎÏìíîïĨĩĪīĬĭĮįİıĴĵĶķĹĺĻļĽľĿŀŁłÑñŃńŅņŇňÒÓÔÕÖØòóôõöøŌōŎŏŐőŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧÙÚÛÜùúûüŨũŪūŬŭŮůŰűŲųŴŵÝýÿŶŷŸŹźŻżŽž";
+    const TO: &str = "AAAAAAaaaaaaAaAaAaCcCcCcCcCcDdDdEEEEeeeeEeEeEeEeEeGgGgGgGgHhHhIIIIiiiiIiIiIiIiIiJjKkLlLlLlLlLlNnNnNnNnOOOOOOooooooOoOoOoRrRrRrSsSsSsSsTtTtTtUUUUuuuuUuUuUuUuUuUuWwYyyYyYZzZzZz";
+    if let Some(ix) = FROM.chars().position(|known| known == ch) {
+        let start = TO.char_indices().nth(ix)?.0;
+        return TO.get(start..start + 1);
+    }
+    Some(match ch {
+        'ß' => "ss",
+        'Æ' | 'æ' => "ae",
+        'Œ' | 'œ' => "oe",
+        'Þ' | 'þ' => "th",
+        'Ð' | 'ð' => "d",
+        _ => return None,
+    })
 }
 
 /// `arguments` holds a JSON object of strings. Raycast's script commands
@@ -292,6 +365,57 @@ mod tests {
         assert!(parse("spotlight://extensions/spotlight/system").is_err());
         assert!(parse("spotlight://extensions/someone/system/lock").is_err());
         assert!(parse("spotlight://extensions/spotlight/x/y?arguments=%7Bnope").is_err());
+
+        let link = command(
+            "spotlight://extensions/spotlight/snippets/import?context=%5B%7B%22text%22%3A%22hi%22%7D%5D",
+        );
+        assert_eq!(link.context.as_deref(), Some(r#"[{"text":"hi"}]"#));
+    }
+
+    #[test]
+    fn takes_a_launch_context() {
+        use crate::view::{Field, FormView};
+
+        let json = r#"[{"name":"A","text":"a"}]"#;
+        assert_eq!(
+            apply_context(Command::ImportSnippets, Some(json)),
+            Command::ImportSnippetsJson(json.into())
+        );
+        assert!(apply_context(Command::ImportQuicklinks, Some(json)).needs_confirmation());
+        assert_eq!(
+            apply_context(Command::ImportSnippets, None),
+            Command::ImportSnippets
+        );
+
+        let field = |id: &str, label: &str| Field {
+            id: id.into(),
+            label: label.into(),
+            kind: FieldKind::Text {
+                placeholder: String::new(),
+                default: String::new(),
+                required: true,
+            },
+        };
+        let create = Command::PushView(Box::new(View::Form(FormView {
+            title: "Create Quicklink".into(),
+            fields: vec![field("name", "Name"), field("link", "Link")],
+            submit_title: "Save".into(),
+            submit: Command::Copy("{name} {link}".into()),
+        })));
+        // Filled in, but not submitted: the user saves it.
+        let Command::PushView(view) = apply_context(
+            create,
+            Some(r#"{"name": "Zed", "link": "https://zed.dev"}"#),
+        ) else {
+            panic!("expected the form");
+        };
+        let View::Form(form) = *view else {
+            panic!("expected the form");
+        };
+        assert!(matches!(
+            &form.fields[1].kind,
+            FieldKind::Text { default, .. } if default == "https://zed.dev"
+        ));
     }
 
     #[test]
@@ -368,7 +492,12 @@ mod tests {
         assert!(link.names("system:lock", "Lock Screen"));
         assert!(!link.names("apps:lock", "Lock Screen"));
         assert!(!link.names("system:sleep", "Sleep"));
-        assert_eq!(slug("  Ça va — Search the Web… "), "a-va-search-the-web");
+        assert_eq!(slug("  Ça va — Search the Web… "), "ca-va-search-the-web");
+        assert_eq!(
+            slug("Crème brûlée für Straße, Łódź"),
+            "creme-brulee-fur-strasse-lodz"
+        );
+        assert_eq!(slug("Ærø Привет"), "aero");
         assert_eq!(slug("Open  quick-link"), "open-quick-link");
     }
 }

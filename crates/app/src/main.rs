@@ -718,6 +718,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
         }
+        SettingsEvent::LinkDistrusted(item_id) => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.distrust_link(item_id, cx))
+                .ok();
+        }
     }
 }
 
@@ -779,6 +785,7 @@ fn launcher_reader(launcher: WindowHandle<Launcher>, web: Arc<Web>) -> LauncherR
             ignored_apps: launcher.ignored_clip_apps(),
             excluded_apps: launcher.excluded_snippet_apps(),
             search_engine: (web.engine(), name),
+            trusted_links: launcher.trusted_links(),
         })
     })
 }

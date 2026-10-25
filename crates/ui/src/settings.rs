@@ -71,6 +71,8 @@ pub struct LauncherState {
     /// The web search engine, which a quicklink's "Use as Web Search" in
     /// the launcher changes too, and its name.
     pub search_engine: (SearchEngine, String),
+    /// Commands that open from links without asking: item id and title.
+    pub trusted_links: Vec<(String, String)>,
 }
 
 /// Reads the launcher's current state; `None` while the launcher can't be
@@ -128,6 +130,8 @@ pub enum SettingsEvent {
         item_id: String,
         hotkey: Option<Hotkey>,
     },
+    /// This command asks again before it opens from a link.
+    LinkDistrusted(String),
 }
 
 pub struct Settings {
@@ -167,6 +171,8 @@ pub struct Settings {
     selection_copy: bool,
     snippet_expansion: bool,
     excluded_apps: Vec<IgnoredApp>,
+    /// Commands that open from links without asking: item id and title.
+    trusted_links: Vec<(String, String)>,
     /// The apps with windows open, to add to `excluded_apps`; `Some` while
     /// the list is shown.
     app_choices: Option<Vec<IgnoredApp>>,
@@ -280,6 +286,7 @@ impl Settings {
             ignored_apps,
             excluded_apps,
             search_engine: (_, engine_name),
+            trusted_links,
         } = launcher(cx).unwrap_or_default();
         let engine_name = if engine_name.is_empty() {
             search_engine.name()
@@ -314,6 +321,7 @@ impl Settings {
             selection_copy,
             snippet_expansion,
             excluded_apps,
+            trusted_links,
             app_choices: None,
             file_search,
             file_status,
@@ -352,6 +360,7 @@ impl Settings {
         self.sources = state.sources;
         self.ignored_apps = state.ignored_apps;
         self.excluded_apps = state.excluded_apps;
+        self.trusted_links = state.trusted_links;
         let (engine, name) = state.search_engine;
         if engine != self.search_engine && self.custom_engine.is_none() {
             self.search_engine = engine;
@@ -2383,7 +2392,72 @@ impl Settings {
     fn shortcuts_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let hint_text = self
             .shortcuts_hint("Aliases and hotkeys of apps and commands. Click one to change it.");
-        vec![hint(hint_text), self.shortcut_list(cx)]
+        vec![
+            hint(hint_text),
+            self.shortcut_list(cx),
+            div()
+                .pt_3()
+                .px_1()
+                .text_size(px(13.))
+                .text_color(rgba(theme::TEXT_MUTED))
+                .child("Open from Links Without Asking")
+                .into_any_element(),
+            self.trusted_link_list(cx),
+        ]
+    }
+
+    /// The commands `spotlight://` links run without waiting for Enter, each
+    /// with a button that makes it ask again.
+    fn trusted_link_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.trusted_links.is_empty() {
+            return card()
+                .px_4()
+                .py_3()
+                .text_size(px(12.))
+                .text_color(rgba(theme::TEXT_MUTED))
+                .child(
+                    "None. When a link opens a command, press Ctrl+Enter (Always Open Command) \
+                     to stop it asking.",
+                )
+                .into_any_element();
+        }
+        card()
+            .px_4()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(
+                self.trusted_links
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (id, title))| {
+                        let id = id.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(13.))
+                                    .truncate()
+                                    .child(title.clone()),
+                            )
+                            .child(remove_button(
+                                ("distrust", ix),
+                                cx.listener(move |this, _, _, cx| this.distrust_link(&id, cx)),
+                            ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn distrust_link(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.trusted_links.retain(|(trusted, _)| trusted != id);
+        cx.emit(SettingsEvent::LinkDistrusted(id.to_owned()));
+        cx.notify();
     }
 
     /// The extension's items with their alias and hotkey cells, like

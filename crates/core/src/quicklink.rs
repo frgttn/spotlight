@@ -4,6 +4,11 @@
 //! Placeholders, as in Raycast (see [`crate::placeholder`]): `{query}`,
 //! `{argument …}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}`,
 //! `{selection}` and `{clipboard}`. Anything else in braces is left as it is.
+//!
+//! They move to and from Raycast as JSON: an array of `{"name", "link",
+//! "openWith"}` objects (plus our `"keyword"`, which Raycast ignores).
+
+use serde_json::{Map, Value, json};
 
 use crate::placeholder::{self, Placeholder};
 pub use crate::placeholder::{Argument, Moment, arguments, field_id, with_field_ids};
@@ -669,6 +674,101 @@ pub fn check_link(link: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// What [`import`] makes of a JSON file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Imported {
+    /// To save: new, and with keywords nothing else has. `open_with` is as
+    /// the file has it: Raycast writes an app's name, which the caller turns
+    /// into a browser's exe (or drops).
+    pub added: Vec<Quicklink>,
+    /// Already there: same name and link.
+    pub duplicates: usize,
+    /// Left out because a quicklink already has their keyword.
+    pub taken: usize,
+    /// Without a link, or with one or a keyword that can't be used.
+    pub invalid: usize,
+}
+
+/// The quicklinks in `json` (as Raycast exports them, or one such object)
+/// that `existing` doesn't have yet. `Err` when it isn't such a file at all.
+pub fn import(json: &str, existing: &[Quicklink]) -> Result<Imported, String> {
+    let json = json.trim_start_matches('\u{feff}');
+    let value: Value =
+        serde_json::from_str(json).map_err(|err| format!("Not a JSON file: {err}"))?;
+    let entries = match value {
+        Value::Array(entries) => entries,
+        Value::Object(_) => vec![value],
+        _ => return Err("Not a list of quicklinks".into()),
+    };
+    let mut imported = Imported::default();
+    for entry in entries {
+        let Some(link) = parse_entry(&entry) else {
+            imported.invalid += 1;
+            continue;
+        };
+        let known = existing.iter().chain(&imported.added);
+        if known
+            .clone()
+            .any(|other| other.name == link.name && other.link == link.link)
+        {
+            imported.duplicates += 1;
+        } else if link.keyword.is_some()
+            && known.into_iter().any(|other| other.keyword == link.keyword)
+        {
+            imported.taken += 1;
+        } else {
+            imported.added.push(link);
+        }
+    }
+    Ok(imported)
+}
+
+/// One object of an import; `None` when it can't be a quicklink.
+fn parse_entry(entry: &Value) -> Option<Quicklink> {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let link = text("link")?.to_owned();
+    check_link(&link).ok()?;
+    let keyword = match text("keyword") {
+        Some(keyword) => normalize_keyword(keyword).ok()?,
+        None => None,
+    };
+    let name = text("name").map_or_else(|| host(&link).unwrap_or(&link).to_owned(), str::to_owned);
+    Some(Quicklink {
+        id: 0,
+        name,
+        link,
+        keyword,
+        open_with: text("openWith").map(str::to_owned),
+    })
+}
+
+/// `links` as JSON Raycast can import. `open_with` names a browser by its
+/// exe; `app_name` gives the name Raycast looks it up by.
+pub fn export(links: &[Quicklink], app_name: impl Fn(&str) -> String) -> String {
+    let entries: Vec<Value> = links
+        .iter()
+        .map(|link| {
+            let mut entry = Map::new();
+            entry.insert("name".into(), json!(link.name));
+            entry.insert("link".into(), json!(link.link));
+            if let Some(app) = &link.open_with {
+                entry.insert("openWith".into(), json!(app_name(app)));
+            }
+            if let Some(keyword) = &link.keyword {
+                entry.insert("keyword".into(), json!(keyword));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into())
+}
+
 /// `C:\…`, `\\server\share` or `%USERPROFILE%\…`.
 fn looks_like_path(link: &str) -> bool {
     let bytes = link.as_bytes();
@@ -778,6 +878,51 @@ mod tests {
             with_field_ids(link),
             "https://x.com/{arg0}/{arg1}/{arg0}/{date}"
         );
+    }
+
+    #[test]
+    fn imports_what_it_exports() {
+        let link = |name: &str, url: &str, keyword: Option<&str>| Quicklink {
+            id: 0,
+            name: name.into(),
+            link: url.into(),
+            keyword: keyword.map(str::to_owned),
+            open_with: None,
+        };
+        let existing = [link(
+            "GitHub",
+            "https://github.com/search?q={query}",
+            Some("gh"),
+        )];
+        let mut chrome = link("Docs", "https://docs.rs/{query}", None);
+        chrome.open_with = Some(r"C:\Chrome\chrome.exe".into());
+        let json = export(&[chrome.clone()], |_| "Google Chrome".into());
+        assert!(json.contains(r#""openWith": "Google Chrome""#));
+        let back = import(&json, &[]).unwrap();
+        assert_eq!(back.added[0].open_with.as_deref(), Some("Google Chrome"));
+
+        let json = r#"[
+            {"name": "GitHub", "link": "https://github.com/search?q={query}"},
+            {"name": "Code search", "link": "https://cs.github.com/?q={query}", "keyword": "!GH"},
+            {"link": "https://example.com/a"},
+            {"name": "Script", "link": "javascript:alert(1)"},
+            {"name": "No link"},
+            7
+        ]"#;
+        let imported = import(json, &existing).unwrap();
+        assert_eq!(
+            imported.added,
+            [link("example.com", "https://example.com/a", None)]
+        );
+        assert_eq!(
+            (imported.duplicates, imported.taken, imported.invalid),
+            (1, 1, 3)
+        );
+        // One object, as a shared link brings.
+        let one = import(r#"{"name": "Zed", "link": "https://zed.dev"}"#, &[]).unwrap();
+        assert_eq!(one.added.len(), 1);
+        assert!(import("[1", &[]).is_err());
+        assert!(import("\"text\"", &[]).is_err());
     }
 
     #[test]

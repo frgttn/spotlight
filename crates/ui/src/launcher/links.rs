@@ -2,7 +2,9 @@
 //! shortcut) opens the launcher on the command it names and waits for Enter,
 //! so a web page can't run commands by itself; Ctrl+Enter also lets that
 //! command open from links without asking from then on, as Raycast's
-//! "Always Open Command" does.
+//! "Always Open Command" does. A link opened from inside (the user's own
+//! quicklink) runs at once, as Raycast's internal links do; commands that
+//! ask for a second Enter still wait for it.
 
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,7 @@ use gpui::{AppContext, Context, Window};
 use spotlight_core::{
     deeplink::{self, CommandLink, Deeplink},
     item::Command,
+    view::View,
 };
 use spotlight_search::Row;
 
@@ -40,13 +43,25 @@ pub(super) fn parse_trusted(setting: &str) -> impl Iterator<Item = String> + '_ 
 impl Launcher {
     /// Opens a `spotlight://` link: the launcher, or the command it names.
     pub fn open_link(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_link_after_load(text.to_owned(), true, window, cx);
+        self.open_link_after_load(text.to_owned(), true, false, window, cx);
     }
 
+    /// Opens a `spotlight://` link a quicklink of the user's own named.
+    pub(super) fn open_own_link(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_link_after_load(text.to_owned(), false, true, window, cx);
+    }
+
+    /// `own`: the link came from inside the launcher, so it's trusted.
     fn open_link_after_load(
         &mut self,
         text: String,
         wait: bool,
+        own: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -78,12 +93,11 @@ impl Launcher {
             };
             return self.link_problem(message, cx);
         };
-        let item = &self.search.catalog()[ix];
-        let id = item.id.clone();
-        let asks = item
-            .primary_action()
-            .is_some_and(|action| action.command.needs_confirmation());
-        if self.trusted_links.contains(&id) && !asks {
+        let id = self.search.catalog()[ix].id.clone();
+        let asks = self
+            .link_command(ix, &link)
+            .is_some_and(|command| command.needs_confirmation());
+        if (own || self.trusted_links.contains(&id)) && !asks {
             return self.run_link(ix, &link, window, cx);
         }
         self.show(Instant::now(), window, cx);
@@ -110,12 +124,39 @@ impl Launcher {
             }
             cx.update_window(handle, |_, window, cx| {
                 this.update(cx, |this, cx| {
-                    this.open_link_after_load(text, false, window, cx)
+                    this.open_link_after_load(text, false, false, window, cx)
                 })
             })
             .ok();
         })
         .detach();
+    }
+
+    /// What item `ix`'s primary action becomes with `link`'s launch context
+    /// and arguments. A command that takes arguments without asking for
+    /// them (a quicklink with defaults) takes them through its provider's
+    /// form ([`deeplink::ARGUMENTS_VIEW`]).
+    fn link_command(&self, ix: usize, link: &CommandLink) -> Option<Command> {
+        let item = &self.search.catalog()[ix];
+        let mut command = item.primary_action()?.command.clone();
+        let is_form =
+            matches!(&command, Command::PushView(view) if matches!(**view, View::Form(_)));
+        if !link.arguments.is_empty()
+            && !is_form
+            && let Some((provider, instance)) = item.id.split_once(':')
+            && let Some(form) = self
+                .search
+                .providers()
+                .iter()
+                .find(|candidate| candidate.id() == provider)
+                .and_then(|provider| {
+                    provider.view(&format!("{}{instance}", deeplink::ARGUMENTS_VIEW))
+                })
+        {
+            command = Command::PushView(Box::new(form));
+        }
+        let command = deeplink::apply_context(command, link.context.as_deref());
+        Some(deeplink::apply_arguments(command, &link.arguments))
     }
 
     /// Runs item `ix`'s primary action as `link` asks: with its arguments,
@@ -127,12 +168,10 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let item = &self.search.catalog()[ix];
-        let id = item.id.clone();
-        let Some(action) = item.primary_action() else {
+        let id = self.search.catalog()[ix].id.clone();
+        let Some(command) = self.link_command(ix, link) else {
             return;
         };
-        let command = deeplink::apply_arguments(action.command.clone(), &link.arguments);
         let opens_view = matches!(
             command,
             Command::PushView(_)
@@ -183,8 +222,9 @@ impl Launcher {
         self.run_link(ix, &pending.link, window, cx);
     }
 
-    /// The command `id` asks again before it opens from a link.
-    pub(super) fn distrust_link(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// The command `id` asks again before it opens from a link (its action
+    /// panel, or Settings).
+    pub fn distrust_link(&mut self, id: &str, cx: &mut Context<Self>) {
         self.trusted_links.remove(id);
         self.save_trusted_links(cx);
     }
