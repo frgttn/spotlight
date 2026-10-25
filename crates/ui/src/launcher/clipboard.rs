@@ -223,7 +223,7 @@ impl Launcher {
             .min_w_0()
             .h_full()
             .border_l_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::p().hairline))
             .flex()
             .flex_col();
         let Some((item, preview)) = item.and_then(|item| {
@@ -244,7 +244,7 @@ impl Launcher {
                 .font_family("Consolas")
                 .text_size(px(12.5))
                 .line_height(px(18.))
-                .text_color(rgba(theme::TEXT))
+                .text_color(rgba(theme::p().text))
                 .child(SharedString::from(text))
                 .into_any_element(),
             PreviewBody::Thumbnail(path) => {
@@ -276,7 +276,7 @@ impl Launcher {
                         div()
                             .flex_none()
                             .text_size(px(13.))
-                            .text_color(rgba(theme::TEXT))
+                            .text_color(rgba(theme::p().text))
                             .child(SharedString::from(item.title.clone())),
                     )
                     .into_any_element()
@@ -289,7 +289,7 @@ impl Launcher {
                         .into_any_element(),
                     None if matches!(self.preview_image, Some(PreviewImage::Failed(_))) => div()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child("The image file is missing")
                         .into_any_element(),
                     None => div().into_any_element(),
@@ -329,7 +329,7 @@ impl Launcher {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .truncate()
                                     .child(folder),
                             )
@@ -338,7 +338,7 @@ impl Launcher {
                         list.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgba(theme::TEXT_FAINT))
+                                .text_color(rgba(theme::p().text_faint))
                                 .child(format!("and {more} more")),
                         )
                     })
@@ -350,7 +350,7 @@ impl Launcher {
             .px_4()
             .py_2()
             .border_t_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::p().hairline))
             .flex()
             .flex_col()
             .gap_1()
@@ -363,14 +363,14 @@ impl Launcher {
                     .child(
                         div()
                             .flex_none()
-                            .text_color(rgba(theme::TEXT_FAINT))
+                            .text_color(rgba(theme::p().text_faint))
                             .child(label),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(rgba(theme::TEXT_MUTED))
+                            .text_color(rgba(theme::p().text_muted))
                             .child(value),
                     )
             }));

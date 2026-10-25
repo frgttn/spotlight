@@ -15,9 +15,11 @@ use gpui::{
     GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, Style,
     TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill,
-    hsla, point, prelude::*, px, relative, rgb, rgba, size,
+    point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
+
+use crate::theme;
 
 actions!(
     text_input,
@@ -902,7 +904,10 @@ impl TextInput {
     fn display(&self, window: &Window) -> (SharedString, Vec<TextRun>) {
         let style = window.text_style();
         let (display_text, text_color) = if self.content.is_empty() {
-            (self.placeholder.clone(), hsla(0., 0., 1., 0.5))
+            (
+                self.placeholder.clone(),
+                gpui::Hsla::from(rgba(theme::p().placeholder)),
+            )
         } else {
             (self.content.clone(), style.color)
         };
@@ -1019,7 +1024,7 @@ impl Element for TextElement {
                         point(text_left + cursor_pos - px(CURSOR_WIDTH / 2.), bounds.top()),
                         size(px(CURSOR_WIDTH), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0x6aa8ff),
+                    rgb(theme::p().caret),
                 )),
             )
         } else {
@@ -1035,7 +1040,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x6aa8ff55),
+                    rgba(theme::p().selection),
                 )),
                 None,
             )
@@ -1213,12 +1218,12 @@ impl Element for AreaElement {
                     origin + point(caret.x - px(CURSOR_WIDTH / 2.), caret.y),
                     size(px(CURSOR_WIDTH), line_height),
                 ),
-                rgb(0x6aa8ff),
+                rgb(theme::p().caret),
             );
             (Some(quad), Vec::new())
         } else {
             let quads = selection_rows(&lines, &selected_range, line_height)
-                .map(|row| fill(row + origin, rgba(0x6aa8ff55)))
+                .map(|row| fill(row + origin, rgba(theme::p().selection)))
                 .collect();
             (None, quads)
         };

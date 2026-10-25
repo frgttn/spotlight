@@ -743,9 +743,9 @@ impl Launcher {
                     .justify_center()
                     .gap_2()
                     .rounded(px(8.))
-                    .when(selected, |tile| tile.bg(rgba(0xffffff1f)))
+                    .when(selected, |tile| tile.bg(rgba(theme::p().selected)))
                     .when(!selected, |tile| {
-                        tile.hover(|style| style.bg(rgba(0xffffff0f)))
+                        tile.hover(|style| style.bg(rgba(theme::p().hover)))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.selected = ix;
@@ -792,11 +792,11 @@ impl Launcher {
                             .rounded(px(6.))
                             .border_1()
                             .border_color(rgba(if focused {
-                                theme::ACCENT
+                                theme::p().accent
                             } else {
-                                theme::SURFACE_BORDER
+                                theme::p().surface_border
                             }))
-                            .bg(rgba(theme::SURFACE))
+                            .bg(rgba(theme::p().surface))
                             .child(div().flex_1().child(input.clone()))
                             .into_any_element(),
                         (FieldInput::Checkbox { on, focus }, _) => {
@@ -818,11 +818,11 @@ impl Launcher {
                                         .rounded(px(4.))
                                         .border_1()
                                         .border_color(rgba(if focused {
-                                            theme::ACCENT
+                                            theme::p().accent
                                         } else {
-                                            theme::SURFACE_BORDER
+                                            theme::p().surface_border
                                         }))
-                                        .when(on, |check| check.bg(rgba(theme::ACCENT)))
+                                        .when(on, |check| check.bg(rgba(theme::p().accent)))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -845,7 +845,7 @@ impl Launcher {
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(rgba(if focused {
-                                    theme::ACCENT
+                                    theme::p().accent
                                 } else {
                                     0x00000000
                                 }))
@@ -865,12 +865,12 @@ impl Launcher {
                                         .text_size(px(12.))
                                         .cursor_pointer()
                                         .when(chosen, |chip| {
-                                            chip.border_color(rgba(theme::ACCENT))
-                                                .bg(rgba(theme::ACCENT_SOFT))
+                                            chip.border_color(rgba(theme::p().accent))
+                                                .bg(rgba(theme::p().accent_soft))
                                         })
                                         .when(!chosen, |chip| {
-                                            chip.border_color(rgba(theme::SURFACE_BORDER))
-                                                .text_color(rgba(theme::TEXT_MUTED))
+                                            chip.border_color(rgba(theme::p().surface_border))
+                                                .text_color(rgba(theme::p().text_muted))
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.choose_option(ix, option, window, cx)
@@ -893,7 +893,7 @@ impl Launcher {
                                 .when(area, |label| label.pt(px(8.)))
                                 .w(px(110.))
                                 .text_size(px(13.))
-                                .text_color(rgba(theme::TEXT_MUTED))
+                                .text_color(rgba(theme::p().text_muted))
                                 .child(SharedString::from(field.label.clone())),
                         )
                         .child(control)
@@ -911,7 +911,7 @@ impl Launcher {
                     div()
                         .pl(px(122.))
                         .text_size(px(12.))
-                        .text_color(rgba(theme::ERROR))
+                        .text_color(rgba(theme::p().error))
                         .child(error),
                 )
             })
@@ -922,7 +922,7 @@ impl Launcher {
                     .items_center()
                     .gap_1()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child("Tab moves between fields;")
                     .child(keycaps(form.submit_keys()))
                     .child(SharedString::from(form.view.submit_title.to_lowercase()))
@@ -1010,7 +1010,7 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
                     .px_4()
                     .py_4()
                     .border_l_1()
-                    .border_color(rgba(theme::HAIRLINE))
+                    .border_color(rgba(theme::p().hairline))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -1022,13 +1022,13 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .child(SharedString::from(label.clone())),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgba(theme::TEXT))
+                                    .text_color(rgba(theme::p().text))
                                     .child(SharedString::from(value.clone())),
                             )
                     })),

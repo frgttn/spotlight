@@ -4,6 +4,7 @@
 //! - `SPOTLIGHT_SYNTHETIC=10000` adds that many filler rows for the list test.
 //! - `SPOTLIGHT_SHOW_ON_START=1` shows the window immediately (handy while developing).
 //! - `SPOTLIGHT_SELFTEST=1` runs the scripted measurement in `selftest.rs` and quits.
+//! - `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved theme.
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
 //!
 //! `spotlight.exe --settings` opens the settings window (of the running
@@ -49,7 +50,7 @@ use spotlight_store::{Key, Store};
 use spotlight_ui::{
     launcher::{self, HomeSection, Launcher, OpenSettings, Quit, WindowMode, WindowOpacity},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
-    text_input,
+    text_input, theme,
 };
 
 use crate::tray::{Command, Tray};
@@ -186,6 +187,26 @@ fn main() {
     let opacity = setting(WINDOW_OPACITY_SETTING)
         .and_then(|text| WindowOpacity::from_setting(&text))
         .unwrap_or_default();
+    // Before any window opens, which then start out in the right colours.
+    // `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved
+    // choice, for screenshots.
+    let mut choice = theme::Choice::from_settings(
+        setting(theme::MODE_SETTING).as_deref(),
+        setting(theme::LIGHT_SETTING).as_deref(),
+        setting(theme::DARK_SETTING).as_deref(),
+    );
+    if let Ok(text) = env::var("SPOTLIGHT_THEME") {
+        if let Some(mode) = theme::Mode::from_setting(&text) {
+            choice.mode = mode;
+        } else if let Some(found) = theme::theme(text.trim()) {
+            choice = choice.with_theme(found.id);
+            choice.mode = match found.appearance {
+                theme::Appearance::Dark => theme::Mode::Dark,
+                theme::Appearance::Light => theme::Mode::Light,
+            };
+        }
+    }
+    theme::set_choice(choice);
     let window_mode = setting(WINDOW_MODE_SETTING)
         .and_then(|text| {
             let mode = WindowMode::from_setting(&text);
@@ -672,6 +693,24 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
             save_setting(state, WINDOW_OPACITY_SETTING, opacity.to_setting(), cx);
+        }
+        SettingsEvent::ThemeChanged(choice) => {
+            theme::set_choice(*choice);
+            // The system's setting may have changed while nothing listened.
+            theme::set_system(theme::appearance_of(cx.window_appearance()));
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.theme_changed(cx))
+                .ok();
+            cx.refresh_windows();
+            save_setting(
+                state,
+                theme::MODE_SETTING,
+                choice.mode.to_setting().to_owned(),
+                cx,
+            );
+            save_setting(state, theme::LIGHT_SETTING, choice.light.to_owned(), cx);
+            save_setting(state, theme::DARK_SETTING, choice.dark.to_owned(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
             if *id == CLIPBOARD_PROVIDER {

@@ -25,7 +25,7 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
     Hsla, KeyBinding, KeyDownEvent, Keystroke, RenderImage, ScrollHandle, SharedString,
     Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla, img,
-    prelude::*, px, relative, rgb, rgba, uniform_list,
+    prelude::*, px, relative, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -418,17 +418,25 @@ impl WindowOpacity {
     /// (0 black, 1 white): this option's own density, or denser where that
     /// would leave the window brighter than [`MAX_BRIGHTNESS`] — a light
     /// background, blurred, stays light, and would turn the window grey.
+    ///
+    /// The tint's colour is the current theme's background. A light theme
+    /// works the same mirrored: a dark background shining through it would
+    /// turn the window grey.
     pub fn tint(self, behind: Option<f32>) -> u32 {
-        /// The tint's colour, `0x1c`, as brightness.
-        const TINT: f32 = 28. / 255.;
         const MAX_BRIGHTNESS: f32 = 0.24;
+        let background = theme::p().background;
+        let light = theme::current().appearance == theme::Appearance::Light;
+        // Everything below is in terms of "distance from the theme's own
+        // extreme": for a light theme, brightness is flipped.
+        let flip = |brightness: f32| if light { 1. - brightness } else { brightness };
+        let tint = flip(f32::from((background >> 24) as u8) / 255.);
         let own = f32::from(self.0) / 100.;
-        let needed = match behind {
-            Some(behind) if behind > MAX_BRIGHTNESS => (behind - MAX_BRIGHTNESS) / (behind - TINT),
+        let needed = match behind.map(flip) {
+            Some(behind) if behind > MAX_BRIGHTNESS => (behind - MAX_BRIGHTNESS) / (behind - tint),
             _ => 0.,
         };
         let alpha = own.max(needed).min(1.);
-        0x1c1c1e00 | (alpha * 255.).round() as u32
+        (background & 0xffffff00) | (alpha * 255.).round() as u32
     }
 
     pub fn to_setting(self) -> String {
@@ -582,7 +590,8 @@ impl Launcher {
             other => panic!("expected a Win32 window handle, got {other:?}"),
         };
         win::round_corners(hwnd);
-        win::set_border_color(hwnd, theme::WINDOW_BORDER);
+        theme::set_system(theme::appearance_of(cx.window_appearance()));
+        win::set_border_color(hwnd, theme::p().window_border);
 
         let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
         let panel_input = cx.new(|cx| TextInput::new("Search for actions…", cx));
@@ -603,6 +612,10 @@ impl Launcher {
                 }
             }),
             cx.observe_self(Self::sync_window_height),
+            // Windows' light/dark setting changed.
+            cx.observe_window_appearance(window, |this, _, cx| {
+                this.follow_system(cx);
+            }),
         ];
 
         if synthetic > 0 {
@@ -1608,7 +1621,26 @@ impl Launcher {
         self.previous_window
     }
 
+    /// Redraws with the current theme: the window's outline is Windows' to
+    /// draw, so it is set again; everything else is read as it's drawn.
+    pub fn theme_changed(&mut self, cx: &mut Context<Self>) {
+        win::set_border_color(self.hwnd, theme::p().window_border);
+        cx.notify();
+    }
+
+    /// Takes the system's light or dark setting as it is now, in case a change
+    /// was missed while hidden. Returns whether the theme changed.
+    pub fn follow_system(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = theme::set_system(theme::appearance_of(cx.window_appearance()));
+        if changed {
+            self.theme_changed(cx);
+            cx.refresh_windows();
+        }
+        changed
+    }
+
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_system(cx);
         let foreground = system_clipboard::foreground_window();
         if foreground != self.hwnd {
             self.previous_window = foreground;
@@ -3100,9 +3132,9 @@ impl Launcher {
                 .items_center()
                 .gap_3()
                 .rounded(px(8.))
-                .when(selected, |row| row.bg(rgba(0xffffff1c)))
+                .when(selected, |row| row.bg(rgba(theme::p().selected)))
                 .when(!selected, |row| {
-                    row.hover(|style| style.bg(rgba(0xffffff0f)))
+                    row.hover(|style| style.bg(rgba(theme::p().hover)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.selected != row {
@@ -3135,9 +3167,9 @@ impl Launcher {
                                     .text_size(px(11.))
                                     .line_height(px(15.))
                                     .text_color(if confirming {
-                                        rgba(theme::ERROR)
+                                        rgba(theme::p().error)
                                     } else {
-                                        rgba(0xffffff70)
+                                        rgba(theme::p().text_dim)
                                     })
                                     .child(subtitle.clone()),
                             ),
@@ -3165,7 +3197,7 @@ impl Launcher {
                                         .min_w_0()
                                         .truncate()
                                         .text_size(px(13.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .child(detail),
                                 )
                             }),
@@ -3178,9 +3210,9 @@ impl Launcher {
                             .px(px(6.))
                             .rounded(px(4.))
                             .border_1()
-                            .border_color(rgba(theme::SURFACE_BORDER))
+                            .border_color(rgba(theme::p().surface_border))
                             .text_size(px(11.))
-                            .text_color(rgba(theme::TEXT_MUTED))
+                            .text_color(rgba(theme::p().text_muted))
                             .child(SharedString::from(alias.clone())),
                     )
                 })
@@ -3193,9 +3225,9 @@ impl Launcher {
                             .flex_none()
                             .text_size(px(13.))
                             .text_color(if confirming {
-                                rgba(theme::ERROR)
+                                rgba(theme::p().error)
                             } else {
-                                rgba(theme::TEXT_FAINT)
+                                rgba(theme::p().text_faint)
                             })
                             .child(accessory),
                     )
@@ -3225,7 +3257,7 @@ impl Launcher {
             .justify_center();
         match item.icon {
             Icon::Glyph(glyph) | Icon::Site { glyph, .. } => badge
-                .bg(rgba(0xffffff1a))
+                .bg(rgba(theme::p().surface_hover))
                 .font_family(icon_font())
                 .text_size(px(15. * scale))
                 .child(SharedString::from(glyph.to_string()))
@@ -3270,9 +3302,9 @@ impl Launcher {
                 .items_center()
                 .gap_2()
                 .rounded(px(5.))
-                .when(row == selected, |row| row.bg(rgba(0xffffff1f)))
+                .when(row == selected, |row| row.bg(rgba(theme::p().selected)))
                 .when(row != selected, |row| {
-                    row.hover(|style| style.bg(rgba(0xffffff0f)))
+                    row.hover(|style| style.bg(rgba(theme::p().hover)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)))
                 .child(
@@ -3293,8 +3325,8 @@ impl Launcher {
             .flex_col()
             .rounded(px(8.))
             .border_1()
-            .border_color(rgba(theme::SURFACE_BORDER))
-            .bg(rgba(theme::PANEL))
+            .border_color(rgba(theme::p().surface_border))
+            .bg(rgba(theme::p().panel))
             .shadow_lg()
             .text_size(px(13.))
             .child(
@@ -3303,7 +3335,7 @@ impl Launcher {
                     .pt_1()
                     .pb_1()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .truncate()
                     .child(title),
             )
@@ -3323,7 +3355,7 @@ impl Launcher {
                                 .px_3()
                                 .flex()
                                 .items_center()
-                                .text_color(rgba(theme::TEXT_FAINT))
+                                .text_color(rgba(theme::p().text_faint))
                                 .child("No matching actions"),
                         )
                     }),
@@ -3334,7 +3366,7 @@ impl Launcher {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(rgba(theme::SURFACE_BORDER))
+                    .border_color(rgba(theme::p().surface_border))
                     .child(self.panel_input.clone()),
             )
             .into_any_element()
@@ -3351,8 +3383,8 @@ impl Launcher {
                         .py_1()
                         .rounded(px(5.))
                         .border_1()
-                        .border_color(rgba(theme::ACCENT))
-                        .bg(rgba(theme::SURFACE))
+                        .border_color(rgba(theme::p().accent))
+                        .bg(rgba(theme::p().surface))
                         .child(input.clone())
                         .into_any_element(),
                     None,
@@ -3380,14 +3412,14 @@ impl Launcher {
             .gap_2()
             .rounded(px(8.))
             .border_1()
-            .border_color(rgba(theme::SURFACE_BORDER))
-            .bg(rgba(theme::PANEL))
+            .border_color(rgba(theme::p().surface_border))
+            .bg(rgba(theme::p().panel))
             .shadow_lg()
             .text_size(px(13.))
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .truncate()
                     .child(SharedString::from(heading)),
             )
@@ -3396,14 +3428,14 @@ impl Launcher {
                 card.child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::ERROR))
+                        .text_color(rgba(theme::p().error))
                         .child(note),
                 )
             })
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child(hint),
             )
             .into_any_element()
@@ -3437,7 +3469,7 @@ impl Launcher {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_color(rgba(theme::TEXT)).child(primary))
+                            .child(div().text_color(rgba(theme::p().text)).child(primary))
                             .child(keycaps(primary_keys)),
                     )
                     .when(has_actions, |hints| {
@@ -3461,22 +3493,22 @@ impl Launcher {
             .items_center()
             .gap_4()
             .border_t_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::p().hairline))
             .text_size(px(12.))
-            .text_color(rgba(theme::TEXT_MUTED))
+            .text_color(rgba(theme::p().text_muted))
             .child(match &self.toast {
                 Some(toast) => div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(rgba(theme::SUCCESS))
+                    .text_color(rgba(theme::p().success))
                     .child(toast.clone()),
                 None if self.show_stats => div().flex_1().min_w_0().truncate().child(self.footer()),
                 None => div().flex_1().min_w_0().child(
                     div()
                         .font_family(icon_font())
                         .text_size(px(14.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child(SharedString::from('\u{E721}'.to_string())),
                 ),
             })
@@ -3527,11 +3559,11 @@ impl Render for Launcher {
                 .items_center()
                 .justify_center()
                 .px_4()
-                .bg(rgba(theme::HUD_TINT))
+                .bg(rgba(theme::p().hud))
                 .border_1()
-                .border_color(rgba(theme::SURFACE_BORDER))
+                .border_color(rgba(theme::p().surface_border))
                 .rounded(px(8.))
-                .text_color(rgba(theme::TEXT))
+                .text_color(rgba(theme::p().text))
                 .text_size(px(14.))
                 .line_height(px(20.))
                 .text_center()
@@ -3554,7 +3586,7 @@ impl Render for Launcher {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgba(0xffffff60))
+                .text_color(rgba(theme::p().text_empty))
                 .child(match self.screens.last() {
                     Some(Screen::List { view, .. }) if view.items.is_empty() => {
                         SharedString::from(view.empty.clone().unwrap_or("Nothing here".into()))
@@ -3626,9 +3658,9 @@ impl Render for Launcher {
                             .py(px(4.))
                             .group_hover("scroll-track", |thumb| thumb.w(px(6.)))
                             .child(div().size_full().rounded_full().bg(rgba(if dragging {
-                                0xffffff66
+                                theme::p().scrollbar_active
                             } else {
-                                0xffffff33
+                                theme::p().scrollbar
                             }))),
                     )
                     .child(drag_track(cx.entity().downgrade(), |this: &mut Self| {
@@ -3691,7 +3723,7 @@ impl Render for Launcher {
             .flex()
             .flex_col()
             .bg(rgba(self.opacity.tint(self.behind)))
-            .text_color(rgb(0xececec))
+            .text_color(rgba(theme::p().text))
             .text_size(px(14.))
             .child(
                 div()
@@ -3709,7 +3741,7 @@ impl Render for Launcher {
                                 .flex_none()
                                 .font_family(icon_font())
                                 .text_size(px(16.))
-                                .text_color(rgba(theme::TEXT_MUTED))
+                                .text_color(rgba(theme::p().text_muted))
                                 .child(SharedString::from('\u{E721}'.to_string())),
                         )
                     })
@@ -3730,7 +3762,7 @@ impl Render for Launcher {
                                     .items_center()
                                     .gap_1()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .child(keycaps("Esc"))
                                     .child("back"),
                             ),
@@ -3741,10 +3773,10 @@ impl Render for Launcher {
                                         .flex_none()
                                         .px_2()
                                         .rounded(px(5.))
-                                        .bg(rgba(theme::SURFACE_HOVER))
+                                        .bg(rgba(theme::p().surface_hover))
                                         .text_size(px(12.))
                                         .line_height(px(22.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .child(SharedString::from(screen.title().to_owned())),
                                 )
                             })
@@ -3757,7 +3789,7 @@ impl Render for Launcher {
                                         .items_center()
                                         .gap_2()
                                         .text_size(px(13.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .child(label)
                                         .children(keys.map(keycaps)),
                                 )
@@ -3773,12 +3805,12 @@ impl Render for Launcher {
                                         .px_2()
                                         .rounded(px(5.))
                                         .border_1()
-                                        .border_color(rgba(theme::SURFACE_BORDER))
+                                        .border_color(rgba(theme::p().surface_border))
                                         .text_size(px(12.))
                                         .line_height(px(22.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                                        .hover(|style| style.bg(rgba(theme::p().surface_hover)))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.step_filter(true, cx);
                                         }))
@@ -3789,7 +3821,7 @@ impl Render for Launcher {
                     }),
             )
             .when(!collapsed, |root| {
-                root.child(div().h(px(1.)).bg(rgba(theme::HAIRLINE)))
+                root.child(div().h(px(1.)).bg(rgba(theme::p().hairline)))
                     .child(results)
                     .child(self.render_footer())
             })
@@ -3830,7 +3862,7 @@ fn render_heading(line: usize, title: SharedString) -> AnyElement {
         .items_end()
         .text_size(px(12.))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(rgba(theme::TEXT_MUTED))
+        .text_color(rgba(theme::p().text_muted))
         .child(title)
         .into_any_element()
 }
@@ -4029,9 +4061,9 @@ fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
             div()
                 .px(px(5.))
                 .rounded(px(4.))
-                .bg(rgba(theme::SURFACE_HOVER))
+                .bg(rgba(theme::p().surface_hover))
                 .text_size(px(10.))
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .child(key)
         }))
 }
