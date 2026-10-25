@@ -783,9 +783,14 @@ mod tests {
     #[test]
     fn expands_the_moment() {
         let moment = Moment {
-            date: "2026-10-23".into(),
-            time: "14:05".into(),
-            day: "Friday".into(),
+            now: crate::datetime::LocalTime {
+                year: 2026,
+                month: 10,
+                day: 23,
+                hour: 14,
+                minute: 5,
+                second: 0,
+            },
             uuid: "u".into(),
         };
         let link = r"C:\Notes\{date} {time} {uuid} {query} {day} {datetime}.md";

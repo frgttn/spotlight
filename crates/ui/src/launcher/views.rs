@@ -206,6 +206,8 @@ impl Launcher {
 
     /// Back to the screen below (root search at the bottom).
     pub(super) fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A typed keyword's form was left: its snippet won't be pasted.
+        self.keyword_target = None;
         if let Some(Screen::List {
             view,
             origin: Some((provider, _)),

@@ -286,6 +286,21 @@ pub fn hide(raw: isize) {
 }
 
 /// Brings an already visible window to the front.
+/// Brings our window to the front when Windows wouldn't let us (no hotkey
+/// or click of ours came just before): a no-op mouse input makes our
+/// process the last to send input, which allows it.
+pub fn take_foreground(raw: isize) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_MOUSE, SendInput};
+    unsafe {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            ..Default::default()
+        };
+        SendInput(&[input], size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd(raw));
+    }
+}
+
 pub fn focus(raw: isize) {
     unsafe {
         let _ = SetForegroundWindow(hwnd(raw));

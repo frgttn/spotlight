@@ -1,6 +1,7 @@
 //! Domain types shared by every Spotlight crate. No platform or UI code here.
 
 pub mod clip;
+pub mod datetime;
 pub mod deeplink;
 pub mod favicon;
 pub mod file_search;

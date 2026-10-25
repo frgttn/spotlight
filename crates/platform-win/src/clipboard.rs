@@ -642,7 +642,7 @@ pub fn paste_into(window: isize, caret_back: usize) -> bool {
 
 /// Asks Windows to activate `window`. Only allowed while Spotlight is the
 /// foreground app. `false` when the window is gone.
-pub(crate) fn bring_to_front(window: isize) -> bool {
+pub fn bring_to_front(window: isize) -> bool {
     let target = HWND(window as *mut c_void);
     unsafe {
         if window == 0 || !IsWindow(Some(target)).as_bool() {

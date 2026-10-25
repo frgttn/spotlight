@@ -297,7 +297,7 @@ fn main() {
             )
             .expect("failed to open the launcher window");
         window
-            .update(cx, |launcher, _, cx| {
+            .update(cx, |launcher, window, cx| {
                 launcher.set_window_mode(window_mode, cx);
                 launcher.set_rank_by_usage(rank_by_usage, cx);
                 launcher.set_selection_copy(selection_copy);
@@ -305,7 +305,7 @@ fn main() {
                 launcher.set_file_prefix(file_search.prefix.clone());
                 // The self-test runs beside a normal instance, which expands them.
                 if !self_test {
-                    launcher.start_expander();
+                    launcher.start_expander(window, cx);
                 }
             })
             .ok();

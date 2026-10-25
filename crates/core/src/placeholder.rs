@@ -6,6 +6,9 @@
 //!   optionally with a default value or a fixed set of choices. Arguments with
 //!   the same name share one value.
 //! - `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}`: the moment it's used.
+//!   The first four take `format="EEEE, MMM d"` (a Unicode date pattern, see
+//!   [`LocalTime::format`]) and `offset="+3d"` (see [`Offset::parse`]).
+//! - `{snippet name="Signature"}`: another snippet's text, in snippets.
 //! - `{selection}`: the text selected in the app the launcher was opened from.
 //! - `{clipboard}`: the text on the clipboard.
 //! - `{cursor}`: where the caret goes after a snippet is pasted.
@@ -36,23 +39,44 @@ impl Argument {
     }
 }
 
+use crate::datetime::{LocalTime, Offset};
+
 /// What `{date}`, `{time}`, `{datetime}`, `{day}` and `{uuid}` stand for at
 /// one moment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
-    /// `2026-10-23`
-    pub date: String,
-    /// `14:05`
-    pub time: String,
-    /// `Friday`
-    pub day: String,
+    pub now: LocalTime,
     pub uuid: String,
 }
 
+/// The patterns `{date}`, `{time}`, `{datetime}` and `{day}` are written in
+/// without a `format`: `2026-10-23`, `14:05`, `2026-10-23 14:05`, `Friday`.
+const DATE: &str = "yyyy-MM-dd";
+const TIME: &str = "HH:mm";
+const DATETIME: &str = "yyyy-MM-dd HH:mm";
+const DAY: &str = "EEEE";
+
 impl Moment {
-    /// `2026-10-23 14:05`
-    pub fn datetime(&self) -> String {
-        format!("{} {}", self.date, self.time)
+    pub fn date(&self) -> String {
+        self.now.format(DATE)
+    }
+
+    pub fn time(&self) -> String {
+        self.now.format(TIME)
+    }
+}
+
+/// A `format` and `offset` given to `{date}` and the like.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Clock {
+    format: Option<String>,
+    offset: Offset,
+}
+
+impl Clock {
+    fn write(&self, moment: &Moment, default: &str) -> String {
+        let pattern = self.format.as_deref().unwrap_or(default);
+        moment.now.shifted(&self.offset).format(pattern)
     }
 }
 
@@ -62,24 +86,26 @@ const QUERY: &str = "Query";
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Placeholder {
     Argument(Argument),
-    Date,
-    Time,
-    DateTime,
-    Day,
+    Date(Clock),
+    Time(Clock),
+    DateTime(Clock),
+    Day(Clock),
     Uuid,
     Selection,
     Clipboard,
     Cursor,
+    /// Another snippet, by name.
+    Snippet(String),
 }
 
 impl Placeholder {
     /// The text for a moment placeholder; `None` for the others.
     pub(crate) fn moment(&self, moment: &Moment) -> Option<String> {
         match self {
-            Placeholder::Date => Some(moment.date.clone()),
-            Placeholder::Time => Some(moment.time.clone()),
-            Placeholder::DateTime => Some(moment.datetime()),
-            Placeholder::Day => Some(moment.day.clone()),
+            Placeholder::Date(clock) => Some(clock.write(moment, DATE)),
+            Placeholder::Time(clock) => Some(clock.write(moment, TIME)),
+            Placeholder::DateTime(clock) => Some(clock.write(moment, DATETIME)),
+            Placeholder::Day(clock) => Some(clock.write(moment, DAY)),
             Placeholder::Uuid => Some(moment.uuid.clone()),
             _ => None,
         }
@@ -112,12 +138,9 @@ pub(crate) fn placeholders(text: &str) -> Vec<(usize, usize, Placeholder)> {
 /// The inside of one `{…}`, if it's a placeholder.
 fn parse(inner: &str) -> Option<Placeholder> {
     let inner = inner.trim();
-    let (word, mut rest) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+    let (word, rest) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+    let pairs = pairs(rest)?;
     let simple = match word {
-        "date" => Some(Placeholder::Date),
-        "time" => Some(Placeholder::Time),
-        "datetime" => Some(Placeholder::DateTime),
-        "day" => Some(Placeholder::Day),
         "uuid" => Some(Placeholder::Uuid),
         "selection" => Some(Placeholder::Selection),
         "clipboard" => Some(Placeholder::Clipboard),
@@ -125,41 +148,72 @@ fn parse(inner: &str) -> Option<Placeholder> {
         _ => None,
     };
     if let Some(simple) = simple {
-        return rest.trim().is_empty().then_some(simple);
+        return pairs.is_empty().then_some(simple);
     }
-    if word != "query" && word != "argument" {
-        return None;
-    }
-    let mut argument = Argument {
-        name: QUERY.to_owned(),
-        default: String::new(),
-        options: Vec::new(),
-    };
-    // `key="value"` pairs.
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
+    match word {
+        "date" | "time" | "datetime" | "day" => {
+            let mut clock = Clock::default();
+            for (key, value) in pairs {
+                match key {
+                    "format" if !value.trim().is_empty() => clock.format = Some(value.to_owned()),
+                    "offset" => clock.offset = Offset::parse(value)?,
+                    _ => return None,
+                }
+            }
+            Some(match word {
+                "date" => Placeholder::Date(clock),
+                "time" => Placeholder::Time(clock),
+                "datetime" => Placeholder::DateTime(clock),
+                _ => Placeholder::Day(clock),
+            })
         }
-        let (key, after) = rest.split_once('=')?;
+        "snippet" => match pairs[..] {
+            [("name", name)] if !name.trim().is_empty() => {
+                Some(Placeholder::Snippet(name.trim().to_owned()))
+            }
+            _ => None,
+        },
+        "query" | "argument" => {
+            let mut argument = Argument {
+                name: QUERY.to_owned(),
+                default: String::new(),
+                options: Vec::new(),
+            };
+            for (key, value) in pairs {
+                match key {
+                    "name" if !value.trim().is_empty() => argument.name = value.trim().to_owned(),
+                    "default" => argument.default = value.to_owned(),
+                    "options" => {
+                        argument.options = value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|option| !option.is_empty())
+                            .map(str::to_owned)
+                            .collect()
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Placeholder::Argument(argument))
+        }
+        _ => None,
+    }
+}
+
+/// `key="value"` pairs, or `None` when `text` isn't only that.
+fn pairs(mut text: &str) -> Option<Vec<(&str, &str)>> {
+    let mut pairs = Vec::new();
+    loop {
+        text = text.trim_start();
+        if text.is_empty() {
+            return Some(pairs);
+        }
+        let (key, after) = text.split_once('=')?;
         let after = after.trim_start().strip_prefix('"')?;
         let (value, after) = after.split_once('"')?;
-        match key.trim() {
-            "name" if !value.trim().is_empty() => argument.name = value.trim().to_owned(),
-            "default" => argument.default = value.to_owned(),
-            "options" => {
-                argument.options = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|option| !option.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }
-            _ => return None,
-        }
-        rest = after;
+        pairs.push((key.trim(), value));
+        text = after;
     }
-    Some(Placeholder::Argument(argument))
 }
 
 /// The arguments `text` asks for, each name once, in order of appearance.
@@ -265,10 +319,10 @@ mod tests {
         assert_eq!(
             found,
             [
-                Placeholder::Date,
-                Placeholder::Time,
-                Placeholder::DateTime,
-                Placeholder::Day,
+                Placeholder::Date(Clock::default()),
+                Placeholder::Time(Clock::default()),
+                Placeholder::DateTime(Clock::default()),
+                Placeholder::Day(Clock::default()),
                 Placeholder::Uuid,
                 Placeholder::Selection,
                 Placeholder::Clipboard,
@@ -277,5 +331,42 @@ mod tests {
             ]
         );
         assert!(placeholders("{cursor here} {clipboards} {}").is_empty());
+    }
+
+    #[test]
+    fn dates_take_a_format_and_an_offset() {
+        let moment = Moment {
+            now: LocalTime {
+                year: 2026,
+                month: 10,
+                day: 23,
+                hour: 14,
+                minute: 5,
+                second: 0,
+            },
+            uuid: "u".into(),
+        };
+        let fill = |text: &str| replace(text, |placeholder| placeholder.moment(&moment));
+        assert_eq!(
+            fill("{date} {time} {datetime} {day}"),
+            "2026-10-23 14:05 2026-10-23 14:05 Friday"
+        );
+        assert_eq!(
+            fill(r#"{date format="EEEE, d MMMM" offset="+1d"} {day offset="-1w +3d"}"#),
+            "Saturday, 24 October Monday"
+        );
+        assert_eq!(fill(r#"{time offset="+2h" format="h a"}"#), "4 PM");
+        // Not placeholders: an unknown key, an offset that isn't one.
+        assert_eq!(fill(r#"{date size="2"}"#), r#"{date size="2"}"#);
+        assert_eq!(fill(r#"{date offset="soon"}"#), r#"{date offset="soon"}"#);
+    }
+
+    #[test]
+    fn names_snippets() {
+        let found: Vec<_> = placeholders(r#"{snippet name="Sign"} {snippet} {snippet name=" "}"#)
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        assert_eq!(found, [Placeholder::Snippet("Sign".into())]);
     }
 }

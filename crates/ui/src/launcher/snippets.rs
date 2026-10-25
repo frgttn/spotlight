@@ -5,6 +5,8 @@
 
 use std::{fs, path::Path};
 
+use std::time::{Duration, Instant};
+
 use gpui::{Context, PathPromptOptions, Window};
 use spotlight_core::{
     clip::IgnoredApp,
@@ -13,7 +15,8 @@ use spotlight_core::{
 };
 use spotlight_platform_win::{
     clipboard::{self, Content},
-    expander, links,
+    expander::{self, Ask, Keyword},
+    links, win,
 };
 
 use super::{Launcher, views::Screen};
@@ -22,19 +25,61 @@ use super::{Launcher, views::Screen};
 pub(super) const PROVIDER: &str = "snippets";
 /// What the export file is called unless the user changes it.
 const EXPORT_NAME: &str = "Snippets.json";
+/// How long a snippet's form gets to come up and take the keyboard before
+/// the keys typed after its keyword are sent to it.
+const FORM_SETTLE: Duration = Duration::from_millis(80);
 
 impl Launcher {
     /// Starts expanding snippet keywords typed in other apps. The self-test
     /// doesn't: it runs beside a normal instance, which already does.
-    pub fn start_expander(&mut self) {
-        match expander::spawn(self.hwnd) {
+    pub fn start_expander(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (asks_tx, asks_rx) = async_channel::unbounded();
+        match expander::spawn(self.hwnd, asks_tx) {
             Ok(service) => {
                 self.expander = Some(service);
                 self.set_excluded_snippet_apps(&self.excluded_snippet_apps());
                 self.sync_expander();
             }
-            Err(err) => eprintln!("[spotlight] snippet keywords won't expand: {err}"),
+            Err(err) => {
+                eprintln!("[spotlight] snippet keywords won't expand: {err}");
+                return;
+            }
         }
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(ask) = asks_rx.recv().await {
+                this.update_in(cx, |this, window, cx| {
+                    this.ask_snippet_arguments(ask, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A keyword whose snippet has arguments was typed in another app: shows
+    /// the snippet's form, which pastes it there (see [`Self::paste_snippet`]).
+    fn ask_snippet_arguments(&mut self, ask: Ask, window: &mut Window, cx: &mut Context<Self>) {
+        if !(self.visible && win::is_visible(self.hwnd)) {
+            self.show(Instant::now(), window, cx);
+        }
+        // Not opened by its hotkey, so Windows may not hand it the foreground.
+        win::take_foreground(self.hwnd);
+        self.previous_window = ask.window;
+        self.screens.clear();
+        self.push_view(
+            snippet::arguments_form(&ask.name, &ask.text, true),
+            window,
+            cx,
+        );
+        self.keyword_target = Some(ask.window);
+        let expander = self.expander.clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(FORM_SETTLE).await;
+            if let Some(expander) = expander {
+                expander.form_shown();
+            }
+        })
+        .detach();
     }
 
     /// Turns expanding keywords typed in other apps on or off (Settings).
@@ -82,8 +127,14 @@ impl Launcher {
         };
         expander.set_snippets(
             snippets
-                .into_iter()
-                .filter_map(|snippet| Some((snippet.keyword?, snippet.text)))
+                .iter()
+                .filter_map(|snippet| {
+                    Some(Keyword {
+                        keyword: snippet.keyword.clone()?,
+                        name: snippet.name.clone(),
+                        text: snippet::inline(&snippet.text, &snippets),
+                    })
+                })
                 .collect(),
         );
     }
@@ -191,8 +242,19 @@ impl Launcher {
 
     /// Fills in `text`'s placeholders, puts it on the clipboard and, with
     /// `paste`, pastes it into the window that was active before the
-    /// launcher, the caret at `{cursor}`.
+    /// launcher, the caret at `{cursor}`. A snippet whose keyword was typed
+    /// goes back to the expander, which puts the clipboard back after.
     pub(super) fn paste_snippet(&mut self, text: &str, paste: bool, cx: &mut Context<Self>) {
+        if let Some(target) = self.keyword_target.take()
+            && paste
+            && let Some(expander) = self.expander.clone()
+        {
+            // While the launcher still has the foreground to hand over.
+            clipboard::bring_to_front(target);
+            self.hide(cx);
+            expander.paste(target, text.to_owned());
+            return;
+        }
         let copied = snippet::needs_clipboard(text)
             .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
             .flatten();

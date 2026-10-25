@@ -403,6 +403,9 @@ pub struct Launcher {
     selection_copy: bool,
     /// Expands snippet keywords typed in other apps; `None` until started.
     expander: Option<expander::Service>,
+    /// The window a snippet's keyword was typed in, while its form is open:
+    /// submitting it pastes there through the expander.
+    keyword_target: Option<isize>,
     /// Whether keywords expand, as set in Settings (Snippets must be on too).
     snippet_expansion: bool,
     /// The clipboard preview's image.
@@ -563,6 +566,7 @@ impl Launcher {
             previous_window: 0,
             selection_copy: true,
             expander: None,
+            keyword_target: None,
             snippet_expansion: true,
             preview_image: None,
             stale_images: Vec::new(),
@@ -1281,6 +1285,7 @@ impl Launcher {
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.pending_link = None;
+        self.keyword_target = None;
         self.close_editor(None, cx);
         self.forget_preview_image();
         win::hide(self.hwnd);
@@ -1763,6 +1768,8 @@ impl Launcher {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
+            // After its `{selection}` was read.
+            Command::PasteSnippet { text, paste } => return self.paste_snippet(text, *paste, cx),
             Command::CopyFile(path) => {
                 let content = system_clipboard::Content::Files(vec![path.clone()]);
                 hud = Some(match system_clipboard::write(self.hwnd, &content) {
@@ -1822,6 +1829,10 @@ impl Launcher {
                 .unwrap_or_else(|_| Err("Couldn't read the selection".into()));
             this.update(cx, |this, cx| match outcome {
                 Ok(Some(text)) => this.run_command(&command.with_selection(&text), cx),
+                // A snippet still pastes, with nothing where the selection goes.
+                Ok(None) if matches!(command, Command::PasteSnippet { .. }) => {
+                    this.run_command(&command.with_selection(""), cx)
+                }
                 Ok(None) => this.show_hud("No text selected".into(), cx),
                 Err(err) => this.show_hud(err.into(), cx),
             })

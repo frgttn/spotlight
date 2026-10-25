@@ -6,7 +6,7 @@
 use crate::{
     clip::IgnoredApp,
     quicklink::{self, Quicklink},
-    snippet::Snippet,
+    snippet::{self, Snippet},
     view::{Preview, View},
     web::{SearchEngine, encode_query},
     window::WindowCommand,
@@ -284,6 +284,7 @@ impl Command {
         match self {
             Command::OpenUrl(url) => url.contains(SELECTION),
             Command::OpenQuicklink { link, .. } => quicklink::has_selection(link),
+            Command::PasteSnippet { text, .. } => snippet::has_selection(text),
             _ => false,
         }
     }
@@ -297,6 +298,13 @@ impl Command {
             Command::OpenQuicklink { link, app } => Command::OpenQuicklink {
                 link: quicklink::fill_selection(link, text),
                 app: app.clone(),
+            },
+            Command::PasteSnippet {
+                text: snippet,
+                paste,
+            } => Command::PasteSnippet {
+                text: snippet::fill_selection(snippet, text),
+                paste: *paste,
             },
             command => command.clone(),
         }
