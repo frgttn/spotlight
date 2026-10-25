@@ -242,6 +242,20 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
             }
             return;
         }
+        Command::SetWindowFrame {
+            x,
+            y,
+            width,
+            height,
+            ..
+        } => {
+            for field in [x, y, width, height] {
+                if *field == placeholder {
+                    *field = value(false);
+                }
+            }
+            return;
+        }
         Command::SaveSnippet(snippet) => {
             let fields = [&mut snippet.name, &mut snippet.text]
                 .into_iter()

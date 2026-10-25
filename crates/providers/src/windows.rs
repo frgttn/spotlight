@@ -68,7 +68,7 @@ fn icon(command: WindowCommand) -> char {
         WindowCommand::Restore | WindowCommand::MakeSmaller | WindowCommand::ReasonableSize => {
             glyph::RESTORE_WINDOW
         }
-        WindowCommand::Minimize => glyph::MINIMIZE,
+        WindowCommand::Minimize | WindowCommand::MinimizeDisplay => glyph::MINIMIZE,
         WindowCommand::NextDisplay | WindowCommand::PreviousDisplay => glyph::DISPLAY,
         WindowCommand::ToggleAlwaysOnTop => glyph::PIN,
         WindowCommand::FocusNextAppWindow | WindowCommand::FocusPreviousAppWindow => glyph::SWITCH,

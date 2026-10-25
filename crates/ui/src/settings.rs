@@ -26,6 +26,7 @@ use spotlight_core::{
     file_search::{self, Config as FileSearchConfig, Status as FileSearchStatus},
     item::Command,
     web::{self, SearchEngine},
+    window::GAPS,
 };
 use spotlight_platform_win::{
     autostart, commands,
@@ -107,6 +108,12 @@ pub enum SettingsEvent {
     SelectionCopyChanged(bool),
     /// Snippet keywords typed in other apps expand (or no longer do).
     SnippetExpansionChanged(bool),
+    /// Layouts now leave `gap` pixels between windows, and running a half
+    /// again cycles through thirds (or doesn't).
+    WindowLayoutChanged {
+        gap: i32,
+        cycle: bool,
+    },
     /// The apps where snippet keywords don't expand are now these; save them.
     ExcludedAppsChanged(Vec<IgnoredApp>),
     /// What File Search indexes changed; save it and index again.
@@ -170,6 +177,9 @@ pub struct Settings {
     win_v: bool,
     selection_copy: bool,
     snippet_expansion: bool,
+    /// Pixels layouts leave between windows, and whether halves cycle.
+    window_gap: i32,
+    window_cycle: bool,
     excluded_apps: Vec<IgnoredApp>,
     /// Commands that open from links without asking: item id and title.
     trusted_links: Vec<(String, String)>,
@@ -223,6 +233,7 @@ impl Settings {
         win_v: bool,
         selection_copy: bool,
         snippet_expansion: bool,
+        (window_gap, window_cycle): (i32, bool),
         file_search: FileSearchConfig,
         file_status: FileStatusReader,
         version: &'static str,
@@ -320,6 +331,8 @@ impl Settings {
             win_v,
             selection_copy,
             snippet_expansion,
+            window_gap,
+            window_cycle,
             excluded_apps,
             trusted_links,
             app_choices: None,
@@ -1020,6 +1033,60 @@ impl Settings {
             )
             .children(choices)
             .child(excluded)
+    }
+
+    /// The gap between windows layouts leave, and whether halves cycle.
+    fn windows_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let gaps = GAPS.iter().enumerate().map(|(ix, &gap)| {
+            let label = if gap == 0 {
+                "None".to_owned()
+            } else {
+                format!("{gap} px")
+            };
+            chip(("window-gap", ix), label, self.window_gap == gap).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.window_gap = gap;
+                    this.window_layout_changed(cx);
+                },
+            ))
+        });
+        card()
+            .child(row(
+                "Gap between windows",
+                "Space layouts leave between windows and around the screen's edges.",
+            ))
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(gaps),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Cycle through thirds",
+                    "Running Left Half (or another half) again makes it two thirds, then one third.",
+                )
+                .child(switch(
+                    "window-cycle",
+                    self.window_cycle,
+                    cx.listener(|this, _, _, cx| {
+                        this.window_cycle = !this.window_cycle;
+                        this.window_layout_changed(cx);
+                    }),
+                )),
+            )
+    }
+
+    fn window_layout_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SettingsEvent::WindowLayoutChanged {
+            gap: self.window_gap,
+            cycle: self.window_cycle,
+        });
+        cx.notify();
     }
 
     fn change_file_search(
@@ -2706,6 +2773,10 @@ impl Settings {
             "snippets" => body.extend([
                 section_title("Expansion"),
                 self.snippets_card(cx).into_any_element(),
+            ]),
+            "windows" => body.extend([
+                section_title("Layouts"),
+                self.windows_card(cx).into_any_element(),
             ]),
             "web" => body.extend([
                 section_title("Search Engine"),

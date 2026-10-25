@@ -35,8 +35,9 @@ use spotlight_core::{
     item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
-    view::{ListView, View},
+    view::{Field, FieldKind, FormView, ListView, View},
     web::SearchEngine,
+    window::WindowCommand,
 };
 use spotlight_platform_win::{
     clipboard as system_clipboard, commands, expander, favicon,
@@ -44,6 +45,7 @@ use spotlight_platform_win::{
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     selection, win,
+    wm::{self, RunningApp},
 };
 use spotlight_search::{Candidate, RootSearch, Row, Searcher};
 use spotlight_store::{CachedIcon, Calculation, Store};
@@ -322,6 +324,9 @@ pub struct Launcher {
     /// while the launcher runs shows up on the next [`Self::show`] after
     /// [`GAMES_REFRESH`].
     games_loaded: Instant,
+    /// The apps running when the window was last shown, for Quit Application
+    /// on their rows.
+    running_apps: Vec<RunningApp>,
     results: Vec<Row>,
     selected: usize,
     /// The action panel (Ctrl+K) is open, with this row of it selected:
@@ -520,6 +525,7 @@ impl Launcher {
             input,
             loading: 0,
             games_loaded: Instant::now(),
+            running_apps: Vec::new(),
             search,
             results: Vec::new(),
             selected: 0,
@@ -1086,6 +1092,16 @@ impl Launcher {
                 Entry::new("Always Open Command", EntryKind::OpenLink { always: true }),
             ];
         }
+        if let Some(app) = self.running_app(item) {
+            entries.push(Entry::new(
+                "Quit Application",
+                EntryKind::Command(Command::QuitApp(app.pid)),
+            ));
+            entries.push(Entry::new(
+                "Force Quit Application",
+                EntryKind::Command(Command::ForceQuit(app.pid)),
+            ));
+        }
         let mut add = |entry: Entry| entries.push(entry);
         if self.aliases.contains_key(&item.id) {
             add(Entry::new("Change Alias…", EntryKind::EditAlias));
@@ -1111,6 +1127,27 @@ impl Launcher {
             ));
         }
         entries
+    }
+
+    /// The running app an installed app's row stands for: by its packaged
+    /// app id, or by its program's path.
+    fn running_app(&self, item: &SearchItem) -> Option<&RunningApp> {
+        let launch_id = item.id.strip_prefix(APPS_PROVIDER)?.strip_prefix(':')?;
+        let path = item
+            .actions
+            .iter()
+            .find_map(|action| match &action.command {
+                Command::ShowInFolder(path) => Some(path.as_str()),
+                _ => None,
+            });
+        self.running_apps.iter().find(|app| {
+            app.aumid.as_deref() == Some(launch_id)
+                || path.is_some_and(|path| {
+                    app.exe
+                        .as_deref()
+                        .is_some_and(|exe| exe.eq_ignore_ascii_case(path))
+                })
+        })
     }
 
     fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
@@ -1243,6 +1280,16 @@ impl Launcher {
             self.games_loaded = Instant::now();
             self.reload_catalog("games", window.scale_factor(), cx);
         }
+        let running = cx.background_executor().spawn(async { wm::running_apps() });
+        cx.spawn(async move |this, cx| {
+            let running = running.await;
+            this.update(cx, |this, cx| {
+                this.running_apps = running;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         if !self.screens.is_empty() {
             self.screens.clear();
             self.input.update(cx, |input, cx| {
@@ -1635,6 +1682,14 @@ impl Launcher {
 
     /// Opens a view, or carries out the command and hides the window.
     fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        if let Command::Window {
+            target,
+            command: ask @ (WindowCommand::AskPosition | WindowCommand::AskSize),
+        } = command
+        {
+            let target = target.unwrap_or(self.previous_window);
+            return self.ask_window_frame(target, *ask == WindowCommand::AskSize, window, cx);
+        }
         // The user's own quicklink to one of our commands: run here, trusted.
         if let Command::OpenQuicklink { link, .. } = command
             && deeplink::parse(link).is_ok()
@@ -1784,6 +1839,14 @@ impl Launcher {
     /// result would otherwise be invisible.
     fn run_command(&mut self, command: &Command, cx: &mut Context<Self>) {
         let mut hud: Option<SharedString> = None;
+        if let Command::QuitApp(pid) | Command::ForceQuit(pid) = command {
+            self.running_apps.retain(|app| app.pid != *pid);
+        }
+        // From Switch Windows or the process list: the list stays open,
+        // without the window (or the app's windows) that went.
+        if self.drop_rows_of(command, cx) {
+            return self.run_in_list(command.clone(), cx);
+        }
         match command {
             Command::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
@@ -1892,6 +1955,135 @@ impl Launcher {
             };
             this.update(cx, |this, cx| {
                 if !this.visible {
+                    this.show_hud(text.into(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The form Move Window… (or Resize Window…, `size`) opens: the window's
+    /// position (or size) now, to change.
+    fn ask_window_frame(
+        &mut self,
+        target: isize,
+        size: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(now) = wm::position(target) else {
+            self.hide(cx);
+            return self.show_hud("No app window is active".into(), cx);
+        };
+        let field = |id: &str, label: &str, value: i32| Field {
+            id: id.into(),
+            label: label.into(),
+            kind: FieldKind::Text {
+                placeholder: format!("{value}"),
+                default: value.to_string(),
+                required: false,
+            },
+        };
+        let (title, fields) = if size {
+            (
+                "Resize Window",
+                vec![
+                    field("width", "Width", now.width),
+                    field("height", "Height", now.height),
+                ],
+            )
+        } else {
+            (
+                "Move Window",
+                vec![field("x", "X", now.x), field("y", "Y", now.y)],
+            )
+        };
+        let template = |id: &str| {
+            if fields.iter().any(|field| field.id == id) {
+                format!("{{{id}}}")
+            } else {
+                String::new()
+            }
+        };
+        let submit = Command::SetWindowFrame {
+            target,
+            x: template("x"),
+            y: template("y"),
+            width: template("width"),
+            height: template("height"),
+        };
+        let form = View::Form(FormView {
+            title: title.into(),
+            fields,
+            submit_title: if size { "Resize" } else { "Move" }.into(),
+            submit,
+        });
+        self.push_view(form, window, cx);
+    }
+
+    /// For a window closed or an app quit from an open list: takes the rows
+    /// it removes out of the list. `false` (nothing changed) for any other
+    /// command, or when no row of the list is about it.
+    fn drop_rows_of(&mut self, command: &Command, cx: &mut Context<Self>) -> bool {
+        let gone = |item: &SearchItem| {
+            item.actions
+                .iter()
+                .any(|action| match (command, &action.command) {
+                    (
+                        Command::Window {
+                            target: Some(closed),
+                            command: WindowCommand::Close,
+                        },
+                        Command::Window {
+                            target: Some(target),
+                            ..
+                        },
+                    ) => closed == target,
+                    (
+                        Command::QuitApp(quit) | Command::ForceQuit(quit),
+                        Command::QuitApp(pid) | Command::ForceQuit(pid),
+                    ) => quit == pid,
+                    _ => false,
+                })
+        };
+        let closes = matches!(
+            command,
+            Command::Window {
+                target: Some(_),
+                command: WindowCommand::Close,
+            } | Command::QuitApp(_)
+                | Command::ForceQuit(_)
+        );
+        let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
+            return false;
+        };
+        if !closes || !view.items.iter().any(gone) {
+            return false;
+        }
+        view.items.retain(|item| !gone(item));
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+        true
+    }
+
+    /// Runs `command` in the background with the launcher kept open; what it
+    /// reports ("Ended Notepad", or why it failed) goes in the footer.
+    fn run_in_list(&mut self, command: Command, cx: &mut Context<Self>) {
+        let outcome = commands::spawn(command);
+        cx.spawn(async move |this, cx| {
+            let Ok(outcome) = outcome.recv().await else {
+                return;
+            };
+            let text = match outcome {
+                Ok(Some(text)) | Err(text) => text,
+                Ok(None) => return,
+            };
+            this.update(cx, |this, cx| {
+                if this.visible {
+                    this.show_toast(text.into(), cx);
+                } else {
                     this.show_hud(text.into(), cx);
                 }
             })

@@ -279,6 +279,16 @@ pub enum Command {
         target: Option<isize>,
         command: WindowCommand,
     },
+    /// Moves and resizes window `target` (a raw HWND): pixels, `x` and `y`
+    /// from the top left of its display's work area; an empty one keeps what
+    /// it is. Strings, so a form can fill them in.
+    SetWindowFrame {
+        target: isize,
+        x: String,
+        y: String,
+        width: String,
+        height: String,
+    },
     /// Asks every window of process `pid` to close, as their × buttons would.
     QuitApp(u32),
     /// Ends process `pid` at once; what it hadn't saved is lost.

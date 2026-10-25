@@ -143,6 +143,13 @@ fn run_blocking(command: &Command) -> Outcome {
         Command::Window { target: None, .. } => {
             Err("No window to arrange: the UI fills in the target".into())
         }
+        Command::SetWindowFrame {
+            target,
+            x,
+            y,
+            width,
+            height,
+        } => wm::set_frame_from(*target, [x, y, width, height]),
         Command::QuitApp(pid) => wm::quit_app(*pid),
         Command::ForceQuit(pid) => wm::force_quit(*pid),
     }

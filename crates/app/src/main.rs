@@ -34,12 +34,13 @@ use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
     deeplink, file_search, snippet,
     web::SearchEngine,
+    window as window_layout,
 };
 use spotlight_platform_win::{
     clipboard,
     hotkey::{self, Hotkey},
     instance::{self, Instance},
-    metrics, protocol, vault, win,
+    metrics, protocol, vault, win, wm,
 };
 use spotlight_providers::{Builtins, clipboard::ClipboardHistory, files::Files, web::Web};
 use spotlight_store::{Key, Store};
@@ -98,6 +99,8 @@ struct AppState {
     win_v: Cell<bool>,
     selection_copy: Cell<bool>,
     snippet_expansion: Cell<bool>,
+    /// Pixels layouts leave between windows, and whether halves cycle.
+    window_layout: Cell<(i32, bool)>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -212,6 +215,13 @@ fn main() {
     let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
     let snippet_expansion =
         setting(snippet::EXPANSION_SETTING).is_none_or(|value| value != "false");
+    let window_layout = (
+        setting(window_layout::GAP_SETTING)
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0),
+        setting(window_layout::CYCLE_SETTING).is_none_or(|value| value != "false"),
+    );
+    wm::set_layout_options(window_layout.0, window_layout.1);
     let file_search = file_search::Config::from_settings(setting);
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
@@ -351,6 +361,7 @@ fn main() {
             win_v: Cell::new(win_v),
             selection_copy: Cell::new(selection_copy),
             snippet_expansion: Cell::new(snippet_expansion),
+            window_layout: Cell::new(window_layout),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -521,6 +532,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.win_v.get(),
                 view_state.selection_copy.get(),
                 view_state.snippet_expansion.get(),
+                view_state.window_layout.get(),
                 view_state.files.config(),
                 file_status,
                 env!("SPOTLIGHT_VERSION"),
@@ -665,6 +677,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 })
                 .ok();
             save_setting(state, snippet::EXPANSION_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::WindowLayoutChanged { gap, cycle } => {
+            state.window_layout.set((*gap, *cycle));
+            wm::set_layout_options(*gap, *cycle);
+            save_setting(state, window_layout::GAP_SETTING, gap.to_string(), cx);
+            save_setting(state, window_layout::CYCLE_SETTING, cycle.to_string(), cx);
         }
         SettingsEvent::ExcludedAppsChanged(apps) => {
             state
