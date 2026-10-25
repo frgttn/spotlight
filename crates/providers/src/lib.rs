@@ -9,6 +9,7 @@ pub mod files;
 pub mod games;
 pub mod quicklinks;
 pub mod rates;
+pub mod run;
 pub mod selection;
 pub mod settings_pages;
 pub mod snippets;
@@ -84,6 +85,8 @@ pub struct Builtins {
     pub clipboard: Arc<clipboard::ClipboardHistory>,
     /// To start and stop indexing, and change what it covers.
     pub files: Arc<files::Files>,
+    /// To change its prefix.
+    pub run: Arc<run::Run>,
 }
 
 /// Every built-in provider. `data_dir` is where providers keep caches
@@ -96,7 +99,9 @@ pub fn all(
     store: Option<Arc<Mutex<Store>>>,
     retention: Retention,
     files: spotlight_core::file_search::Config,
+    run_prefix: String,
 ) -> Builtins {
+    let run = Arc::new(run::Run::new(store.clone(), run_prefix));
     let files = Arc::new(files::Files::new(files, store.clone()));
     let web = Arc::new(web::Web::new(engine, store.clone()));
     let clipboard = Arc::new(clipboard::ClipboardHistory::new(
@@ -117,6 +122,7 @@ pub fn all(
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(store.clone())),
         Arc::new(snippets::Snippets::new(store)),
+        run.clone(),
         web.clone(),
         Arc::new(selection::Selection::new(
             web.clone(),
@@ -129,5 +135,6 @@ pub fn all(
         web,
         clipboard,
         files,
+        run,
     }
 }

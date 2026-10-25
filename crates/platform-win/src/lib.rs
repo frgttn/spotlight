@@ -27,6 +27,7 @@ pub mod net;
 pub mod ntfs;
 pub mod protocol;
 pub mod registry;
+pub mod run;
 pub mod selection;
 pub mod system;
 pub mod vault;

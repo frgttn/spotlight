@@ -108,6 +108,12 @@ const MIGRATIONS: &[&str] = &[
     // Lists leave the blobs out; only putting the entry back reads them.
     "ALTER TABLE clips ADD COLUMN html BLOB;
     ALTER TABLE clips ADD COLUMN rtf BLOB;",
+    // Commands run from Run, as typed, most recent first when listed.
+    "CREATE TABLE run_history (
+        command TEXT PRIMARY KEY,
+        runs    INTEGER NOT NULL,
+        used_at INTEGER NOT NULL
+    );",
 ];
 
 /// An icon nobody asked for in this long is forgotten (about two months).
@@ -719,6 +725,30 @@ impl Store {
             .optional()
     }
 
+    /// Commands run from Run, most recently run first, at most `limit`.
+    pub fn run_history(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT command FROM run_history ORDER BY used_at DESC, runs DESC LIMIT ?1")?;
+        stmt.query_map([limit as i64], |row| row.get(0))?.collect()
+    }
+
+    /// `command` was run at `now` (unix seconds).
+    pub fn record_run(&self, command: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_history (command, runs, used_at) VALUES (?1, 1, ?2)
+             ON CONFLICT (command) DO UPDATE SET runs = runs + 1, used_at = ?2",
+            params![command, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_run(&self, command: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM run_history WHERE command = ?1", [command])?;
+        Ok(())
+    }
+
     /// The formatting entry `id` was copied with; empty when it has none.
     pub fn clip_rich(&self, id: i64) -> Result<RichText> {
         Ok(self
@@ -1131,6 +1161,18 @@ mod tests {
         assert_eq!(contents(store.clips(None).unwrap()), ["b"]);
         assert_eq!(store.delete_clip(b).unwrap().unwrap().content, "b");
         assert!(store.clips(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remembers_run_commands() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_run("cmd", 10).unwrap();
+        store.record_run("gpedit.msc", 20).unwrap();
+        store.record_run("cmd", 30).unwrap();
+        assert_eq!(store.run_history(10).unwrap(), ["cmd", "gpedit.msc"]);
+        assert_eq!(store.run_history(1).unwrap(), ["cmd"]);
+        store.forget_run("cmd").unwrap();
+        assert_eq!(store.run_history(10).unwrap(), ["gpedit.msc"]);
     }
 
     #[test]

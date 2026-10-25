@@ -116,6 +116,8 @@ pub enum SettingsEvent {
     },
     /// The apps where snippet keywords don't expand are now these; save them.
     ExcludedAppsChanged(Vec<IgnoredApp>),
+    /// What a root search starts with to run a command; save it.
+    RunPrefixChanged(String),
     /// What File Search indexes changed; save it and index again.
     FileSearchChanged(FileSearchConfig),
     /// Rebuild the file index from scratch.
@@ -192,6 +194,9 @@ pub struct Settings {
     exclusion_input: Entity<TextInput>,
     /// The file prefix of root search, saved as it is typed.
     prefix_input: Entity<TextInput>,
+    /// Run's prefix, saved as it is typed.
+    run_prefix_input: Entity<TextInput>,
+    run_prefix: String,
     /// Redraws the File Search page while indexing, for its count.
     status_refresh: Option<Task<()>>,
     /// The index service's installer or remover is running (behind its UAC
@@ -215,7 +220,7 @@ pub struct Settings {
     relayout: bool,
     focus: FocusHandle,
     recorder: FocusHandle,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
 }
 
 impl EventEmitter<SettingsEvent> for Settings {}
@@ -234,6 +239,7 @@ impl Settings {
         selection_copy: bool,
         snippet_expansion: bool,
         (window_gap, window_cycle): (i32, bool),
+        run_prefix: String,
         file_search: FileSearchConfig,
         file_status: FileStatusReader,
         version: &'static str,
@@ -259,6 +265,11 @@ impl Settings {
             input.set_text(prefix, cx);
             input
         });
+        let run_prefix_input = cx.new(|cx| {
+            let mut input = TextInput::new("Off", cx);
+            input.set_text(run_prefix.clone(), cx);
+            input
+        });
         let subscriptions = [
             cx.on_blur(&recorder, window, |this, _, cx| this.stop_recording(cx)),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -275,6 +286,17 @@ impl Settings {
                 &search,
                 window,
                 |this, _, _: &text_input::Changed, _, cx| this.search_changed(cx),
+            ),
+            cx.subscribe_in(
+                &run_prefix_input,
+                window,
+                |this, input, _: &text_input::Changed, _, cx| {
+                    let prefix = input.read(cx).text().trim().to_owned();
+                    if prefix != this.run_prefix {
+                        this.run_prefix = prefix.clone();
+                        cx.emit(SettingsEvent::RunPrefixChanged(prefix));
+                    }
+                },
             ),
             // Only root search reads it, so nothing is indexed again.
             cx.subscribe_in(
@@ -340,6 +362,8 @@ impl Settings {
             file_status,
             exclusion_input: cx.new(|cx| TextInput::new("Folder name or path", cx)),
             prefix_input,
+            run_prefix_input,
+            run_prefix,
             status_refresh: None,
             service_busy: false,
             service_message: None,
@@ -521,7 +545,9 @@ impl Settings {
             return self.add_exclusion(cx);
         }
         // Saved as typed: Enter just leaves the field.
-        if self.prefix_input.focus_handle(cx).is_focused(window) {
+        if self.prefix_input.focus_handle(cx).is_focused(window)
+            || self.run_prefix_input.focus_handle(cx).is_focused(window)
+        {
             window.focus(&self.focus);
             return;
         }
@@ -1480,21 +1506,7 @@ impl Settings {
                     "In root search",
                     "Start a search with this to find files right there; Tab goes on in Search Files. Empty turns it off.",
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(64.))
-                        .h(px(30.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(rgba(theme::SURFACE_BORDER))
-                        .bg(rgba(theme::SURFACE))
-                        .text_size(px(13.))
-                        .child(self.prefix_input.clone()),
-                ),
+                .child(prefix_field(self.prefix_input.clone())),
             )
             .child(divider())
             .child(self.service_row(cx))
@@ -2774,6 +2786,18 @@ impl Settings {
                 section_title("Expansion"),
                 self.snippets_card(cx).into_any_element(),
             ]),
+            "run" => body.extend([
+                section_title("Prefix"),
+                card()
+                    .child(
+                        row(
+                            "In root search",
+                            "Start a search with this to run what follows, as in Win+R. Empty turns it off; command names (gpedit) still get a Run row.",
+                        )
+                        .child(prefix_field(self.run_prefix_input.clone())),
+                    )
+                    .into_any_element(),
+            ]),
             "windows" => body.extend([
                 section_title("Layouts"),
                 self.windows_card(cx).into_any_element(),
@@ -3140,6 +3164,23 @@ fn divider() -> impl IntoElement {
 }
 
 /// A settings row: title and description on the left, the control on the right.
+/// A short text field at the end of a row: a prefix.
+fn prefix_field(input: Entity<TextInput>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(64.))
+        .h(px(30.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgba(theme::SURFACE_BORDER))
+        .bg(rgba(theme::SURFACE))
+        .text_size(px(13.))
+        .child(input)
+}
+
 fn row(title: impl Into<SharedString>, description: impl Into<SharedString>) -> gpui::Div {
     div()
         .min_h(px(54.))

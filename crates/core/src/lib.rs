@@ -10,6 +10,7 @@ pub mod item;
 pub mod placeholder;
 pub mod provider;
 pub mod quicklink;
+pub mod run;
 pub mod snippet;
 pub mod view;
 pub mod web;

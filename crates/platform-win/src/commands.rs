@@ -23,7 +23,7 @@ use windows::{
 };
 
 use crate::{
-    links,
+    links, run,
     system::{self, Outcome},
     wm,
 };
@@ -150,6 +150,7 @@ fn run_blocking(command: &Command) -> Outcome {
             width,
             height,
         } => wm::set_frame_from(*target, [x, y, width, height]),
+        Command::Run { line, admin } => run::start(line, *admin),
         Command::QuitApp(pid) => wm::quit_app(*pid),
         Command::ForceQuit(pid) => wm::force_quit(*pid),
     }
@@ -162,19 +163,28 @@ fn shell_execute(verb: &str, target: &str) -> Outcome {
 
 /// `ShellExecute` with `verb` and command-line `parameters` for a program, blocking.
 fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
+    shell_execute_in(verb, target, parameters, "")
+}
+
+/// [`shell_execute_with`], started in folder `dir` (empty: ours).
+pub(crate) fn shell_execute_in(verb: &str, target: &str, parameters: &str, dir: &str) -> Outcome {
     let parameters = HSTRING::from(parameters);
+    let dir = HSTRING::from(dir);
+    let optional = |text: &HSTRING| {
+        if text.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(text.as_ptr())
+        }
+    };
     let code = unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(
             None,
             &HSTRING::from(verb),
             &HSTRING::from(target),
-            if parameters.is_empty() {
-                PCWSTR::null()
-            } else {
-                PCWSTR(parameters.as_ptr())
-            },
-            PCWSTR::null(),
+            optional(&parameters),
+            optional(&dir),
             SW_SHOWNORMAL,
         )
         .0 as isize

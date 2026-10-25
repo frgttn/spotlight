@@ -213,6 +213,39 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
         }
     );
 
+    // Run: after its prefix only Run's rows, the typed command first; a
+    // command's name gets a row under the others. Nothing is run.
+    let mut run_titles = Vec::new();
+    for query in [">cmd /k echo spotlight", "notepad"] {
+        press(window, "ctrl-a", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(query, window, cx)
+            })
+            .ok();
+        sleep(SETTLE_MS).await;
+        run_titles.push(
+            window
+                .update(cx, |launcher, _, _| launcher.result_titles())
+                .unwrap_or_default(),
+        );
+    }
+    let prefixed = run_titles[0].first().map(String::as_str);
+    let by_name = run_titles[1].iter().any(|title| title == "Run notepad.exe");
+    eprintln!(
+        "[selftest] run: prefix -> {prefixed:?}, name row: {by_name} {}",
+        if prefixed == Some("Run “cmd /k echo spotlight”")
+            && run_titles[0]
+                .iter()
+                .all(|title| !title.contains("Search Google"))
+            && by_name
+        {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
     let alias = alias_round_trip(window, cx).await;
     eprintln!(
         "[selftest] alias: {alias} {}",

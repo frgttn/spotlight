@@ -32,7 +32,7 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
-    deeplink, file_search, snippet,
+    deeplink, file_search, run as run_command, snippet,
     web::SearchEngine,
     window as window_layout,
 };
@@ -42,7 +42,9 @@ use spotlight_platform_win::{
     instance::{self, Instance},
     metrics, protocol, vault, win, wm,
 };
-use spotlight_providers::{Builtins, clipboard::ClipboardHistory, files::Files, web::Web};
+use spotlight_providers::{
+    Builtins, clipboard::ClipboardHistory, files::Files, run::Run, web::Web,
+};
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
     launcher::{self, Launcher, OpenSettings, Quit, WindowMode},
@@ -96,6 +98,9 @@ struct AppState {
     clipboard: Arc<ClipboardHistory>,
     /// File Search, to index again when what it covers changes.
     files: Arc<Files>,
+    /// Run, to change its prefix.
+    run: Arc<Run>,
+    run_prefix: RefCell<String>,
     win_v: Cell<bool>,
     selection_copy: Cell<bool>,
     snippet_expansion: Cell<bool>,
@@ -222,6 +227,9 @@ fn main() {
         setting(window_layout::CYCLE_SETTING).is_none_or(|value| value != "false"),
     );
     wm::set_layout_options(window_layout.0, window_layout.1);
+    let run_prefix = setting(run_command::PREFIX_SETTING)
+        .map(|prefix| prefix.trim().to_owned())
+        .unwrap_or_else(|| run_command::DEFAULT_PREFIX.to_owned());
     let file_search = file_search::Config::from_settings(setting);
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
@@ -257,12 +265,14 @@ fn main() {
             web,
             clipboard: clipboard_history,
             files,
+            run,
         } = spotlight_providers::all(
             search_engine.clone(),
             data_dir.clone(),
             store.clone(),
             retention,
             file_search.clone(),
+            run_prefix.clone(),
         );
         if !disabled_providers.iter().any(|id| id == FILES_PROVIDER) {
             files.start();
@@ -313,6 +323,7 @@ fn main() {
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 launcher.set_file_prefix(file_search.prefix.clone());
+                launcher.set_run_prefix(run_prefix.clone());
                 // The self-test runs beside a normal instance, which expands them.
                 if !self_test {
                     launcher.start_expander(window, cx);
@@ -358,6 +369,8 @@ fn main() {
             web,
             clipboard: clipboard_history,
             files,
+            run,
+            run_prefix: RefCell::new(run_prefix),
             win_v: Cell::new(win_v),
             selection_copy: Cell::new(selection_copy),
             snippet_expansion: Cell::new(snippet_expansion),
@@ -533,6 +546,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.selection_copy.get(),
                 view_state.snippet_expansion.get(),
                 view_state.window_layout.get(),
+                view_state.run_prefix.borrow().clone(),
                 view_state.files.config(),
                 file_status,
                 env!("SPOTLIGHT_VERSION"),
@@ -708,6 +722,19 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, _| launcher.set_file_prefix(prefix))
                 .ok();
             save_file_search(state, config, cx);
+        }
+        SettingsEvent::RunPrefixChanged(prefix) => {
+            state.run_prefix.replace(prefix.clone());
+            state.run.set_prefix(prefix.clone());
+            state
+                .launcher
+                .update(cx, |launcher, window, cx| {
+                    launcher.set_run_prefix(prefix.clone());
+                    // Its row says what to type.
+                    launcher.reload_provider(spotlight_providers::run::ID, window, cx);
+                })
+                .ok();
+            save_setting(state, run_command::PREFIX_SETTING, prefix.clone(), cx);
         }
         SettingsEvent::FileSearchRebuild => {
             if files_enabled(state, cx) {

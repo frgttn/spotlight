@@ -100,6 +100,8 @@ const APPS_PROVIDER: &str = "apps";
 /// File Search: its provider and the live list root search's file prefix
 /// asks for rows.
 const FILES_PROVIDER: &str = "files";
+/// Run's provider, whose rows alone follow its prefix.
+const RUN_PROVIDER: &str = "run";
 const FILES_VIEW: &str = "search";
 /// How long a footer toast stays.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
@@ -391,6 +393,8 @@ pub struct Launcher {
     asked_icons: HashSet<String>,
     /// What a root search starts with to search files ("*"); empty: off.
     file_prefix: String,
+    /// What a root search starts with to run a command (Run).
+    run_prefix: String,
     /// The files found for root search's text after the file prefix.
     prefix_rows: Vec<SearchItem>,
     visible: bool,
@@ -564,6 +568,7 @@ impl Launcher {
             window_scale: window.scale_factor(),
             asked_icons: HashSet::new(),
             file_prefix: spotlight_core::file_search::DEFAULT_PREFIX.to_owned(),
+            run_prefix: spotlight_core::run::DEFAULT_PREFIX.to_owned(),
             prefix_rows: Vec::new(),
             visible: false,
             window_mode: WindowMode::default(),
@@ -1005,7 +1010,20 @@ impl Launcher {
                 .position(|provider| provider.id() == FILES_PROVIDER)
                 .is_some_and(|ix| search.is_enabled(ix))
         });
+        // After Run's prefix, only Run: what's typed and the past commands.
+        let run = spotlight_core::run::after_prefix(&self.run_prefix, query).and_then(|_| {
+            let ix = search
+                .providers()
+                .iter()
+                .position(|provider| provider.id() == RUN_PROVIDER)?;
+            search
+                .is_enabled(ix)
+                .then(|| search.providers()[ix].clone())
+        });
         self.results = match screens.last() {
+            None if let Some(run) = run => {
+                run.answers(query).into_iter().map(Row::Computed).collect()
+            }
             // Files only, from the files provider (see `search_prefix`), and
             // a row to go on in Search Files: first while nothing follows
             // the prefix, so Enter opens it.
@@ -1819,6 +1837,11 @@ impl Launcher {
                 this.show_toast(message.into(), cx);
                 this.search_live(cx);
                 this.search_prefix(cx);
+                // Rows computed from the query (Run's history) change too.
+                if this.screens.is_empty() {
+                    let query = this.query(cx);
+                    this.refilter(&query);
+                }
             })
             .ok();
         })
@@ -1929,6 +1952,11 @@ impl Launcher {
     /// What a root search starts with to search files; empty turns it off.
     pub fn set_file_prefix(&mut self, prefix: String) {
         self.file_prefix = prefix;
+    }
+
+    /// What a root search starts with to run a command; empty turns it off.
+    pub fn set_run_prefix(&mut self, prefix: String) {
+        self.run_prefix = prefix;
     }
 
     pub fn set_selection_copy(&mut self, enabled: bool) {

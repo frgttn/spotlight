@@ -279,6 +279,12 @@ pub enum Command {
         target: Option<isize>,
         command: WindowCommand,
     },
+    /// Starts a command line as Windows' Run dialog would (`gpedit.msc`,
+    /// `cmd /k ipconfig`), elevated with `admin`. Only Run produces it.
+    Run {
+        line: String,
+        admin: bool,
+    },
     /// Moves and resizes window `target` (a raw HWND): pixels, `x` and `y`
     /// from the top left of its display's work area; an empty one keeps what
     /// it is. Strings, so a form can fill them in.
