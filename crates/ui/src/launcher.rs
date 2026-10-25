@@ -1688,7 +1688,7 @@ impl Launcher {
                 action,
                 item,
             } => self.provider_action(provider, action, item, cx),
-            Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
+            Command::RestoreClip { id, paste, plain } => self.restore_clip(*id, *paste, *plain, cx),
             Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
             Command::ClearClipboardHistory => self.clear_clips(window, cx),

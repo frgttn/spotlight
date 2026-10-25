@@ -17,7 +17,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 pub use rusqlite::{Error, ErrorCode};
 use spotlight_core::{
-    clip::{self, ClipKind, Retention},
+    clip::{self, ClipKind, Retention, RichText},
     frecency::Frecency,
     quicklink::{self, Quicklink},
     snippet::Snippet,
@@ -104,6 +104,10 @@ const MIGRATIONS: &[&str] = &[
         saved_at INTEGER NOT NULL,
         PRIMARY KEY (name, size)
     );",
+    // The formatting copied with a text entry, to paste it back formatted.
+    // Lists leave the blobs out; only putting the entry back reads them.
+    "ALTER TABLE clips ADD COLUMN html BLOB;
+    ALTER TABLE clips ADD COLUMN rtf BLOB;",
 ];
 
 /// An icon nobody asked for in this long is forgotten (about two months).
@@ -226,6 +230,9 @@ pub struct Clip {
     pub pinned: bool,
     /// Unix seconds, of the latest copy.
     pub copied_at: i64,
+    /// Whether formatting came with the text (see [`Store::clip_rich`]).
+    /// Read only: [`Store::add_clip`] takes the formatting itself.
+    pub rich: bool,
 }
 
 impl Clip {
@@ -239,7 +246,8 @@ impl Clip {
     }
 }
 
-const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at";
+const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at,
+    html IS NOT NULL OR rtf IS NOT NULL";
 
 fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
     let kind: String = row.get(1)?;
@@ -253,6 +261,7 @@ fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
         app_path: row.get(6)?,
         pinned: row.get(7)?,
         copied_at: row.get(8)?,
+        rich: row.get(9)?,
     })
 }
 
@@ -643,7 +652,7 @@ impl Store {
     /// (newer id, so it's first even within the same second), keeping its
     /// pin, and its app if `clip` has none (as when Spotlight itself put it
     /// back). Returns the new id and whether the content is new.
-    pub fn add_clip(&mut self, clip: &Clip, hash: &str) -> Result<(i64, bool)> {
+    pub fn add_clip(&mut self, clip: &Clip, hash: &str, rich: &RichText) -> Result<(i64, bool)> {
         let tx = self.conn.transaction()?;
         let existing = tx
             .query_row(
@@ -668,8 +677,8 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO clips
-                (kind, content, hash, width, height, app, app_path, pinned, copied_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (kind, content, hash, width, height, app, app_path, pinned, copied_at, html, rtf)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 clip.kind.as_str(),
                 clip.content,
@@ -679,7 +688,9 @@ impl Store {
                 app,
                 app_path,
                 pinned,
-                clip.copied_at
+                clip.copied_at,
+                rich.html,
+                rich.rtf
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -706,6 +717,20 @@ impl Store {
                 clip_row,
             )
             .optional()
+    }
+
+    /// The formatting entry `id` was copied with; empty when it has none.
+    pub fn clip_rich(&self, id: i64) -> Result<RichText> {
+        Ok(self
+            .conn
+            .query_row("SELECT html, rtf FROM clips WHERE id = ?1", [id], |row| {
+                Ok(RichText {
+                    html: row.get(0)?,
+                    rtf: row.get(1)?,
+                })
+            })
+            .optional()?
+            .unwrap_or_default())
     }
 
     pub fn pin_clip(&self, id: i64, pinned: bool) -> Result<()> {
@@ -993,6 +1018,7 @@ mod tests {
             app_path: None,
             pinned: false,
             copied_at,
+            rich: false,
         }
     }
 
@@ -1075,15 +1101,19 @@ mod tests {
     #[test]
     fn clipboard_history_moves_repeats_up_and_pins_first() {
         let mut store = Store::open_in_memory().unwrap();
-        let (a, new) = store.add_clip(&text_clip("a", 10), "ha").unwrap();
+        let (a, new) = store
+            .add_clip(&text_clip("a", 10), "ha", &RichText::default())
+            .unwrap();
         assert!(new);
-        store.add_clip(&text_clip("b", 20), "hb").unwrap();
+        store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
         // Copied again, by Spotlight itself (no app): moves up, keeps its app.
         let again = Clip {
             app: None,
             ..text_clip("a", 30)
         };
-        let (again_id, new) = store.add_clip(&again, "ha").unwrap();
+        let (again_id, new) = store.add_clip(&again, "ha", &RichText::default()).unwrap();
         assert!(!new && again_id != a);
         assert_eq!(store.clip(a).unwrap(), None);
         assert_eq!(contents(store.clips(None).unwrap()), ["a", "b"]);
@@ -1104,11 +1134,38 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_formatting_out_of_lists() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rich = RichText {
+            html: Some(b"Version:0.9 <b>a</b>".to_vec()),
+            rtf: None,
+        };
+        let (id, _) = store.add_clip(&text_clip("a", 10), "ha", &rich).unwrap();
+        let (plain, _) = store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
+        let clips = store.clips(None).unwrap();
+        assert_eq!(
+            clips.iter().map(|clip| clip.rich).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(store.clip_rich(id).unwrap(), rich);
+        assert!(store.clip_rich(plain).unwrap().is_empty());
+        // Copied again without formatting: the entry loses it.
+        let (again, _) = store
+            .add_clip(&text_clip("a", 30), "ha", &RichText::default())
+            .unwrap();
+        assert!(!store.clip(again).unwrap().unwrap().rich);
+    }
+
+    #[test]
     fn trimming_keeps_the_newest_and_drops_the_old() {
         let mut store = Store::open_in_memory().unwrap();
         for ix in 0..6 {
             let text = ix.to_string();
-            store.add_clip(&text_clip(&text, ix * 100), &text).unwrap();
+            store
+                .add_clip(&text_clip(&text, ix * 100), &text, &RichText::default())
+                .unwrap();
         }
         let oldest = store.clips(None).unwrap().last().unwrap().id;
         store.pin_clip(oldest, true).unwrap();

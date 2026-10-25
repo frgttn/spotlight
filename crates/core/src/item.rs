@@ -155,6 +155,8 @@ pub mod shortcut {
     pub const PIN: &str = "ctrl-.";
     /// Shows more about it: Show Details.
     pub const INFO: &str = "ctrl-i";
+    /// Pastes it another way: as plain text.
+    pub const PASTE_PLAIN: &str = "ctrl-shift-v";
 }
 
 /// What an action does. A closed set of safe operations: providers describe
@@ -245,6 +247,8 @@ pub enum Command {
     RestoreClip {
         id: i64,
         paste: bool,
+        /// Only the text, without the formatting it was copied with.
+        plain: bool,
     },
     /// Pins or unpins a clipboard history entry: pinned ones stay at the top
     /// and are never trimmed.

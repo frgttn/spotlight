@@ -19,7 +19,7 @@ use image::{ImageFormat, imageops::FilterType};
 use spotlight_core::{
     clip::{self, ClipKind, IGNORED_APPS_SETTING, IgnoredApp, Retention},
     frecency,
-    item::{Command, Icon, SearchItem},
+    item::{Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     view::{ListFilter, ListView, Preview, PreviewBody, View},
@@ -108,6 +108,7 @@ impl ClipboardHistory {
             app_path: path,
             pinned: false,
             copied_at: frecency::now(),
+            rich: !copied.rich.is_empty(),
         };
         let hash = match copied.content {
             Content::Text(text) => {
@@ -135,7 +136,11 @@ impl ClipboardHistory {
         let added = store
             .lock()
             .map_err(|_| "store lock poisoned".to_owned())
-            .and_then(|mut store| store.add_clip(&clip, &hash).map_err(|err| err.to_string()));
+            .and_then(|mut store| {
+                store
+                    .add_clip(&clip, &hash, &copied.rich)
+                    .map_err(|err| err.to_string())
+            });
         if let Err(err) = added {
             eprintln!("[clipboard] could not save a clipboard entry: {err}");
         }
@@ -399,6 +404,7 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
             Command::RestoreClip {
                 id: clip.id,
                 paste: true,
+                plain: false,
             },
         )
         .action(
@@ -406,8 +412,21 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
             Command::RestoreClip {
                 id: clip.id,
                 paste: false,
+                plain: false,
             },
         );
+    if clip.rich {
+        item = item
+            .action(
+                "Paste as Plain Text",
+                Command::RestoreClip {
+                    id: clip.id,
+                    paste: true,
+                    plain: true,
+                },
+            )
+            .shortcut(shortcut::PASTE_PLAIN);
+    }
     item.keywords = keywords;
     match (tag, paths.as_slice()) {
         (Tag::Link, _) => {
@@ -465,6 +484,9 @@ fn preview(clip: &Clip, tag: Tag, paths: &[&str], now: i64) -> Preview {
     if let Some(app) = &clip.app {
         metadata.push(("Application".into(), app.clone()));
     }
+    if clip.rich {
+        metadata.push(("Formatting".into(), "Kept".into()));
+    }
     match clip.kind {
         ClipKind::Text => {
             let text = &clip.content;
@@ -506,6 +528,7 @@ fn hash(kind: u8, bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use spotlight_core::clip::RichText;
     use spotlight_platform_win::clipboard::Image;
 
     use super::*;
@@ -522,6 +545,7 @@ mod tests {
     fn copied(content: Content) -> Copied {
         Copied {
             content,
+            rich: RichText::default(),
             app: Some(("Notepad".into(), r"C:\Windows\notepad.exe".into())),
         }
     }
@@ -612,6 +636,35 @@ mod tests {
     }
 
     #[test]
+    fn formatted_text_can_paste_plain() {
+        let history = history();
+        history.record(copied(Content::Text("plain".into())));
+        history.record(Copied {
+            rich: RichText {
+                html: Some(b"<b>bold</b>".to_vec()),
+                rtf: None,
+            },
+            ..copied(Content::Text("bold".into()))
+        });
+        let items = history.history().items;
+        let plain_paste = |item: &SearchItem| {
+            item.actions.iter().any(|action| {
+                matches!(
+                    action.command,
+                    Command::RestoreClip {
+                        plain: true,
+                        paste: true,
+                        ..
+                    }
+                )
+            })
+        };
+        assert_eq!(items[0].title, "bold");
+        assert!(plain_paste(&items[0]));
+        assert!(!plain_paste(&items[1]));
+    }
+
+    #[test]
     fn ignored_apps_are_not_kept() {
         let history = history();
         let store = history.store.clone().unwrap();
@@ -627,6 +680,7 @@ mod tests {
         history.record(copied(Content::Text("from notepad".into())));
         history.record(Copied {
             content: Content::Text("from elsewhere".into()),
+            rich: RichText::default(),
             app: Some(("Other".into(), r"C:\other.exe".into())),
         });
         assert_eq!(titles(&history), ["from elsewhere"]);
