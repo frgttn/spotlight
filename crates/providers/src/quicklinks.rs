@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use spotlight_core::{
     favicon,
-    item::{Action, Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     quicklink::{self, Argument, DEFAULTS, Quicklink},
@@ -103,6 +103,7 @@ impl Quicklinks {
             let edit = self.edit_form("Edit Quicklink", link);
             item = item
                 .action("Edit Quicklink…", Command::PushView(Box::new(edit)))
+                .shortcut(shortcut::EDIT)
                 .action("Delete Quicklink", Command::DeleteQuicklink(link.id));
         }
         item
@@ -312,10 +313,10 @@ impl Quicklinks {
 
 /// Enter on a suggestion: `!g` becomes `!gh `, ready for the text.
 fn complete_action(trigger: &str) -> Action {
-    Action {
-        title: format!("Use !{trigger}"),
-        command: Command::Complete(format!("!{trigger} ")),
-    }
+    Action::new(
+        format!("Use !{trigger}"),
+        Command::Complete(format!("!{trigger} ")),
+    )
 }
 
 /// Opens `link`, or its form when an argument is still missing: `values` are
@@ -334,10 +335,7 @@ fn open_action(link: &Quicklink, values: &[String]) -> Action {
     } else {
         Command::PushView(Box::new(arguments_form(link, &arguments, values)))
     };
-    Action {
-        title: "Open Quicklink".into(),
-        command,
-    }
+    Action::new("Open Quicklink", command)
 }
 
 /// A field per argument; submitting opens the link with them.

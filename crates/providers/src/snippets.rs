@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use spotlight_core::{
-    item::{Action, Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     snippet::{self, Argument, Snippet},
@@ -81,6 +81,7 @@ impl Snippets {
             let duplicate = edit_form("Duplicate Snippet", &copy);
             item = item
                 .action("Edit Snippet…", Command::PushView(Box::new(edit)))
+                .shortcut(shortcut::EDIT)
                 .action("Duplicate Snippet…", Command::PushView(Box::new(duplicate)))
                 .action("Delete Snippet", Command::DeleteSnippet(snippet.id));
         }
@@ -219,15 +220,12 @@ fn paste_action(snippet: &Snippet, paste: bool) -> Action {
     } else {
         Command::PushView(Box::new(arguments_form(snippet, &arguments, paste)))
     };
-    Action {
-        title: if paste {
-            "Paste Snippet"
-        } else {
-            "Copy Snippet"
-        }
-        .into(),
-        command,
-    }
+    let title = if paste {
+        "Paste Snippet"
+    } else {
+        "Copy Snippet"
+    };
+    Action::new(title, command)
 }
 
 /// A field per argument; submitting pastes the snippet with them.

@@ -22,15 +22,16 @@ use std::{
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
-    Hsla, KeyBinding, RenderImage, SharedString, Subscription, Task, UniformListScrollHandle,
-    Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
+    Hsla, KeyBinding, KeyDownEvent, Keystroke, RenderImage, ScrollHandle, SharedString,
+    Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla, img,
+    prelude::*, px, rgb, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     deeplink,
     frecency::{self, Frecency},
-    item::{Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     view::{ListView, View},
@@ -156,6 +157,8 @@ impl Provider for Synthetic {
 struct Entry {
     title: String,
     kind: EntryKind,
+    /// The keys it asks for; see [`entry_keys`] for the ones it gets.
+    shortcut: Option<String>,
 }
 
 #[derive(Clone)]
@@ -179,6 +182,27 @@ enum EntryKind {
 }
 
 impl Entry {
+    fn new(title: impl Into<String>, kind: EntryKind) -> Self {
+        Self {
+            title: title.into(),
+            kind,
+            shortcut: None,
+        }
+    }
+
+    fn of(action: &Action) -> Self {
+        Self {
+            title: action.title.clone(),
+            kind: EntryKind::Command(action.command.clone()),
+            shortcut: action.shortcut().map(str::to_owned),
+        }
+    }
+
+    fn with_shortcut(mut self, keys: &str) -> Self {
+        self.shortcut = Some(keys.to_owned());
+        self
+    }
+
     fn needs_confirmation(&self) -> bool {
         match &self.kind {
             EntryKind::Command(command) => command.needs_confirmation(),
@@ -299,8 +323,14 @@ pub struct Launcher {
     games_loaded: Instant,
     results: Vec<Row>,
     selected: usize,
-    /// The action panel (Ctrl+K) is open, with this action selected.
+    /// The action panel (Ctrl+K) is open, with this row of it selected:
+    /// an index into [`Self::panel_entries`], which its search narrows.
     panel: Option<usize>,
+    /// The panel's search field, which has the keyboard while it's open.
+    panel_input: Entity<TextInput>,
+    /// What had the keyboard before the panel opened, to give it back.
+    panel_return: Option<FocusHandle>,
+    panel_scroll: ScrollHandle,
     /// Set by a first Enter on an action that asks for confirmation (restart,
     /// shut down): that item's id and the action's index. Moving the selection
     /// or typing clears it.
@@ -403,7 +433,13 @@ impl Launcher {
         win::round_corners(hwnd);
 
         let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
+        let panel_input = cx.new(|cx| TextInput::new("Search for actions…", cx));
         let subscriptions = vec![
+            cx.subscribe(&panel_input, |this, _, _: &text_input::Changed, cx| {
+                if this.panel.is_some() {
+                    this.select_panel_row(0, cx);
+                }
+            }),
             cx.subscribe_in(
                 &input,
                 window,
@@ -484,6 +520,9 @@ impl Launcher {
             results: Vec::new(),
             selected: 0,
             panel: None,
+            panel_input,
+            panel_return: None,
+            panel_scroll: ScrollHandle::new(),
             confirming: None,
             pending_link: None,
             trusted_links,
@@ -1017,27 +1056,20 @@ impl Launcher {
     /// keep an alias, a hotkey or a ranking.
     fn actions_for(&self, row: &Row) -> Vec<Entry> {
         let item = self.item(row);
-        let mut entries: Vec<Entry> = item
-            .actions
-            .iter()
-            .map(|action| Entry {
-                title: action.title.clone(),
-                kind: EntryKind::Command(action.command.clone()),
-            })
-            .collect();
+        let mut entries: Vec<Entry> = item.actions.iter().map(Entry::of).collect();
         if let Some(id) = item
             .id
             .strip_prefix(HISTORY_ITEM)
             .and_then(|id| id.parse().ok())
         {
-            entries.push(Entry {
-                title: "Delete Entry".into(),
-                kind: EntryKind::DeleteCalculation(id),
-            });
-            entries.push(Entry {
-                title: "Clear History".into(),
-                kind: EntryKind::ClearCalculations,
-            });
+            entries.push(
+                Entry::new("Delete Entry", EntryKind::DeleteCalculation(id))
+                    .with_shortcut(shortcut::CLEAR),
+            );
+            entries.push(
+                Entry::new("Clear History", EntryKind::ClearCalculations)
+                    .with_shortcut(shortcut::CLEAR_ALL),
+            );
             return entries;
         }
         if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
@@ -1045,40 +1077,33 @@ impl Launcher {
         }
         if self.link_pending_for(&item.id) {
             return vec![
-                Entry {
-                    title: "Open Command".into(),
-                    kind: EntryKind::OpenLink { always: false },
-                },
-                Entry {
-                    title: "Always Open Command".into(),
-                    kind: EntryKind::OpenLink { always: true },
-                },
+                Entry::new("Open Command", EntryKind::OpenLink { always: false }),
+                Entry::new("Always Open Command", EntryKind::OpenLink { always: true }),
             ];
         }
-        let mut add = |title: &str, kind| {
-            entries.push(Entry {
-                title: title.to_owned(),
-                kind,
-            })
-        };
+        let mut add = |entry: Entry| entries.push(entry);
         if self.aliases.contains_key(&item.id) {
-            add("Change Alias…", EntryKind::EditAlias);
-            add("Remove Alias", EntryKind::RemoveAlias);
+            add(Entry::new("Change Alias…", EntryKind::EditAlias));
+            add(Entry::new("Remove Alias", EntryKind::RemoveAlias));
         } else {
-            add("Set Alias…", EntryKind::EditAlias);
+            add(Entry::new("Set Alias…", EntryKind::EditAlias));
         }
         if self.item_hotkeys.contains_key(&item.id) {
-            add("Change Hotkey…", EntryKind::RecordHotkey);
-            add("Remove Hotkey", EntryKind::RemoveHotkey);
+            add(Entry::new("Change Hotkey…", EntryKind::RecordHotkey));
+            add(Entry::new("Remove Hotkey", EntryKind::RemoveHotkey));
         } else {
-            add("Set Hotkey…", EntryKind::RecordHotkey);
+            add(Entry::new("Set Hotkey…", EntryKind::RecordHotkey));
         }
         if self.frecency.contains_key(&item.id) {
-            add("Reset Ranking", EntryKind::ResetRanking);
+            add(Entry::new("Reset Ranking", EntryKind::ResetRanking));
         }
-        add("Copy Deeplink", EntryKind::CopyDeeplink);
+        add(Entry::new("Copy Deeplink", EntryKind::CopyDeeplink)
+            .with_shortcut(shortcut::COPY_DEEPLINK));
         if self.trusted_links.contains(&item.id) {
-            add("Ask Before Opening from Links", EntryKind::DistrustLink);
+            add(Entry::new(
+                "Ask Before Opening from Links",
+                EntryKind::DistrustLink,
+            ));
         }
         entries
     }
@@ -1107,11 +1132,12 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
-    /// Types into the field that has the keyboard: the alias editor's while
-    /// it's open, or a form's focused text field.
+    /// Types into the field that has the keyboard: the alias editor's or the
+    /// action panel's while open, or a form's focused text field.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let input = match &self.editor {
             Some(Editor::Alias { input, .. }) => input.clone(),
+            _ if self.panel.is_some() => self.panel_input.clone(),
             _ => self
                 .focused_form_input(window, cx)
                 .unwrap_or_else(|| self.input.clone()),
@@ -1122,12 +1148,12 @@ impl Launcher {
     }
 
     /// The action selected in the open panel. For the self-test.
-    pub fn panel_selected(&self) -> Option<String> {
-        let selected = self.panel?;
-        self.selected_actions()
+    pub fn panel_selected(&self, cx: &App) -> Option<String> {
+        let row = self.panel?;
+        self.panel_entries(cx)
             .into_iter()
-            .nth(selected)
-            .map(|entry| entry.title)
+            .nth(row)
+            .map(|(_, entry)| entry.title)
     }
 
     /// Whether the alias editor is open. For the self-test.
@@ -1145,14 +1171,14 @@ impl Launcher {
         self.loading == 0
     }
 
-    /// Action titles in the open action panel, or `None` when it's closed.
-    /// For the self-test.
-    pub fn panel_actions(&self) -> Option<Vec<String>> {
+    /// Action titles in the open action panel (those its search keeps), or
+    /// `None` when it's closed. For the self-test.
+    pub fn panel_actions(&self, cx: &App) -> Option<Vec<String>> {
         self.panel?;
         Some(
-            self.selected_actions()
+            self.panel_entries(cx)
                 .into_iter()
-                .map(|action| action.title)
+                .map(|(_, entry)| entry.title)
                 .collect(),
         )
     }
@@ -1264,11 +1290,9 @@ impl Launcher {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(action) = self.panel {
-            let count = self.selected_actions().len();
-            self.panel = Some((action + 1).min(count.saturating_sub(1)));
-            cx.notify();
-            return;
+        if let Some(row) = self.panel {
+            let count = self.panel_entries(cx).len();
+            return self.select_panel_row((row + 1).min(count.saturating_sub(1)), cx);
         }
         if self.collapsed(cx) {
             self.revealed = true;
@@ -1290,10 +1314,8 @@ impl Launcher {
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(action) = self.panel {
-            self.panel = Some(action.saturating_sub(1));
-            cx.notify();
-            return;
+        if let Some(row) = self.panel {
+            return self.select_panel_row(row.saturating_sub(1), cx);
         }
         if self.in_grid() {
             return self.grid_move(-(GRID_COLUMNS as isize), cx);
@@ -1313,19 +1335,57 @@ impl Launcher {
     /// or a detail view's own.
     fn selected_actions(&self) -> Vec<Entry> {
         if let Some(Screen::Detail { view, .. }) = self.screens.last() {
-            return view
-                .actions
-                .iter()
-                .map(|action| Entry {
-                    title: action.title.clone(),
-                    kind: EntryKind::Command(action.command.clone()),
-                })
-                .collect();
+            return view.actions.iter().map(Entry::of).collect();
         }
         self.results
             .get(self.selected)
             .map(|row| self.actions_for(row))
             .unwrap_or_default()
+    }
+
+    /// The selected actions the panel's search keeps, each with its index
+    /// among them all (what [`Self::run_action`] takes).
+    fn panel_entries(&self, cx: &App) -> Vec<(usize, Entry)> {
+        let query = self.panel_input.read(cx).text().to_lowercase();
+        self.selected_actions()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, entry)| matches_words(&entry.title, &query))
+            .collect()
+    }
+
+    /// The action of the panel row selected, as an index among them all;
+    /// `None` when the panel is closed or its search kept nothing.
+    fn panel_action(&self, cx: &App) -> Option<usize> {
+        let row = self.panel?;
+        self.panel_entries(cx).get(row).map(|&(ix, _)| ix)
+    }
+
+    fn select_panel_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.panel = Some(row);
+        self.panel_scroll.scroll_to_item(row);
+        cx.notify();
+    }
+
+    /// Runs the action whose own keys were pressed, panel open or not: the
+    /// launcher's bindings (Enter, Ctrl+K…) and the search field's got the
+    /// keystroke first and passed on it.
+    fn run_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() || self.collapsed(cx) {
+            return;
+        }
+        let entries = self.selected_actions();
+        let pressed = &event.keystroke;
+        let Some(ix) = own_keys(&entries).iter().position(|keys| {
+            keys.as_deref()
+                .and_then(|keys| Keystroke::parse(keys).ok())
+                .is_some_and(|keys| keys.modifiers == pressed.modifiers && keys.key == pressed.key)
+        }) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.panel = None;
+        self.run_action(ix, window, cx);
     }
 
     // ←/→ that the search field passes on in a grid.
@@ -1344,6 +1404,9 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.panel.is_some() {
+            return;
+        }
         // After the file prefix, Tab goes on in Search Files.
         if self.screens.is_empty() {
             let query = self.query(cx);
@@ -1363,7 +1426,7 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.step_filter(false, cx) {
+        if self.panel.is_none() && !self.step_filter(false, cx) {
             self.focus_field(false, window, cx);
         }
     }
@@ -1393,10 +1456,14 @@ impl Launcher {
             Some(Editor::Hotkey { .. }) => return,
             None => {}
         }
+        // The panel's search kept nothing: nothing to run.
+        if self.panel.is_some() && self.panel_action(cx).is_none() {
+            return;
+        }
         match self.screens.last() {
             Some(Screen::Form(_)) if self.panel.is_none() => return self.submit_form(window, cx),
             Some(Screen::Detail { .. }) => {
-                let action = self.panel.unwrap_or(0);
+                let action = self.panel_action(cx).unwrap_or(0);
                 return self.run_action(action, window, cx);
             }
             _ => {}
@@ -1410,7 +1477,7 @@ impl Launcher {
                     .is_some_and(|row| &self.item(row).id == id)
             })
             .map(|&(_, action)| action);
-        let action = self.panel.or(waiting).unwrap_or(0);
+        let action = self.panel_action(cx).or(waiting).unwrap_or(0);
         if self.selected_actions().is_empty() {
             self.hide(cx);
         } else {
@@ -1437,16 +1504,18 @@ impl Launcher {
         self.run_action(1, window, cx);
     }
 
-    fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_actions(&mut self, _: &ToggleActions, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             return;
         }
-        self.panel = match self.panel {
-            Some(_) => None,
-            None if !self.selected_actions().is_empty() => Some(0),
-            None => None,
-        };
         self.confirming = None;
+        if self.panel.take().is_none() && !self.selected_actions().is_empty() {
+            self.panel_input.update(cx, |input, cx| input.clear(cx));
+            self.panel_return = window.focused(cx);
+            window.focus(&self.panel_input.focus_handle(cx));
+            self.select_panel_row(0, cx);
+        }
+        // Closing gives the keyboard back in `render`.
         cx.notify();
     }
 
@@ -2496,53 +2565,47 @@ impl Launcher {
         }
     }
 
-    /// The Ctrl+K panel: the selected item's actions, above the footer's right end.
+    /// The Ctrl+K panel: the selected item's actions, above the footer's
+    /// right end, with a search field under them.
     fn render_panel(&self, selected: usize, cx: &mut Context<Self>) -> AnyElement {
         let title = self
             .results
             .get(self.selected)
             .map(|row| SharedString::from(self.item(row).title.clone()))
             .unwrap_or_default();
-        let rows = self
-            .selected_actions()
-            .into_iter()
-            .enumerate()
-            .map(|(ix, action)| {
-                let shortcut = match ix {
-                    0 => Some("Enter"),
-                    1 => Some("Ctrl Enter"),
-                    _ => None,
-                };
-                div()
-                    .id(ix)
-                    .h(px(32.))
-                    .px_2()
-                    .mx_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(5.))
-                    .when(ix == selected, |row| row.bg(rgba(0xffffff1f)))
-                    .when(ix != selected, |row| {
-                        row.hover(|style| style.bg(rgba(0xffffff0f)))
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .child(SharedString::from(action.title)),
-                    )
-                    .children(shortcut.map(keycaps))
-            });
+        let keys = entry_keys(&self.selected_actions());
+        let entries = self.panel_entries(cx);
+        let empty = entries.is_empty();
+        let rows = entries.into_iter().enumerate().map(|(row, (ix, entry))| {
+            div()
+                .id(row)
+                .flex_none()
+                .h(px(32.))
+                .px_2()
+                .mx_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(5.))
+                .when(row == selected, |row| row.bg(rgba(0xffffff1f)))
+                .when(row != selected, |row| {
+                    row.hover(|style| style.bg(rgba(0xffffff0f)))
+                })
+                .on_click(cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)))
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(SharedString::from(entry.title)),
+                )
+                .children(keys[ix].as_deref().map(|keys| keycaps(&keys_label(keys))))
+        });
         div()
             .absolute()
             .right(px(10.))
             .bottom(px(38.))
-            .w(px(300.))
-            .py_1()
+            .w(px(320.))
+            .pt_1()
             .flex()
             .flex_col()
             .rounded(px(8.))
@@ -2561,7 +2624,36 @@ impl Launcher {
                     .truncate()
                     .child(title),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("panel-rows")
+                    .max_h(px(PANEL_ROWS * 32.))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.panel_scroll)
+                    .children(rows)
+                    .when(empty, |list| {
+                        list.child(
+                            div()
+                                .h(px(32.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .text_color(rgba(theme::TEXT_FAINT))
+                                .child("No matching actions"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgba(theme::SURFACE_BORDER))
+                    .child(self.panel_input.clone()),
+            )
             .into_any_element()
     }
 
@@ -2723,6 +2815,15 @@ impl Launcher {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The panel closed (an action ran, Esc, the list changed) while its
+        // search field had the keyboard: give it back.
+        if self.panel.is_none() && self.panel_input.focus_handle(cx).is_focused(window) {
+            let back = self
+                .panel_return
+                .take()
+                .unwrap_or_else(|| self.input.focus_handle(cx));
+            window.focus(&back);
+        }
         if let Some(text) = &self.hud {
             // An explicit size from the top left, not `size_full`: GPUI can
             // still think the window has the launcher's size when the HUD's
@@ -2840,6 +2941,7 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::prev_choice))
             .on_action(cx.listener(Self::toggle_choice))
             .on_action(cx.listener(Self::dismiss))
+            .on_key_down(cx.listener(Self::run_shortcut))
             .track_focus(&self.focus)
             .size_full()
             .flex()
@@ -3009,6 +3111,77 @@ fn days_ago(then: i64, now: i64) -> String {
 }
 
 /// Key caps for a shortcut such as `"Ctrl K"`, one per key.
+/// How many rows the action panel shows before it scrolls.
+const PANEL_ROWS: f32 = 9.;
+
+/// Keys the launcher and its search field keep for themselves; an action
+/// asking for one of them gets none.
+const RESERVED_KEYS: &[&str] = &[
+    "enter",
+    "ctrl-enter",
+    "ctrl-k",
+    "ctrl-n",
+    "ctrl-p",
+    "ctrl-q",
+    "ctrl-,",
+    "ctrl-a",
+    "ctrl-c",
+    "ctrl-v",
+    "ctrl-x",
+];
+
+/// The keys each action runs with besides the panel: the ones it asks for,
+/// unless the launcher keeps them or an action above took them. The first
+/// two also run with Enter and Ctrl+Enter.
+fn own_keys(entries: &[Entry]) -> Vec<Option<String>> {
+    let mut taken: Vec<&str> = Vec::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let keys = entry
+                .shortcut
+                .as_deref()
+                .filter(|keys| !RESERVED_KEYS.contains(keys) && !taken.contains(keys))?;
+            taken.push(keys);
+            Some(keys.to_owned())
+        })
+        .collect()
+}
+
+/// The keys the panel shows beside each action: Enter and Ctrl+Enter for
+/// the first two (their own keys still work, as in Raycast), then
+/// [`own_keys`].
+fn entry_keys(entries: &[Entry]) -> Vec<Option<String>> {
+    let mut keys = own_keys(entries);
+    for (ix, shown) in ["enter", "ctrl-enter"].into_iter().enumerate() {
+        if let Some(keys) = keys.get_mut(ix) {
+            *keys = Some(shown.to_owned());
+        }
+    }
+    keys
+}
+
+/// `ctrl-shift-c` as the keycaps show it: `Ctrl Shift C`.
+fn keys_label(keys: &str) -> String {
+    keys.split('-')
+        .map(|key| match key {
+            "ctrl" => "Ctrl".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "enter" => "Enter".to_owned(),
+            key => key.to_uppercase(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether every word of `query` (lowercase) is in `title`, as the action
+/// panel's search keeps actions.
+fn matches_words(title: &str, query: &str) -> bool {
+    let title = title.to_lowercase();
+    query.split_whitespace().all(|word| title.contains(word))
+}
+
 fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
     let keys: Vec<SharedString> = shortcut
         .split(' ')
@@ -3091,6 +3264,57 @@ const FILLER: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gives_actions_their_keys() {
+        let entry = |title: &str, keys: Option<&str>| Entry {
+            title: title.to_owned(),
+            kind: EntryKind::ResetRanking,
+            shortcut: keys.map(str::to_owned),
+        };
+        let entries = [
+            entry("Open", Some("ctrl-o")),
+            entry("Run as Administrator", Some(shortcut::TERTIARY)),
+            entry("Copy Path", Some(shortcut::COPY_TERTIARY)),
+            entry("Select All", Some("ctrl-a")),
+            entry("Reset Ranking", None),
+            entry("Copy File", Some(shortcut::COPY)),
+            entry("Copy Deeplink", Some(shortcut::COPY_DEEPLINK)),
+        ];
+        let keys = entry_keys(&entries);
+        assert_eq!(
+            keys.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            [
+                Some("enter"),
+                Some("ctrl-enter"),
+                Some("alt-shift-c"),
+                // The search field's Select All, and taken by Copy File.
+                None,
+                None,
+                Some("ctrl-shift-c"),
+                None,
+            ]
+        );
+        // The second action's own keys still run it.
+        assert_eq!(
+            own_keys(&entries)[..2],
+            [
+                Some("ctrl-o".to_owned()),
+                Some("ctrl-shift-enter".to_owned())
+            ]
+        );
+        assert_eq!(keys_label("ctrl-shift-c"), "Ctrl Shift C");
+        assert_eq!(keys_label("ctrl-alt-enter"), "Ctrl Alt Enter");
+        assert_eq!(keys_label("ctrl-."), "Ctrl .");
+    }
+
+    #[test]
+    fn searches_actions_by_words() {
+        assert!(matches_words("Copy Deeplink", ""));
+        assert!(matches_words("Copy Deeplink", "deep"));
+        assert!(matches_words("Move to Recycle Bin", "bin move"));
+        assert!(!matches_words("Copy Path", "copy name"));
+    }
 
     #[test]
     fn says_how_long_ago() {

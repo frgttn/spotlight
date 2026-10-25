@@ -60,10 +60,16 @@ impl SearchItem {
     }
 
     pub fn action(mut self, title: impl Into<String>, command: Command) -> Self {
-        self.actions.push(Action {
-            title: title.into(),
-            command,
-        });
+        self.actions.push(Action::new(title, command));
+        self
+    }
+
+    /// Gives the last action added a key combination of its own (see
+    /// [`shortcut`]), in place of its command's default.
+    pub fn shortcut(mut self, keys: &str) -> Self {
+        if let Some(action) = self.actions.last_mut() {
+            action.shortcut = Some(keys.to_owned());
+        }
         self
     }
 
@@ -97,6 +103,58 @@ pub enum Icon {
 pub struct Action {
     pub title: String,
     pub command: Command,
+    /// Runs it from the list without opening the action panel, in GPUI's
+    /// keystroke syntax (`ctrl-shift-c`). `None` takes the command's default,
+    /// [`Command::default_shortcut`].
+    pub shortcut: Option<String>,
+}
+
+impl Action {
+    pub fn new(title: impl Into<String>, command: Command) -> Self {
+        Self {
+            title: title.into(),
+            command,
+            shortcut: None,
+        }
+    }
+
+    /// Its own key combination, or its command's default.
+    pub fn shortcut(&self) -> Option<&str> {
+        self.shortcut
+            .as_deref()
+            .or_else(|| self.command.default_shortcut())
+    }
+}
+
+/// Key combinations for actions, named and chosen as Raycast's for Windows
+/// are, so the same action has the same keys in both. The first two actions
+/// are always Enter and Ctrl+Enter, whatever they ask for.
+pub mod shortcut {
+    /// Copies the main thing: a file, a URL.
+    pub const COPY: &str = "ctrl-shift-c";
+    /// Copies something about it: a name.
+    pub const COPY_SECONDARY: &str = "ctrl-alt-c";
+    /// Copies something else about it: a path.
+    pub const COPY_TERTIARY: &str = "alt-shift-c";
+    pub const COPY_DEEPLINK: &str = "ctrl-shift-c";
+    /// Opens it somewhere else: Open With.
+    pub const OPEN: &str = "ctrl-o";
+    /// Shows where it is: Show in Explorer.
+    pub const OPEN_SECONDARY: &str = "ctrl-shift-o";
+    /// A third way to run it: Run as Administrator.
+    pub const TERTIARY: &str = "ctrl-shift-enter";
+    /// A fourth: Open in Terminal.
+    pub const QUATERNARY: &str = "ctrl-alt-enter";
+    /// Deletes it.
+    pub const CLEAR: &str = "ctrl-d";
+    /// Deletes all of them.
+    pub const CLEAR_ALL: &str = "ctrl-alt-d";
+    pub const EDIT: &str = "ctrl-e";
+    /// Creates something from it: a quicklink.
+    pub const SAVE: &str = "ctrl-s";
+    pub const PIN: &str = "ctrl-.";
+    /// Shows more about it: Show Details.
+    pub const INFO: &str = "ctrl-i";
 }
 
 /// What an action does. A closed set of safe operations: providers describe
@@ -259,6 +317,24 @@ impl Command {
             },
             command => command.clone(),
         }
+    }
+
+    /// The keys an action with this command takes when it names none.
+    pub fn default_shortcut(&self) -> Option<&'static str> {
+        Some(match self {
+            Command::OpenWith(_) => shortcut::OPEN,
+            Command::ShowInFolder(_) => shortcut::OPEN_SECONDARY,
+            Command::RunAsAdmin(_) => shortcut::TERTIARY,
+            Command::OpenTerminal(_) => shortcut::QUATERNARY,
+            Command::CopyFile(_) => shortcut::COPY,
+            Command::MoveToTrash(_)
+            | Command::DeleteQuicklink(_)
+            | Command::DeleteSnippet(_)
+            | Command::DeleteClip(_) => shortcut::CLEAR,
+            Command::ClearClipboardHistory => shortcut::CLEAR_ALL,
+            Command::PinClip { .. } => shortcut::PIN,
+            _ => return None,
+        })
     }
 
     /// Commands that are hard to undo ask for a second Enter.

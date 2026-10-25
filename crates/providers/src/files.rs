@@ -22,7 +22,7 @@ use spotlight_core::{
     clip,
     file_search::{Config, Status, profile, thousands},
     frecency::{self, Frecency},
-    item::{Command, Icon, SearchItem},
+    item::{Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     view::{ListFilter, ListView, LiveRows, Preview, PreviewBody, View},
@@ -990,7 +990,9 @@ fn file_item(index: &Index, id: EntryId) -> SearchItem {
     }
     item = item
         .action("Copy Path", Command::Copy(text.clone()))
+        .shortcut(shortcut::COPY_TERTIARY)
         .action("Copy Name", Command::Copy(name))
+        .shortcut(shortcut::COPY_SECONDARY)
         .action(
             if dir { "Copy Folder" } else { "Copy File" },
             Command::CopyFile(text.clone()),

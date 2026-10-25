@@ -166,20 +166,47 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     press(window, "ctrl-k", cx);
     sleep(SETTLE_MS).await;
     let panel = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten();
     press(window, "escape", cx);
     sleep(SETTLE_MS).await;
     let (closed, visible) = window
-        .update(cx, |launcher, _, _| {
-            (launcher.panel_actions().is_none(), launcher.is_visible())
+        .update(cx, |launcher, _, cx| {
+            (launcher.panel_actions(cx).is_none(), launcher.is_visible())
         })
         .unwrap_or_default();
     let expected = ["Copy Answer", "Copy Calculation"].map(String::from);
     eprintln!(
         "[selftest] action panel: {panel:?}, esc closes it: {closed}, window stays: {visible} {}",
         if panel.as_deref() == Some(&expected[..]) && closed && visible {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // Typing in the open panel narrows its actions.
+    press(window, "ctrl-k", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("calc", window, cx)
+        })
+        .ok();
+    sleep(SETTLE_MS).await;
+    let (narrowed, selected) = window
+        .update(cx, |launcher, _, cx| {
+            (launcher.panel_actions(cx), launcher.panel_selected(cx))
+        })
+        .unwrap_or_default();
+    press(window, "escape", cx);
+    sleep(SETTLE_MS).await;
+    let expected = ["Copy Calculation".to_owned()];
+    eprintln!(
+        "[selftest] action panel search: {narrowed:?}, selected {selected:?} {}",
+        if narrowed.as_deref() == Some(&expected[..])
+            && selected.as_deref() == Some("Copy Calculation")
+        {
             "OK"
         } else {
             "FAIL"
@@ -382,7 +409,7 @@ async fn alias_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> 
     async fn pick(window: WindowHandle<Launcher>, title: &str, cx: &mut AsyncApp) -> bool {
         press(window, "ctrl-k", cx);
         let titles = window
-            .update(cx, |launcher, _, _| launcher.panel_actions())
+            .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -394,7 +421,7 @@ async fn alias_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> 
             press(window, "down", cx);
         }
         let selected = window
-            .update(cx, |launcher, _, _| launcher.panel_selected())
+            .update(cx, |launcher, _, cx| launcher.panel_selected(cx))
             .ok()
             .flatten();
         if !selected.is_some_and(|selected| selected.starts_with(title)) {
@@ -712,7 +739,7 @@ async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) 
     press(window, "ctrl-k", cx);
     executor.timer(Duration::from_millis(SETTLE_MS)).await;
     let actions = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten();
     if actions.as_deref() != Some(&["Open Command".to_owned(), "Always Open Command".to_owned()]) {
@@ -1039,7 +1066,7 @@ async fn quicklink_save_and_delete(window: WindowHandle<Launcher>, cx: &mut Asyn
     }
     press(window, "ctrl-k", cx);
     let titles = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -1113,7 +1140,7 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
     let delete = |cx: &mut AsyncApp| -> Result<(), String> {
         press(window, "ctrl-k", cx);
         let actions = window
-            .update(cx, |launcher, _, _| launcher.panel_actions())
+            .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -1280,7 +1307,7 @@ async fn snippet_paste(window: WindowHandle<Launcher>, target: isize, cx: &mut A
     }
     press(window, "ctrl-k", cx);
     let actions = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten()
         .unwrap_or_default();
