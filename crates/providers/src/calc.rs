@@ -4,18 +4,18 @@
 use std::{
     error::Error,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use fend_core::{Context, ExchangeRateFnV2, ExchangeRateFnV2Options, Interrupt};
 use spotlight_core::{
-    item::{Command, Icon, SearchItem},
+    item::{AnswerCard, Command, Icon, SearchItem},
     item_id,
     provider::Provider,
 };
 
 use crate::{
-    glyph,
+    currency, glyph,
     rates::{self, Rates},
 };
 
@@ -125,30 +125,137 @@ impl Provider for Calculator {
     }
 
     fn answers(&self, query: &str) -> Vec<SearchItem> {
-        let Some(answer) = self.evaluate(query) else {
+        let query = query.trim();
+        // An amount of money on its own ("5 uah"), which fend only repeats,
+        // is worth as much as what in dollars (euros for dollars), as in Raycast.
+        let answer = match self.amount_of(query) {
+            Some((_, code)) => {
+                let target = if code.eq_ignore_ascii_case("USD") {
+                    "EUR"
+                } else {
+                    "USD"
+                };
+                self.evaluate(&format!("{query} to {target}"))
+            }
+            None => self.evaluate(query),
+        };
+        let Some(answer) = answer else {
             return Vec::new();
         };
-        let (answer, subtitle) = if self.is_currency(&answer) {
+        let (answer, subtitle, card) = if self.is_currency(&answer) {
             // A long-running app still gets fresh rates; this returns at once.
             self.rates.refresh_in_background();
-            (
-                Self::round_money(&answer),
-                format!("Calculator · {}", rates::ATTRIBUTION),
-            )
+            let answer = Self::round_money(&answer);
+            let card = self.money_card(query, &answer);
+            (answer, format!("Calculator · {}", rates::ATTRIBUTION), card)
         } else {
-            (answer, "Calculator".to_owned())
+            let card = AnswerCard {
+                question: pretty(query),
+                question_label: "Expression".into(),
+                answer: answer.clone(),
+                answer_label: "Result".into(),
+                note: None,
+            };
+            (answer, "Calculator".to_owned(), card)
         };
         vec![
             SearchItem::new(item_id(ID, "answer"), answer.clone())
                 .subtitle(subtitle)
                 .icon(Icon::Glyph(glyph::CALCULATOR))
+                .card(card)
                 .action("Copy Answer", Command::Copy(answer.clone()))
                 .action(
                     "Copy Calculation",
-                    Command::Copy(format!("{} = {answer}", query.trim())),
+                    Command::Copy(format!("{query} = {answer}")),
                 ),
         ]
     }
+}
+
+impl Calculator {
+    /// `"5 uah"` → `(5, "uah")`, when the code is a currency we have a rate for.
+    fn amount_of<'a>(&self, text: &'a str) -> Option<(f64, &'a str)> {
+        let text = text.trim();
+        let split = text.len().checked_sub(3)?;
+        let (amount, code) = (text.get(..split)?.trim(), text.get(split..)?);
+        if !code.bytes().all(|byte| byte.is_ascii_alphabetic()) || !self.rates.knows(code) {
+            return None;
+        }
+        Some((amount.replace(',', "").parse().ok()?, code))
+    }
+
+    /// The card for an answer in money, `"0.12 USD"`: what was converted on
+    /// the left, named when it's an amount of one currency, and the answer
+    /// with its sign and currency's name on the right.
+    fn money_card(&self, query: &str, answer: &str) -> AnswerCard {
+        let question = before_target(query);
+        let question_label = self
+            .amount_of(question)
+            .and_then(|(_, code)| currency::name(code))
+            .unwrap_or("Expression");
+        let (amount, code) = answer.rsplit_once(' ').unwrap_or((answer, ""));
+        AnswerCard {
+            question: pretty(question),
+            question_label: question_label.into(),
+            answer: currency::with_sign(amount, code),
+            answer_label: currency::name(code).unwrap_or(code).into(),
+            note: self
+                .rates
+                .fetched()
+                .map(|fetched| format!("Updated {}", ago(fetched))),
+        }
+    }
+}
+
+/// What is converted, without where to: `"10 eur in uah"` → `"10 eur"`.
+fn before_target(query: &str) -> &str {
+    let lower = query.to_ascii_lowercase();
+    [" to ", " in ", " as ", "->"]
+        .iter()
+        .filter_map(|word| lower.rfind(word))
+        .max()
+        .map_or(query, |at| query[..at].trim_end())
+}
+
+/// The expression as it would be written: `40*10` → `40 × 10`, `1/3` →
+/// `1 ÷ 3`. A slash between letters is a unit (`km/h`) and stays.
+fn pretty(query: &str) -> String {
+    let chars: Vec<char> = query.chars().collect();
+    let numeric = |c: Option<&char>| c.is_some_and(|c| c.is_ascii_digit() || "().".contains(*c));
+    let mut out = String::with_capacity(query.len());
+    for (ix, &c) in chars.iter().enumerate() {
+        let sign = match c {
+            '*' => Some('×'),
+            '/' if numeric(chars[..ix].iter().rev().find(|c| !c.is_whitespace()))
+                && numeric(chars[ix + 1..].iter().find(|c| !c.is_whitespace())) =>
+            {
+                Some('÷')
+            }
+            _ => None,
+        };
+        match sign {
+            Some(sign) => {
+                out.push(' ');
+                out.push(sign);
+                out.push(' ');
+            }
+            None => out.push(c),
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// "less than a minute ago", "5 minutes ago", "3 hours ago", "2 days ago".
+fn ago(time: SystemTime) -> String {
+    let seconds = time.elapsed().unwrap_or_default().as_secs();
+    let (count, unit) = match seconds {
+        0..60 => return "less than a minute ago".into(),
+        60..3600 => (seconds / 60, "minute"),
+        3600..86400 => (seconds / 3600, "hour"),
+        _ => (seconds / 86400, "day"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
 }
 
 #[cfg(test)]
@@ -198,6 +305,42 @@ mod tests {
                 .unwrap()
                 .contains("ExchangeRate-API")
         );
+    }
+
+    #[test]
+    fn cards_show_the_expression_and_the_result() {
+        let calc = calculator();
+        let card = calc.answers("40*10")[0].card.clone().unwrap();
+        assert_eq!(card.question, "40 × 10");
+        assert_eq!(card.question_label, "Expression");
+        assert_eq!(card.answer, "400");
+        assert_eq!(card.answer_label, "Result");
+        assert_eq!(pretty("(1 + 2)/3"), "(1 + 2) ÷ 3");
+        assert_eq!(pretty("100 km/h to m/s"), "100 km/h to m/s");
+    }
+
+    #[test]
+    fn cards_name_the_currencies() {
+        let calc = calculator();
+        let answers = calc.answers("10 eur in uah");
+        let card = answers[0].card.clone().unwrap();
+        assert_eq!(card.question, "10 eur");
+        assert_eq!(card.question_label, "Euro");
+        assert_eq!(card.answer, "₴455.56");
+        assert_eq!(card.answer_label, "Ukrainian Hryvnia");
+        assert_eq!(card.note.as_deref(), Some("Updated less than a minute ago"));
+    }
+
+    #[test]
+    fn an_amount_of_money_alone_is_given_in_dollars() {
+        let calc = calculator();
+        let answers = calc.answers("41 uah");
+        assert_eq!(answers[0].title, "1.00 USD");
+        let card = answers[0].card.clone().unwrap();
+        assert_eq!(card.answer, "$1.00");
+        assert_eq!(card.question_label, "Ukrainian Hryvnia");
+        assert_eq!(calc.answers("10 usd")[0].title, "9.00 EUR");
+        assert!(calc.answers("10 xyz").is_empty());
     }
 
     #[test]

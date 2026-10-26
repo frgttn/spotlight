@@ -3,6 +3,7 @@
 //! Environment:
 //! - `SPOTLIGHT_SYNTHETIC=10000` adds that many filler rows for the list test.
 //! - `SPOTLIGHT_SHOW_ON_START=1` shows the window immediately (handy while developing).
+//!   With `SPOTLIGHT_QUERY=<text>` that text is typed into it (for screenshots).
 //! - `SPOTLIGHT_SELFTEST=1` runs the scripted measurement in `selftest.rs` and quits.
 //! - `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved theme.
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
@@ -539,6 +540,21 @@ fn main() {
                 .detach();
         } else if show_on_start {
             presses_tx.send_blocking(Instant::now()).ok();
+            // `SPOTLIGHT_QUERY=<text>` types it into the search field once
+            // shown, for screenshots of a search.
+            if let Ok(query) = env::var("SPOTLIGHT_QUERY") {
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    window
+                        .update(cx, |launcher, window, cx| {
+                            launcher.type_text(&query, window, cx)
+                        })
+                        .ok();
+                })
+                .detach();
+            }
         }
     });
 }

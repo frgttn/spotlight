@@ -82,6 +82,8 @@ actions!(
 
 const CONTEXT: &str = "Launcher";
 const ROW_HEIGHT: f32 = 40.;
+/// Lines of the list an answer card ([`SearchItem::card`]) takes.
+const CARD_LINES: usize = 3;
 /// Space above the first and below the last row.
 const LIST_PADDING: f32 = 4.;
 /// How much of a list's first line is hidden when it is a section heading,
@@ -1340,8 +1342,21 @@ impl Launcher {
         sections
     }
 
-    /// Where row `row` is in the list, with the section headings counted.
+    /// The row drawn as an answer card: root search's first, when it has one
+    /// (the calculator's answer).
+    fn card_row(&self) -> Option<usize> {
+        let first = self.results.first()?;
+        (self.screens.is_empty() && self.item(first).card.is_some()).then_some(0)
+    }
+
+    /// Where row `row` is in the list, with the section headings and the
+    /// card's extra lines counted.
     fn line_of(&self, row: usize) -> usize {
+        let after_card = self.card_row().is_some_and(|card| row > card);
+        self.plain_line_of(row) + if after_card { CARD_LINES - 1 } else { 0 }
+    }
+
+    fn plain_line_of(&self, row: usize) -> usize {
         row + self
             .sections
             .iter()
@@ -1350,11 +1365,30 @@ impl Launcher {
     }
 
     fn line_count(&self) -> usize {
-        self.results.len() + self.sections.len()
+        let card = if self.card_row().is_some() {
+            CARD_LINES - 1
+        } else {
+            0
+        };
+        self.results.len() + self.sections.len() + card
     }
 
-    /// What line `line` of the list shows: a heading, or a row.
+    /// What line `line` of the list shows: a heading, a row, or the rest of
+    /// the card.
     fn line_at(&self, line: usize) -> Line {
+        if let Some(row) = self.card_row() {
+            let card = self.plain_line_of(row);
+            if line > card && line < card + CARD_LINES {
+                return Line::CardRest(row, line - card);
+            }
+            if line >= card + CARD_LINES {
+                return self.plain_line_at(line - (CARD_LINES - 1));
+            }
+        }
+        self.plain_line_at(line)
+    }
+
+    fn plain_line_at(&self, line: usize) -> Line {
         for (ix, (start, title)) in self.sections.iter().enumerate() {
             let heading = start + ix;
             if line < heading {
@@ -1378,6 +1412,9 @@ impl Launcher {
             .any(|(start, _)| *start == self.selected);
         if heading {
             self.scroll.reveal(line - 1, count);
+        }
+        if self.card_row() == Some(self.selected) {
+            self.scroll.reveal(line + CARD_LINES - 1, count);
         }
         self.scroll.reveal(line, count);
     }
@@ -3235,6 +3272,135 @@ impl Launcher {
         )
     }
 
+    /// Row `row`'s answer card, drawn from list line `line`, which is line
+    /// `part` of the card's: it spills over the lines under it, so the list
+    /// keeps lines of one height.
+    fn render_card(
+        &self,
+        line: usize,
+        row: usize,
+        part: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(card) = self.item(&self.results[row]).card.as_deref() else {
+            return div()
+                .id(("card", line))
+                .h(px(ROW_HEIGHT))
+                .into_any_element();
+        };
+        let selected = row == self.selected;
+        let half = |value: &str, label: &str| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .px_6()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .max_w_full()
+                        .truncate()
+                        .text_size(px(26.))
+                        .line_height(px(32.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgba(theme::p().text))
+                        .child(SharedString::from(value.to_owned())),
+                )
+                .child(
+                    div()
+                        .max_w_full()
+                        .truncate()
+                        .px(px(6.))
+                        .rounded(px(4.))
+                        .bg(rgba(theme::p().surface_hover))
+                        .text_size(px(11.))
+                        .line_height(px(18.))
+                        .text_color(rgba(theme::p().text_muted))
+                        .child(SharedString::from(label.to_owned())),
+                )
+        };
+        // The divider between the halves, broken by the arrow and the note
+        // under it; a gap as tall as the note above the arrow keeps the arrow
+        // in the middle.
+        let divider = || div().w(px(1.)).flex_1().bg(rgba(theme::p().hairline));
+        let note_line = |text: SharedString| {
+            div()
+                .h(px(16.))
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(rgba(theme::p().text_faint))
+                .child(text)
+        };
+        let middle = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(divider())
+            .when(card.note.is_some(), |middle| {
+                middle.child(note_line(SharedString::default()))
+            })
+            .child(
+                div()
+                    .py(px(4.))
+                    .text_size(px(16.))
+                    .line_height(px(20.))
+                    .text_color(rgba(theme::p().text_muted))
+                    .child("→"),
+            )
+            .when_some(card.note.clone(), |middle, note| {
+                middle.child(note_line(note.into()))
+            })
+            .child(divider());
+        div()
+            .id(("card", line))
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-(part as f32) * ROW_HEIGHT))
+                    .left_0()
+                    .right_0()
+                    .h(px(CARD_LINES as f32 * ROW_HEIGHT))
+                    .px_2()
+                    .py(px(2.))
+                    .child(
+                        div()
+                            .id("card")
+                            .relative()
+                            .size_full()
+                            .flex()
+                            .rounded(px(8.))
+                            .bg(rgba(if selected {
+                                theme::p().selected
+                            } else {
+                                theme::p().surface
+                            }))
+                            .when(!selected, |card| {
+                                card.hover(|style| style.bg(rgba(theme::p().hover)))
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.selected != row {
+                                    this.selected = row;
+                                    this.confirming = None;
+                                }
+                                this.panel = None;
+                                this.confirm(&Confirm, window, cx);
+                            }))
+                            .child(half(&card.question, &card.question_label))
+                            .child(half(&card.answer, &card.answer_label))
+                            .child(middle),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_icon(&self, item: &SearchItem) -> AnyElement {
         self.render_icon_sized(item, ICON_SIZE)
     }
@@ -3605,10 +3771,22 @@ impl Render for Launcher {
                 "results",
                 self.line_count(),
                 cx.processor(|this, range: Range<usize>, _window, cx| {
+                    let first = range.start;
                     range
                         .map(|line| match this.line_at(line) {
+                            Line::Row(row) if this.card_row() == Some(row) => {
+                                this.render_card(line, row, 0, cx)
+                            }
                             Line::Row(row) => this.render_row(row, cx).into_any_element(),
                             Line::Heading(title) => render_heading(line, title),
+                            // The card is drawn once, by its first line in view.
+                            Line::CardRest(row, part) if line == first => {
+                                this.render_card(line, row, part, cx)
+                            }
+                            Line::CardRest(..) => div()
+                                .id(("card", line))
+                                .h(px(ROW_HEIGHT))
+                                .into_any_element(),
                         })
                         .collect::<Vec<_>>()
                 }),
@@ -3847,6 +4025,8 @@ impl Render for Launcher {
 enum Line {
     Heading(SharedString),
     Row(usize),
+    /// Line `.1` (from 1) of row `.0`'s answer card, under its first.
+    CardRest(usize, usize),
 }
 
 /// A section heading, as tall as a row so the list's lines stay uniform;

@@ -5,6 +5,7 @@ pub mod apps;
 pub mod calc;
 pub mod clipboard;
 pub mod control_panel;
+mod currency;
 pub mod files;
 pub mod games;
 pub mod quicklinks;

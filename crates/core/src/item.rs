@@ -29,6 +29,21 @@ pub struct SearchItem {
     /// Shown beside the list while the row is selected, in lists that have
     /// previews (clipboard history).
     pub preview: Option<Box<Preview>>,
+    /// Drawn as a large card in place of the row (the calculator's answer).
+    pub card: Option<Box<AnswerCard>>,
+}
+
+/// An answer shown as a card, what was asked on the left and the answer on
+/// the right, each with a label under it: `40 × 10` (Expression) → `400`
+/// (Result), `5 uah` (Ukrainian Hryvnia) → `$0.12` (US Dollar).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnswerCard {
+    pub question: String,
+    pub question_label: String,
+    pub answer: String,
+    pub answer_label: String,
+    /// A small line between the two: "Updated 3 hours ago".
+    pub note: Option<String>,
 }
 
 impl SearchItem {
@@ -41,6 +56,7 @@ impl SearchItem {
             icon: Icon::None,
             actions: Vec::new(),
             preview: None,
+            card: None,
         }
     }
 
@@ -75,6 +91,11 @@ impl SearchItem {
 
     pub fn preview(mut self, preview: Preview) -> Self {
         self.preview = Some(Box::new(preview));
+        self
+    }
+
+    pub fn card(mut self, card: AnswerCard) -> Self {
+        self.card = Some(Box::new(card));
         self
     }
 
