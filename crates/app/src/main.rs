@@ -6,6 +6,7 @@
 //!   With `SPOTLIGHT_QUERY=<text>` that text is typed into it (for screenshots).
 //! - `SPOTLIGHT_SELFTEST=1` runs the scripted measurement in `selftest.rs` and quits.
 //! - `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved theme.
+//! - `SPOTLIGHT_WINDOW_MODE=compact|expanded` overrides the saved window mode.
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
 //!
 //! `spotlight.exe --settings` opens the settings window (of the running
@@ -63,6 +64,8 @@ const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 /// `settings` key: `WindowMode`'s setting form; missing means expanded.
 const WINDOW_MODE_SETTING: &str = "window_mode";
 /// `settings` key: `"true"` or `"false"`; missing means on.
+const COMPACT_FAVORITES_SETTING: &str = "compact_favorites";
+/// `settings` key: `"true"` or `"false"`; missing means on.
 const RANK_BY_USAGE_SETTING: &str = "rank_by_usage";
 /// `settings` key: the root search sections hidden before anything is
 /// typed, `HomeSection`'s setting forms comma-separated; missing means none.
@@ -97,6 +100,7 @@ struct AppState {
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
     window_mode: Cell<WindowMode>,
+    compact_favorites: Cell<bool>,
     rank_by_usage: Cell<bool>,
     hidden_sections: RefCell<Vec<HomeSection>>,
     opacity: Cell<WindowOpacity>,
@@ -178,6 +182,7 @@ fn main() {
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
     let rank_by_usage = setting(RANK_BY_USAGE_SETTING).is_none_or(|value| value != "false");
+    let compact_favorites = setting(COMPACT_FAVORITES_SETTING).is_none_or(|value| value != "false");
     let hidden_sections: Vec<HomeSection> = setting(HIDDEN_SECTIONS_SETTING)
         .map(|text| {
             text.split(',')
@@ -208,7 +213,11 @@ fn main() {
         }
     }
     theme::set_choice(choice);
-    let window_mode = setting(WINDOW_MODE_SETTING)
+    // `SPOTLIGHT_WINDOW_MODE=compact|expanded` overrides the saved one, for
+    // screenshots.
+    let window_mode = env::var("SPOTLIGHT_WINDOW_MODE")
+        .ok()
+        .or_else(|| setting(WINDOW_MODE_SETTING))
         .and_then(|text| {
             let mode = WindowMode::from_setting(&text);
             if mode.is_none() {
@@ -358,6 +367,7 @@ fn main() {
         window
             .update(cx, |launcher, window, cx| {
                 launcher.set_window_mode(window_mode, cx);
+                launcher.set_compact_favorites(compact_favorites, cx);
                 launcher.set_rank_by_usage(rank_by_usage, cx);
                 launcher.set_hidden_sections(hidden_sections.clone(), cx);
                 launcher.set_window_opacity(opacity, cx);
@@ -405,6 +415,7 @@ fn main() {
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
             window_mode: Cell::new(window_mode),
+            compact_favorites: Cell::new(compact_favorites),
             rank_by_usage: Cell::new(rank_by_usage),
             hidden_sections: RefCell::new(hidden_sections),
             opacity: Cell::new(opacity),
@@ -597,6 +608,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
                 view_state.window_mode.get(),
+                view_state.compact_favorites.get(),
                 view_state.rank_by_usage.get(),
                 view_state.hidden_sections.borrow().clone(),
                 view_state.opacity.get(),
@@ -674,6 +686,16 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, cx| launcher.set_window_mode(*mode, cx))
                 .ok();
             save_setting(state, WINDOW_MODE_SETTING, mode.to_setting().to_owned(), cx);
+        }
+        SettingsEvent::CompactFavoritesChanged(enabled) => {
+            state.compact_favorites.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_compact_favorites(*enabled, cx)
+                })
+                .ok();
+            save_setting(state, COMPACT_FAVORITES_SETTING, enabled.to_string(), cx);
         }
         SettingsEvent::RankByUsageChanged(enabled) => {
             state.rank_by_usage.set(*enabled);

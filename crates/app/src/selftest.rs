@@ -356,6 +356,8 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
 
     let compact = compact_round_trip(window, cx).await;
     eprintln!("[selftest] compact mode: {compact}");
+    let favorite_keys = favorite_keys(window, cx).await;
+    eprintln!("[selftest] favorite keys: {favorite_keys}");
 
     // The HUD, for a look from outside: the line below says when it's up.
     sleep(SETTLE_MS).await;
@@ -443,6 +445,77 @@ async fn compact_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         })
         .ok();
     format!("{result} ({})", seen.join(", "))
+}
+
+/// Makes Keyboard Shortcuts the only favorite, then checks that Ctrl+1
+/// leaves it shut in expanded mode, in compact mode with its favorites
+/// turned off and with the results shown by ↓, that Ctrl+2 (no favorite there) does nothing, and that Ctrl+1
+/// opens it from the collapsed compact window. The favorites are put back
+/// after. Returns how far it got.
+async fn favorite_keys(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    const ITEM: &str = "spotlight:shortcuts";
+    let executor = cx.background_executor().clone();
+    let saved = window
+        .update(cx, |launcher, _, cx| {
+            let saved = launcher.favorites();
+            launcher.set_favorites(vec![ITEM.to_owned()], cx);
+            launcher.set_pinned(true);
+            saved
+        })
+        .unwrap_or_default();
+    // Sets the mode and the switch while hidden, as Settings does, shows
+    // the launcher, presses each of `keys` and returns the open view's title.
+    let try_keys = async |mode: WindowMode, on: bool, keys: &[&str], cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| {
+                launcher.hide(cx);
+                launcher.set_window_mode(mode, cx);
+                launcher.set_compact_favorites(on, cx);
+            })
+            .ok();
+        executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.show(Instant::now(), window, cx)
+            })
+            .ok();
+        executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        for keys in keys {
+            press(window, keys, cx);
+            executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        }
+        window
+            .update(cx, |launcher, _, _| launcher.screen_title())
+            .ok()
+            .flatten()
+    };
+    let result = 'checks: {
+        let cases = [
+            (WindowMode::Expanded, true, &["ctrl-1"][..], "expanded"),
+            (WindowMode::Compact, false, &["ctrl-1"], "turned off"),
+            (WindowMode::Compact, true, &["down", "ctrl-1"], "shown by ↓"),
+            (WindowMode::Compact, true, &["ctrl-2"], "Ctrl+2"),
+        ];
+        for (mode, on, keys, case) in cases {
+            if let Some(title) = try_keys(mode, on, keys, cx).await {
+                break 'checks format!("FAIL: {case} opened {title:?}");
+            }
+        }
+        match try_keys(WindowMode::Compact, true, &["ctrl-1"], cx).await {
+            Some(title) if title == "Keyboard Shortcuts" => "OK".to_owned(),
+            other => format!("FAIL: Ctrl+1 showed {other:?}"),
+        }
+    };
+    window
+        .update(cx, |launcher, _, cx| {
+            launcher.set_favorites(saved, cx);
+            launcher.set_compact_favorites(true, cx);
+            launcher.set_pinned(false);
+            launcher.hide(cx);
+            launcher.set_window_mode(WindowMode::Expanded, cx);
+        })
+        .ok();
+    result
 }
 
 /// Sends `keystroke` through GPUI's key dispatch, as a real key press arrives.
@@ -1222,6 +1295,19 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         Ok(())
     };
 
+    // Export writes every snippet: the data folder may have its own.
+    let file = env::temp_dir().join(format!("spotlight-selftest-{}.json", std::process::id()));
+    let export = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.export_snippets_to(&file))
+            .unwrap_or_else(|_| Err("window gone".into()))
+    };
+    let before = match export(cx) {
+        Ok(count) => count,
+        Err(err) => return format!("couldn't count the snippets: {err}"),
+    };
+    let _ = std::fs::remove_file(&file);
+
     if let Err(why) = create("Selftest Snippet", cx).await {
         return why;
     }
@@ -1251,14 +1337,11 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         return format!("saved, but the list has {:?}", titles(cx));
     }
 
-    let file = env::temp_dir().join(format!("spotlight-selftest-{}.json", std::process::id()));
-    let exported = window
-        .update(cx, |launcher, _, _| launcher.export_snippets_to(&file))
-        .unwrap_or_else(|_| Err("window gone".into()));
+    let exported = export(cx);
     let json = std::fs::read_to_string(&file).unwrap_or_default();
-    if exported != Ok(1) || !json.contains(r#""keyword": ";zzs""#) {
+    if exported != Ok(before + 1) || !json.contains(r#""keyword": ";zzs""#) {
         let _ = std::fs::remove_file(&file);
-        return format!("listed, but the export gave {exported:?}: {json}");
+        return format!("listed, but the export gave {exported:?} (had {before}): {json}");
     }
 
     if let Err(why) = delete(cx) {
@@ -1279,7 +1362,13 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
     let first = import(cx);
     let second = import(cx);
     let _ = std::fs::remove_file(&file);
-    if first != "Imported 1 snippet" || second != "Nothing new to import" {
+    // The folder's own snippets are in the file too, and already there.
+    let added = if before == 0 {
+        "Imported 1 snippet".to_owned()
+    } else {
+        format!("Imported 1, skipped {before}")
+    };
+    if first != added || second != "Nothing new to import" {
         return format!("deleted, but importing gave {first:?}, then {second:?}");
     }
     if let Err(why) = back_to_search(window, cx).await {

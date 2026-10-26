@@ -99,6 +99,9 @@ const ICON_REFRESH_SECS: i64 = 7 * 24 * 3600;
 pub const WINDOW_SIZE: (f32, f32) = (750., 475.);
 /// The collapsed window's height in compact mode: just the search row.
 const COMPACT_HEIGHT: f32 = 64.;
+/// How many favorites the collapsed window shows beside the search field,
+/// and Ctrl+1 to Ctrl+8 run.
+const COMPACT_FAVORITES: usize = 8;
 /// How many recently used items root search suggests before anything is typed.
 const SUGGESTIONS: usize = 8;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
@@ -501,6 +504,9 @@ pub struct Launcher {
     frecency: HashMap<String, Frecency>,
     /// Whether root search ranks by frecency. Off, usage is still recorded.
     rank_by_usage: bool,
+    /// Compact mode shows the favorites beside the search field and runs
+    /// them with Ctrl+1 to Ctrl+8.
+    compact_favorites: bool,
     /// Where search engines chosen here (a quicklink's "Use as Web Search")
     /// go, so the app applies and saves them as it does Settings' choice.
     engines: Option<async_channel::Sender<SearchEngine>>,
@@ -711,6 +717,7 @@ impl Launcher {
             icons: HashMap::new(),
             frecency,
             rank_by_usage: true,
+            compact_favorites: true,
             engines: None,
             store,
             aliases,
@@ -1077,6 +1084,11 @@ impl Launcher {
 
     pub fn set_engine_sender(&mut self, engines: async_channel::Sender<SearchEngine>) {
         self.engines = Some(engines);
+    }
+
+    pub fn set_compact_favorites(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.compact_favorites = enabled;
+        cx.notify();
     }
 
     pub fn set_rank_by_usage(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -1831,11 +1843,18 @@ impl Launcher {
     /// launcher's bindings (Enter, Ctrl+K…) and the search field's got the
     /// keystroke first and passed on it.
     fn run_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.is_some() || self.collapsed(cx) {
+        if self.editor.is_some() {
+            return;
+        }
+        let pressed = &event.keystroke;
+        if self.run_quick_favorite(pressed, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.collapsed(cx) {
             return;
         }
         let entries = self.selected_actions();
-        let pressed = &event.keystroke;
         let Some(ix) = own_keys(&entries).iter().position(|keys| {
             keys.as_deref()
                 .and_then(|keys| Keystroke::parse(keys).ok())
@@ -2392,6 +2411,17 @@ impl Launcher {
             self.selected = row;
             self.reveal_selected();
         }
+    }
+
+    /// The favorites' item ids, in order.
+    pub fn favorites(&self) -> Vec<String> {
+        self.favorites.clone()
+    }
+
+    /// Makes `ids` the favorites, and saves them.
+    pub fn set_favorites(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        self.favorites = ids;
+        self.favorites_changed(cx);
     }
 
     /// Saves the favorites and shows them in their new order.
@@ -3446,6 +3476,104 @@ impl Launcher {
         }
     }
 
+    /// Compact mode's collapsed window: the favorites as icons at the right
+    /// of the search field, as Raycast shows them; a click runs one.
+    fn render_compact_favorites(&self, cx: &mut Context<Self>) -> AnyElement {
+        let icons = self
+            .quick_favorites()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                let id = item.id.clone();
+                let title = SharedString::from(format!("{}  ·  Ctrl+{}", item.title, ix + 1));
+                div()
+                    .id(("favorite", ix))
+                    .flex_none()
+                    .size(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme::p().hover)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_favorite(&id, window, cx);
+                    }))
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip(title.clone())).into())
+                    .child(self.render_icon_sized(item, 20.))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(icons)
+            .into_any_element()
+    }
+
+    /// The favorites that Ctrl+1 to Ctrl+8 run, in order: those in the
+    /// catalog, as many as the collapsed window shows.
+    fn quick_favorites(&self) -> Vec<&SearchItem> {
+        let catalog = self.search.catalog();
+        self.favorites
+            .iter()
+            .filter_map(|id| catalog.iter().find(|item| item.id == *id))
+            .take(COMPACT_FAVORITES)
+            .collect()
+    }
+
+    /// Ctrl+1 to Ctrl+8 in the collapsed compact window, where the
+    /// favorites' icons are: runs that favorite. Whether the key was one.
+    fn run_quick_favorite(
+        &mut self,
+        pressed: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let modifiers = pressed.modifiers;
+        if !modifiers.control || modifiers.alt || modifiers.shift || modifiers.platform {
+            return false;
+        }
+        let Some(ix) = pressed
+            .key
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=COMPACT_FAVORITES).contains(n))
+        else {
+            return false;
+        };
+        if !self.compact_favorites || !self.collapsed(cx) {
+            return false;
+        }
+        let Some(id) = self
+            .quick_favorites()
+            .get(ix - 1)
+            .map(|item| item.id.clone())
+        else {
+            return false;
+        };
+        self.run_favorite(&id, window, cx);
+        true
+    }
+
+    /// Runs favorite `id`'s first action from root search's rows, which
+    /// list every favorite (hidden while the window is collapsed).
+    fn run_favorite(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.results.iter().position(|row| self.item(row).id == id) else {
+            // Home lists every favorite in the catalog; this one just left it.
+            return;
+        };
+        self.selected = row;
+        self.confirming = None;
+        self.panel = None;
+        if self.selected_actions().is_empty() {
+            self.hide(cx);
+        } else {
+            self.run_action(0, window, cx);
+        }
+    }
+
     /// The Ctrl+K panel: the selected item's actions, above the footer's
     /// right end, with a search field under them.
     fn render_panel(&self, selected: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -3738,6 +3866,8 @@ impl Render for Launcher {
         }
         self.drop_stale_images(window);
         let collapsed = self.window_collapsed;
+        let favorites =
+            (collapsed && self.compact_favorites).then(|| self.render_compact_favorites(cx));
         // Both run, so neither waits on the other's frame.
         let detail_moving = self.tick_detail_scroll();
         if self.scroll.tick() || detail_moving {
@@ -3995,7 +4125,8 @@ impl Render for Launcher {
                                         .child(label)
                                         .child(keycaps("Tab")),
                                 )
-                            }),
+                            })
+                            .children(favorites),
                     }),
             )
             .when(!collapsed, |root| {
@@ -4016,6 +4147,26 @@ impl Render for Launcher {
                     .size_full(),
             )
             .into_any_element()
+    }
+}
+
+/// A hover tooltip: one line of text, as the favorites' icons show their
+/// names.
+struct Tooltip(SharedString);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .bg(rgba(theme::p().panel))
+            .border_1()
+            .border_color(rgba(theme::p().surface_border))
+            .text_color(rgba(theme::p().text))
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .child(self.0.clone())
     }
 }
 

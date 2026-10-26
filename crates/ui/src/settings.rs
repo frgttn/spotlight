@@ -98,6 +98,9 @@ pub enum SettingsEvent {
     SmoothScrollingChanged(bool),
     /// The launcher opens in this mode from now on.
     WindowModeChanged(WindowMode),
+    /// Compact mode shows the favorites and runs them with Ctrl+1 to Ctrl+8
+    /// (or no longer does).
+    CompactFavoritesChanged(bool),
     /// Root search ranks often-used items first (or no longer does).
     RankByUsageChanged(bool),
     /// Root search no longer lists these kinds before anything is typed.
@@ -173,6 +176,7 @@ pub struct Settings {
     shortcut_message: Option<(String, SharedString, bool)>,
     smooth_scrolling: bool,
     window_mode: WindowMode,
+    compact_favorites: bool,
     rank_by_usage: bool,
     hidden_sections: Vec<HomeSection>,
     opacity: WindowOpacity,
@@ -250,6 +254,7 @@ impl Settings {
         hotkey: Option<Hotkey>,
         smooth_scrolling: bool,
         window_mode: WindowMode,
+        compact_favorites: bool,
         rank_by_usage: bool,
         hidden_sections: Vec<HomeSection>,
         opacity: WindowOpacity,
@@ -359,6 +364,7 @@ impl Settings {
             shortcut_message: None,
             smooth_scrolling,
             window_mode,
+            compact_favorites,
             rank_by_usage,
             hidden_sections,
             opacity,
@@ -758,6 +764,14 @@ impl Settings {
         self.nav_scroll.set_enabled(self.smooth_scrolling);
         self.page_scroll.set_enabled(self.smooth_scrolling);
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
+        cx.notify();
+    }
+
+    fn toggle_compact_favorites(&mut self, cx: &mut Context<Self>) {
+        self.compact_favorites = !self.compact_favorites;
+        cx.emit(SettingsEvent::CompactFavoritesChanged(
+            self.compact_favorites,
+        ));
         cx.notify();
     }
 
@@ -2768,6 +2782,18 @@ impl Settings {
                     )
                     .py_3()
                     .child(self.window_mode_control(cx)),
+                )
+                .child(divider())
+                .child(
+                    row(
+                        "Favorites in Compact Mode",
+                        "Show favorites beside the search field; Ctrl+1 to Ctrl+8 open them.",
+                    )
+                    .child(switch(
+                        "compact-favorites",
+                        self.compact_favorites,
+                        cx.listener(|this, _, _, cx| this.toggle_compact_favorites(cx)),
+                    )),
                 )
                 .child(divider())
                 .child(
