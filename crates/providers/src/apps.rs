@@ -115,6 +115,7 @@ fn details(item: &SearchItem, launch_id: &str) -> View {
     metadata.push(("App ID".to_owned(), launch_id.to_owned()));
     View::Detail(DetailView {
         title: item.title.clone(),
+        qr: None,
         markdown: markdown.to_owned(),
         metadata,
         actions: item.actions.clone(),

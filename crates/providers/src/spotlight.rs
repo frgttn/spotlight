@@ -61,6 +61,7 @@ impl Provider for Spotlight {
     fn catalog(&self) -> Vec<SearchItem> {
         let shortcuts = View::Detail(DetailView {
             title: "Keyboard Shortcuts".into(),
+            qr: None,
             markdown: SHORTCUTS.into(),
             metadata: Vec::new(),
             actions: Vec::new(),

@@ -397,6 +397,30 @@ fn dib_to_rgba(dib: &[u8]) -> Option<RgbaImage> {
     RgbaImage::from_raw(width, rows, rgba)
 }
 
+/// The image on the clipboard now, or the picture file when one file was
+/// copied in Explorer. `Ok(None)`: there's no image. Blocking: decodes it.
+pub fn image(owner: isize) -> Result<Option<RgbaImage>, String> {
+    let raw = {
+        let _open = Open::with_retries(HWND(owner as *mut c_void))
+            .ok_or("the clipboard is busy in another app")?;
+        read_image().or_else(read_files)
+    };
+    let unreadable = |err: image::ImageError| format!("unreadable image: {err}");
+    Ok(match raw {
+        Some(Raw::Png(png)) => Some(
+            image::load_from_memory_with_format(&png, ImageFormat::Png)
+                .map_err(unreadable)?
+                .into_rgba8(),
+        ),
+        Some(Raw::Dib(dib)) => Some(dib_to_rgba(&dib).ok_or("unreadable image")?),
+        Some(Raw::Content(Content::Files(paths))) => match paths.as_slice() {
+            [path] => image::open(path).ok().map(|image| image.into_rgba8()),
+            _ => None,
+        },
+        Some(Raw::Content(_)) | None => None,
+    })
+}
+
 /// Puts `content` on the clipboard, as copying it in the first place did.
 /// `owner` is a window of ours, which Windows records as the clipboard's owner.
 pub fn write(owner: isize, content: &Content) -> Result<(), String> {

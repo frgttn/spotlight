@@ -4,6 +4,7 @@
 mod clipboard;
 mod json_files;
 mod links;
+mod qr;
 mod quicklinks;
 mod snippets;
 mod views;
@@ -53,6 +54,7 @@ use spotlight_store::{CachedIcon, Calculation, Store};
 use self::{
     clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
     links::PendingLink,
+    qr::QrImage,
     views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
 };
 use crate::{
@@ -574,6 +576,8 @@ pub struct Launcher {
     snippet_expansion: bool,
     /// The clipboard preview's image.
     preview_image: Option<PreviewImage>,
+    /// The QR code drawn in the open view.
+    qr_image: Option<QrImage>,
     /// Images no longer shown, freed on the next frame (it takes the window).
     stale_images: Vec<Arc<RenderImage>>,
     stats: Stats,
@@ -752,6 +756,7 @@ impl Launcher {
             keyword_target: None,
             snippet_expansion: true,
             preview_image: None,
+            qr_image: None,
             stale_images: Vec::new(),
             stats: Stats {
                 hotkey,
@@ -1755,6 +1760,7 @@ impl Launcher {
         self.keyword_target = None;
         self.close_editor(None, cx);
         self.forget_preview_image();
+        self.forget_qr_image();
         win::hide(self.hwnd);
         self.visible = false;
         self.prepare_next_show(cx);
@@ -2176,6 +2182,10 @@ impl Launcher {
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
             Command::ClearClipboardHistory => self.clear_clips(window, cx),
             Command::IgnoreClipApp(app) => self.ignore_clip_app(app.clone(), cx),
+            Command::ShowQrCode(text) => self.show_qr_code(text, window, cx),
+            Command::CopyQrCode(text) => self.copy_qr_code(text, cx),
+            Command::SaveQrCode(text) => self.save_qr_code(text, cx),
+            Command::ScanQrCodes(source) => self.scan_qr_codes(*source, window, cx),
             Command::SetSearchEngine { engine, name } => {
                 if let Some(engines) = &self.engines {
                     engines.try_send(engine.clone()).ok();
@@ -2646,6 +2656,12 @@ impl Launcher {
             self.previous_window = system_clipboard::foreground_window();
             self.record_visit(id.to_owned(), cx);
             return self.run_with_selection(action.command, cx);
+        }
+        // Scanning the screen hides the launcher first and opens it on what
+        // it finds.
+        if let Command::ScanQrCodes(source) = action.command {
+            self.record_visit(id.to_owned(), cx);
+            return self.scan_qr_codes(source, window, cx);
         }
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);

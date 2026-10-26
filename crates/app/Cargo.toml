@@ -20,6 +20,7 @@ raw-window-handle.workspace = true
 spotlight-core.workspace = true
 spotlight-platform-win.workspace = true
 spotlight-providers.workspace = true
+spotlight-qr.workspace = true
 spotlight-store.workspace = true
 spotlight-ui.workspace = true
 tray-icon.workspace = true

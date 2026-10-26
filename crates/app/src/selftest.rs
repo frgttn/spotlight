@@ -303,6 +303,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     for (name, outcome) in [
         ("grid", grid_round_trip(window, cx).await),
         ("detail", detail_round_trip(window, cx).await),
+        ("qr", qr_round_trip(window, cx).await),
         ("form", form_round_trip(window, cx).await),
         ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
@@ -954,6 +955,53 @@ async fn detail_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) ->
     press(window, "down", cx);
     match back_to_search(window, cx).await {
         Ok(()) => "opened, scrolled, back to search".into(),
+        Err(why) => why,
+    }
+}
+
+/// `qr <text>` in root search opens the code's view, and the code it draws
+/// is read back from a capture of the screen (only whether it's there is
+/// printed, nothing else the screen shows). `SPOTLIGHT_SELFTEST_HOLD=<ms>`
+/// keeps the view open that long, for a look from outside.
+async fn qr_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    const TEXT: &str = "https://example.com/spotlight-selftest";
+    if let Err(why) = open_from_search(window, &format!("qr {TEXT}"), "Generate QR Code", cx).await
+    {
+        return why;
+    }
+    let title = window
+        .update(cx, |launcher, _, _| launcher.screen_title())
+        .ok()
+        .flatten();
+    if title.as_deref() != Some("QR Code") {
+        return format!("didn't open ({title:?})");
+    }
+    cx.background_executor()
+        .timer(Duration::from_millis(SETTLE_MS))
+        .await;
+    let read = cx
+        .background_executor()
+        .spawn(async {
+            spotlight_platform_win::screen::capture()
+                .map(|screen| spotlight_qr::read(&screen).iter().any(|code| code == TEXT))
+        })
+        .await;
+    let read = match read {
+        Ok(true) => "read back from the screen",
+        Ok(false) => "not found on the screen",
+        Err(_) => "screen not captured",
+    };
+    if let Some(hold) = env::var("SPOTLIGHT_SELFTEST_HOLD")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        eprintln!("[selftest] qr view held for {hold} ms");
+        cx.background_executor()
+            .timer(Duration::from_millis(hold))
+            .await;
+    }
+    match back_to_search(window, cx).await {
+        Ok(()) => format!("opened, {read}, back to search"),
         Err(why) => why,
     }
 }

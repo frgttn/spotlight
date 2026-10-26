@@ -17,4 +17,5 @@ serde_json.workspace = true
 spotlight-core.workspace = true
 spotlight-files.workspace = true
 spotlight-platform-win.workspace = true
+spotlight-qr.workspace = true
 spotlight-store.workspace = true

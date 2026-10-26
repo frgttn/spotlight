@@ -119,6 +119,8 @@ const MIGRATIONS: &[&str] = &[
         item_id  TEXT PRIMARY KEY,
         position INTEGER NOT NULL
     );",
+    // What the QR codes in an image entry say, found when it was copied.
+    "ALTER TABLE clips ADD COLUMN qr TEXT;",
 ];
 
 /// An icon nobody asked for in this long is forgotten (about two months).
@@ -244,6 +246,8 @@ pub struct Clip {
     /// Whether formatting came with the text (see [`Store::clip_rich`]).
     /// Read only: [`Store::add_clip`] takes the formatting itself.
     pub rich: bool,
+    /// What the QR codes in an image say.
+    pub qr: Vec<String>,
 }
 
 impl Clip {
@@ -258,7 +262,10 @@ impl Clip {
 }
 
 const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at,
-    html IS NOT NULL OR rtf IS NOT NULL";
+    html IS NOT NULL OR rtf IS NOT NULL, qr";
+
+/// Between the QR codes' texts in the `qr` column; no text has it.
+const QR_SEPARATOR: char = '\u{1e}';
 
 fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
     let kind: String = row.get(1)?;
@@ -273,6 +280,10 @@ fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
         pinned: row.get(7)?,
         copied_at: row.get(8)?,
         rich: row.get(9)?,
+        qr: row
+            .get::<_, Option<String>>(10)?
+            .map(|codes| codes.split(QR_SEPARATOR).map(str::to_owned).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -688,8 +699,9 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO clips
-                (kind, content, hash, width, height, app, app_path, pinned, copied_at, html, rtf)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (kind, content, hash, width, height, app, app_path, pinned, copied_at, html, rtf,
+                 qr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 clip.kind.as_str(),
                 clip.content,
@@ -701,7 +713,8 @@ impl Store {
                 pinned,
                 clip.copied_at,
                 rich.html,
-                rich.rtf
+                rich.rtf,
+                (!clip.qr.is_empty()).then(|| clip.qr.join(&QR_SEPARATOR.to_string()))
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -1075,6 +1088,7 @@ mod tests {
             pinned: false,
             copied_at,
             rich: false,
+            qr: Vec::new(),
         }
     }
 
@@ -1210,6 +1224,23 @@ mod tests {
         assert_eq!(store.run_history(1).unwrap(), ["cmd"]);
         store.forget_run("cmd").unwrap();
         assert_eq!(store.run_history(10).unwrap(), ["gpedit.msc"]);
+    }
+
+    #[test]
+    fn keeps_what_qr_codes_say() {
+        let mut store = Store::open_in_memory().unwrap();
+        let codes = vec!["https://a.b".to_owned(), "line 1\nline 2".to_owned()];
+        let image = Clip {
+            kind: ClipKind::Image,
+            qr: codes.clone(),
+            ..text_clip("C:\\images\\1.png", 10)
+        };
+        let (id, _) = store.add_clip(&image, "hi", &RichText::default()).unwrap();
+        store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
+        assert_eq!(store.clip(id).unwrap().unwrap().qr, codes);
+        assert!(store.clips(None).unwrap()[0].qr.is_empty());
     }
 
     #[test]

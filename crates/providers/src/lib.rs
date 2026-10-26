@@ -8,6 +8,7 @@ pub mod control_panel;
 mod currency;
 pub mod files;
 pub mod games;
+pub mod qr;
 pub mod quicklinks;
 pub mod rates;
 pub mod run;
@@ -123,6 +124,7 @@ pub fn all(
         Arc::new(calc::Calculator::new(rates::Rates::new(data_dir.clone()))),
         Arc::new(quicklinks::Quicklinks::new(store.clone())),
         Arc::new(snippets::Snippets::new(store)),
+        Arc::new(qr::Qr),
         run.clone(),
         web.clone(),
         Arc::new(selection::Selection::new(

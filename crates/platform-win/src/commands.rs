@@ -134,6 +134,10 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::DeleteClip(_)
         | Command::ClearClipboardHistory
         | Command::IgnoreClipApp(_)
+        | Command::ShowQrCode(_)
+        | Command::CopyQrCode(_)
+        | Command::SaveQrCode(_)
+        | Command::ScanQrCodes(_)
         | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
         Command::Window {

@@ -11,8 +11,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, ScrollHandle, ScrollStrategy,
-    SharedString, Window, div, prelude::*, px, rgba, uniform_list,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, RenderImage, ScrollHandle,
+    ScrollStrategy, SharedString, Window, div, img, prelude::*, px, rgba, uniform_list,
 };
 use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, LiveRows, View};
 
@@ -683,14 +683,19 @@ impl Launcher {
 
     /// Lists and grids: the rows; details and forms: their own body.
     pub(super) fn render_screen_body(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let qr = match self.screens.last()? {
+            Screen::Detail { view, .. } => view.qr.clone(),
+            _ => None,
+        };
+        let qr = qr.and_then(|text| self.qr_image(&text, window.scale_factor()));
         match self.screens.last()? {
             Screen::List { grid: true, .. } => Some(self.render_grid(cx)),
             Screen::List { grid: false, .. } => None,
-            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, cx)),
+            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, qr, cx)),
             Screen::Form(form) => Some(self.render_form(form, window, cx)),
         }
     }
@@ -966,7 +971,13 @@ impl Launcher {
 /// change the choice (elsewhere Space types a space).
 pub(super) const CHOICE_CONTEXT: &str = "FormChoice";
 
-fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher>) -> AnyElement {
+/// `qr`: the image of the view's QR code and its size, drawn above the text.
+fn render_detail(
+    view: &DetailView,
+    scroll: &Scroller,
+    qr: Option<(Arc<RenderImage>, f32)>,
+    cx: &mut Context<Launcher>,
+) -> AnyElement {
     let text = div()
         .id("detail")
         .size_full()
@@ -975,6 +986,17 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
         .px_5()
         .py_4()
         .text_size(px(14.))
+        .when_some(qr, |text, (image, size)| {
+            text.child(
+                div().flex().justify_center().pb_4().child(
+                    img(image)
+                        .size(px(size))
+                        .flex_none()
+                        .rounded(px(6.))
+                        .overflow_hidden(),
+                ),
+            )
+        })
         .child(markdown::render(&view.markdown));
     // Wheel notches are animated instead; everything else falls through to GPUI.
     let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Launcher, delta, cx| {

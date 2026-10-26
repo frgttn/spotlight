@@ -105,6 +105,8 @@ pub enum PreviewBody {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetailView {
     pub title: String,
+    /// A QR code of this text, drawn above the markdown.
+    pub qr: Option<String>,
     pub markdown: String,
     /// Label and value pairs, shown beside the text.
     pub metadata: Vec<(String, String)>,
@@ -220,7 +222,9 @@ fn replace(command: &mut Command, id: &str, value: impl Fn(bool) -> String) {
     let placeholder = format!("{{{id}}}");
     let (text, in_url) = match command {
         Command::OpenUrl(url) => (url, true),
-        Command::Copy(text) | Command::PasteSnippet { text, .. } => (text, false),
+        Command::Copy(text) | Command::PasteSnippet { text, .. } | Command::ShowQrCode(text) => {
+            (text, false)
+        }
         Command::OpenQuicklink { link, .. } => {
             // Quicklinks encode their own way (`%20`, and paths not at all).
             if link.contains(&placeholder) {

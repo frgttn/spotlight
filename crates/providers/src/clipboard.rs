@@ -5,6 +5,8 @@
 //! Text and file lists live in the database. Images are PNG files in the
 //! `clipboard` folder of the data folder, with a smaller copy for the preview;
 //! both are encrypted (`vault::write_file`), and read with `vault::read_file`.
+//! What QR codes in an image say is read when it's copied and kept with it,
+//! so search finds the image by it.
 
 use std::{
     fs,
@@ -109,6 +111,7 @@ impl ClipboardHistory {
             pinned: false,
             copied_at: frecency::now(),
             rich: !copied.rich.is_empty(),
+            qr: Vec::new(),
         };
         let hash = match copied.content {
             Content::Text(text) => {
@@ -130,6 +133,9 @@ impl ClipboardHistory {
                 clip.content = path;
                 clip.width = Some(image.width);
                 clip.height = Some(image.height);
+                clip.qr = image::load_from_memory_with_format(&image.png, ImageFormat::Png)
+                    .map(|image| spotlight_qr::read(&image.into_rgba8()))
+                    .unwrap_or_default();
                 hash
             }
         };
@@ -394,6 +400,9 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
     if clip.kind != ClipKind::Image {
         keywords.push(clip.content.chars().take(SEARCHED_CHARS).collect());
     }
+    for code in &clip.qr {
+        keywords.push(code.chars().take(SEARCHED_CHARS).collect());
+    }
     keywords.extend(clip.app.clone());
 
     let mut item = SearchItem::new(item_id(ID, &clip.id.to_string()), title)
@@ -440,6 +449,19 @@ fn item(clip: &Clip, now: i64) -> SearchItem {
                 .action("Show in Folder", Command::ShowInFolder((*path).into()));
         }
         _ => {}
+    }
+    if let Some(view) = spotlight_qr::scanned_view(&clip.qr) {
+        let show = match clip.qr.len() {
+            1 => "Show QR Code",
+            _ => "Show QR Codes",
+        };
+        item = item.action(show, Command::PushView(Box::new(view)));
+        if let [code] = clip.qr.as_slice() {
+            item = item.action("Copy QR Code Text", Command::Copy(code.clone()));
+            if let Some(url) = spotlight_qr::link(code) {
+                item = item.action("Open QR Code Link", Command::OpenUrl(url.to_owned()));
+            }
+        }
     }
     let pin = if clip.pinned { "Unpin" } else { "Pin" };
     item = item
@@ -497,6 +519,11 @@ fn preview(clip: &Clip, tag: Tag, paths: &[&str], now: i64) -> Preview {
         ClipKind::Image => {
             if let (Some(width), Some(height)) = (clip.width, clip.height) {
                 metadata.push(("Dimensions".into(), format!("{width} × {height}")));
+            }
+            match clip.qr.as_slice() {
+                [] => {}
+                [code] => metadata.push(("QR Code".into(), clip::first_line(code, 80))),
+                codes => metadata.push(("QR Codes".into(), codes.len().to_string())),
             }
         }
         ClipKind::Files => metadata.push(("Files".into(), paths.len().to_string())),
@@ -744,6 +771,33 @@ mod tests {
         clip.remove_files();
         assert!(!fs::exists(&clip.content).unwrap());
         assert!(!fs::exists(preview).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn images_are_found_by_their_qr_codes() {
+        let dir = std::env::temp_dir().join(format!("spotlight-qr-clips-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let history = ClipboardHistory::new(Some(store), Some(dir.clone()), Retention::default());
+        let code = spotlight_qr::Code::new("https://example.com/menu").unwrap();
+        history.record(copied(Content::Image(Image {
+            png: code.png().unwrap(),
+            width: code.png_size(),
+            height: code.png_size(),
+        })));
+
+        let item = &history.history().items[0];
+        assert!(
+            item.keywords
+                .contains(&"https://example.com/menu".to_owned())
+        );
+        let titles: Vec<&str> = item.actions.iter().map(|a| a.title.as_str()).collect();
+        assert!(titles.contains(&"Show QR Code"), "{titles:?}");
+        assert!(item.actions.iter().any(|action| action.command
+            == Command::OpenUrl("https://example.com/menu".into())));
+        let metadata = &item.preview.as_ref().unwrap().metadata;
+        assert!(metadata.contains(&("QR Code".into(), "https://example.com/menu".into())));
         let _ = fs::remove_dir_all(&dir);
     }
 

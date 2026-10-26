@@ -322,6 +322,23 @@ pub enum Command {
     QuitApp(u32),
     /// Ends process `pid` at once; what it hadn't saved is lost.
     ForceQuit(u32),
+    /// Shows a QR code of this text in a view of its own.
+    ShowQrCode(String),
+    /// Puts a QR code of this text on the clipboard, as an image.
+    CopyQrCode(String),
+    /// Asks where to save a QR code of this text as a PNG file.
+    SaveQrCode(String),
+    /// Looks for QR codes and shows what they say.
+    ScanQrCodes(QrSource),
+}
+
+/// Where [`Command::ScanQrCodes`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QrSource {
+    /// Every display, as it is once the launcher is hidden.
+    Screen,
+    /// The image on the clipboard.
+    Clipboard,
 }
 
 /// Where a command takes the text selected in the app the launcher came
@@ -392,6 +409,7 @@ impl Command {
             | Command::DeleteClip(_) => shortcut::CLEAR,
             Command::ClearClipboardHistory => shortcut::CLEAR_ALL,
             Command::PinClip { .. } => shortcut::PIN,
+            Command::SaveQrCode(_) => shortcut::SAVE,
             _ => return None,
         })
     }
