@@ -4,7 +4,10 @@
 
 use std::{os::windows::process::CommandExt, process, thread};
 
-use spotlight_core::{item::Command, quicklink};
+use spotlight_core::{
+    item::{CardKind, Command},
+    quicklink,
+};
 use windows::{
     Win32::{
         System::{
@@ -25,7 +28,7 @@ use windows::{
 use crate::{
     links, run,
     system::{self, Outcome},
-    wm,
+    wifi, wm,
 };
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
@@ -34,6 +37,9 @@ const URL_SCHEMES: &[&str] = &[
     "https://",
     "http://",
     "ms-settings:",
+    // A new email, a call (Phone Link): what a QR code's contact offers.
+    "mailto:",
+    "tel:",
     // Game launchers, to start a game they installed.
     "steam://",
     "com.epicgames.launcher://",
@@ -155,9 +161,27 @@ fn run_blocking(command: &Command) -> Outcome {
             height,
         } => wm::set_frame_from(*target, [x, y, width, height]),
         Command::Run { line, admin } => run::start(line, *admin),
+        Command::ConnectWifi(network) => wifi::connect(network),
+        Command::OpenCard { kind, text } => open_card(*kind, text),
         Command::QuitApp(pid) => wm::quit_app(*pid),
         Command::ForceQuit(pid) => wm::force_quit(*pid),
     }
+}
+
+/// Writes a contact or event to a file of its type in the temp folder and
+/// opens it, so People, Outlook or Calendar offers to add it. Only these two
+/// types: opening a file of any other type could run it.
+fn open_card(kind: CardKind, text: &str) -> Outcome {
+    let name = match kind {
+        CardKind::Contact => "Contact.vcf",
+        CardKind::Event => "Event.ics",
+    };
+    let folder = std::env::temp_dir().join("Spotlight");
+    let path = folder.join(name);
+    std::fs::create_dir_all(&folder)
+        .and_then(|()| std::fs::write(&path, text))
+        .map_err(|err| format!("Couldn't write the file: {err}"))?;
+    shell_execute("open", &path.to_string_lossy())
 }
 
 /// `ShellExecute` with `verb`, blocking.

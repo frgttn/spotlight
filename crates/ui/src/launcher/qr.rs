@@ -6,7 +6,7 @@ use std::{fs, sync::Arc, time::Duration, time::Instant};
 
 use gpui::{Context, RenderImage, Window};
 use image::Frame;
-use spotlight_core::item::QrSource;
+use spotlight_core::item::{CLIPBOARD, QrSource};
 use spotlight_platform_win::{
     clipboard::{self, Content, Image},
     dialog::{self, Request},
@@ -31,10 +31,20 @@ pub(super) struct QrImage {
 }
 
 impl Launcher {
-    /// Opens the view of a QR code of `text`, or says why there can't be one.
+    /// Opens the view of a QR code of `text` (the clipboard's text for
+    /// [`CLIPBOARD`]), or says why there can't be one.
     pub(super) fn show_qr_code(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        match Code::new(text) {
-            Ok(_) => self.push_view(spotlight_qr::view(text, false), window, cx),
+        let text = if text == CLIPBOARD {
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            match copied.filter(|text| !text.trim().is_empty()) {
+                Some(copied) => copied,
+                None => return self.show_toast("There's no text on the clipboard".into(), cx),
+            }
+        } else {
+            text.to_owned()
+        };
+        match Code::new(&text) {
+            Ok(_) => self.push_view(spotlight_qr::view(&text, false), window, cx),
             Err(err) => self.show_toast(err.into(), cx),
         }
     }

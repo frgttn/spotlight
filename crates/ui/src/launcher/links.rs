@@ -172,12 +172,7 @@ impl Launcher {
         let Some(command) = self.link_command(ix, link) else {
             return;
         };
-        let opens_view = matches!(
-            command,
-            Command::PushView(_)
-                | Command::OpenProviderView { .. }
-                | Command::OpenCalculatorHistory
-        );
+        let opens_view = super::opens_view(&command);
         if !self.visible {
             // Window commands act on the window the link was opened from.
             self.previous_window = spotlight_platform_win::clipboard::foreground_window();

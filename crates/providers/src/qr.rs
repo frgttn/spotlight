@@ -3,7 +3,7 @@
 //! draws the code and does the scanning (see `spotlight_qr`).
 
 use spotlight_core::{
-    item::{Command, Icon, QrSource, SearchItem},
+    item::{CLIPBOARD, Command, Icon, QrSource, SELECTION, SearchItem},
     item_id,
     provider::Provider,
     view::{Field, FieldKind, FormView, View},
@@ -27,7 +27,7 @@ impl Provider for Qr {
     }
 
     fn description(&self) -> &'static str {
-        "Generate QR Code (also “qr <text>”), and reading QR codes on the screen or the clipboard."
+        "Generate QR Code (also “qr <text>”, or from the selection or clipboard), and reading QR codes on the screen or the clipboard."
     }
 
     fn catalog(&self) -> Vec<SearchItem> {
@@ -51,6 +51,16 @@ impl Provider for Qr {
                 .keywords(&["qr code", "create", "make", "barcode"])
                 .icon(Icon::Glyph(GLYPH))
                 .action("Open Form", Command::PushView(Box::new(View::Form(form)))),
+            SearchItem::new(item_id(ID, "selection"), "Generate QR Code from Selection")
+                .subtitle("QR Codes")
+                .keywords(&["qr code", "create", "make", "selected text"])
+                .icon(Icon::Glyph(GLYPH))
+                .action("Show QR Code", Command::ShowQrCode(SELECTION.into())),
+            SearchItem::new(item_id(ID, "clipboard"), "Generate QR Code from Clipboard")
+                .subtitle("QR Codes")
+                .keywords(&["qr code", "create", "make", "copied text"])
+                .icon(Icon::Glyph(GLYPH))
+                .action("Show QR Code", Command::ShowQrCode(CLIPBOARD.into())),
             SearchItem::new(item_id(ID, "scan-screen"), "Scan QR Code from Screen")
                 .subtitle("QR Codes")
                 .keywords(&["qr code", "read", "decode", "barcode"])
@@ -99,6 +109,20 @@ mod tests {
         assert_eq!(
             answers[0].actions[0].command,
             Command::ShowQrCode("https://example.com".into())
+        );
+    }
+
+    #[test]
+    fn codes_of_the_selection_and_clipboard() {
+        let catalog = Qr.catalog();
+        let command = |title: &str| {
+            let item = catalog.iter().find(|item| item.title == title).unwrap();
+            item.actions[0].command.clone()
+        };
+        assert!(command("Generate QR Code from Selection").needs_selection());
+        assert_eq!(
+            command("Generate QR Code from Clipboard"),
+            Command::ShowQrCode(CLIPBOARD.into())
         );
     }
 

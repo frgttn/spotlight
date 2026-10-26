@@ -991,6 +991,27 @@ async fn qr_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> Str
         Ok(false) => "not found on the screen",
         Err(_) => "screen not captured",
     };
+    // A scanned Wi-Fi network's view on top: its panel offers to connect
+    // first. Nothing is run.
+    let wifi = "WIFI:S:Selftest Network;T:WPA;P:example-password;;";
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.open_view(spotlight_qr::view(wifi, true), window, cx)
+        })
+        .ok();
+    press(window, "ctrl-k", cx);
+    cx.background_executor()
+        .timer(Duration::from_millis(SETTLE_MS))
+        .await;
+    let actions = window
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    press(window, "escape", cx);
+    if actions.first().map(String::as_str) != Some("Connect to Network") {
+        return format!("Wi-Fi code's actions: {actions:?}");
+    }
     if let Some(hold) = env::var("SPOTLIGHT_SELFTEST_HOLD")
         .ok()
         .and_then(|ms| ms.parse::<u64>().ok())
@@ -1000,8 +1021,9 @@ async fn qr_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> Str
             .timer(Duration::from_millis(hold))
             .await;
     }
+    press(window, "escape", cx);
     match back_to_search(window, cx).await {
-        Ok(()) => format!("opened, {read}, back to search"),
+        Ok(()) => format!("opened, {read}, Wi-Fi connects first, back to search"),
         Err(why) => why,
     }
 }

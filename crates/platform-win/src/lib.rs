@@ -32,5 +32,6 @@ pub mod screen;
 pub mod selection;
 pub mod system;
 pub mod vault;
+pub mod wifi;
 pub mod win;
 pub mod wm;

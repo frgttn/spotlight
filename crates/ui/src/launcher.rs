@@ -2133,7 +2133,7 @@ impl Launcher {
             return self.open_own_link(link, window, cx);
         }
         if command.needs_selection() {
-            return self.run_with_selection(command.clone(), cx);
+            return self.run_with_selection(command.clone(), window, cx);
         }
         match command {
             Command::PushView(view) => self.push_view((**view).clone(), window, cx),
@@ -2336,7 +2336,12 @@ impl Launcher {
     /// Reads the text selected in the app the launcher came from, then runs
     /// `command` with it. The launcher hides first: the app has to be in
     /// front for its selection to be read.
-    fn run_with_selection(&mut self, command: Command, cx: &mut Context<Self>) {
+    fn run_with_selection(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let provider = self
             .search
             .providers()
@@ -2349,12 +2354,17 @@ impl Launcher {
         }
         let outcome = selection::spawn(self.previous_window, self.hwnd, self.selection_copy);
         self.hide(cx);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let outcome = outcome
                 .recv()
                 .await
                 .unwrap_or_else(|_| Err("Couldn't read the selection".into()));
-            this.update(cx, |this, cx| match outcome {
+            this.update_in(cx, |this, window, cx| match outcome {
+                // A QR code of it opens in the launcher.
+                Ok(Some(text)) if matches!(command, Command::ShowQrCode(_)) => {
+                    this.show(Instant::now(), window, cx);
+                    this.show_qr_code(&text, window, cx);
+                }
                 Ok(Some(text)) => this.run_command(&command.with_selection(&text), cx),
                 // A snippet still pastes, with nothing where the selection goes.
                 Ok(None) if matches!(command, Command::PasteSnippet { .. }) => {
@@ -2631,12 +2641,7 @@ impl Launcher {
         };
         // Commands that open a view (Clipboard History) open the launcher on
         // it; pressed again while that view is up, the launcher closes.
-        if matches!(
-            action.command,
-            Command::PushView(_)
-                | Command::OpenProviderView { .. }
-                | Command::OpenCalculatorHistory
-        ) {
+        if opens_view(&action.command) {
             let title = &self.search.catalog()[ix].title;
             if self.visible && self.screen_title().as_ref() == Some(title) {
                 self.hide(cx);
@@ -2655,7 +2660,7 @@ impl Launcher {
             // The hotkey was pressed in the app whose selection it's for.
             self.previous_window = system_clipboard::foreground_window();
             self.record_visit(id.to_owned(), cx);
-            return self.run_with_selection(action.command, cx);
+            return self.run_with_selection(action.command, window, cx);
         }
         // Scanning the screen hides the launcher first and opens it on what
         // it finds.
@@ -4245,6 +4250,19 @@ fn kind_of(id: &str) -> &'static str {
 
 /// What goes after a catalog item's title: its subtitle, without the kind
 /// already shown at the right ("!gh  ·  Quicklink" → "!gh").
+/// Whether `command` opens a view, so the launcher shows when it's run
+/// from a hotkey or a link.
+fn opens_view(command: &Command) -> bool {
+    match command {
+        Command::PushView(_)
+        | Command::OpenProviderView { .. }
+        | Command::OpenCalculatorHistory => true,
+        // One of the selection reads it first, with the launcher hidden.
+        Command::ShowQrCode(_) => !command.needs_selection(),
+        _ => false,
+    }
+}
+
 fn detail_of(subtitle: Option<&str>, kind: &str) -> Option<String> {
     let subtitle = subtitle?.trim();
     let subtitle = subtitle

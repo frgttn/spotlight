@@ -330,6 +330,46 @@ pub enum Command {
     SaveQrCode(String),
     /// Looks for QR codes and shows what they say.
     ScanQrCodes(QrSource),
+    /// Saves a Wi-Fi network (a QR code's) to Windows and connects to it.
+    ConnectWifi(WifiNetwork),
+    /// Opens a contact (vCard) or an event (iCalendar) with the app that
+    /// takes them (People, Outlook, Calendar), to add it there.
+    OpenCard {
+        kind: CardKind,
+        text: String,
+    },
+}
+
+/// A Wi-Fi network as a QR code shares it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    pub security: WifiSecurity,
+    /// Empty for an open network.
+    pub password: String,
+    /// It doesn't broadcast its name.
+    pub hidden: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WifiSecurity {
+    /// No password.
+    Open,
+    Wep,
+    /// WPA2 (or WPA) with a password.
+    #[default]
+    Wpa,
+    /// WPA3 with a password.
+    Wpa3,
+}
+
+/// What [`Command::OpenCard`] opens, which picks the file type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardKind {
+    /// A `.vcf` file.
+    Contact,
+    /// An `.ics` file.
+    Event,
 }
 
 /// Where [`Command::ScanQrCodes`] looks.
@@ -342,8 +382,11 @@ pub enum QrSource {
 }
 
 /// Where a command takes the text selected in the app the launcher came
-/// from: in an `OpenUrl` URL (percent-encoded) or a quicklink.
+/// from: in an `OpenUrl` URL (percent-encoded) or a quicklink, or as the
+/// whole text of a QR code.
 pub const SELECTION: &str = "{selection}";
+/// A QR code of the clipboard's text: `ShowQrCode(CLIPBOARD)`.
+pub const CLIPBOARD: &str = "{clipboard}";
 
 impl Command {
     /// Whether it uses the selected text ([`SELECTION`]), which the app reads
@@ -353,6 +396,7 @@ impl Command {
             Command::OpenUrl(url) => url.contains(SELECTION),
             Command::OpenQuicklink { link, .. } => quicklink::has_selection(link),
             Command::PasteSnippet { text, .. } => snippet::has_selection(text),
+            Command::ShowQrCode(text) => text == SELECTION,
             _ => false,
         }
     }
@@ -374,6 +418,7 @@ impl Command {
                 text: snippet::fill_selection(snippet, text),
                 paste: *paste,
             },
+            Command::ShowQrCode(code) if code == SELECTION => Command::ShowQrCode(text.to_owned()),
             command => command.clone(),
         }
     }
@@ -485,6 +530,14 @@ mod tests {
             link: r"C:\Notes\{selection}.md".into(),
             app: None,
         };
+        let qr = Command::ShowQrCode(SELECTION.into());
+        assert!(qr.needs_selection());
+        assert_eq!(
+            qr.with_selection("a {b}"),
+            Command::ShowQrCode("a {b}".into())
+        );
+        // Only the whole text: a code of other text that mentions it is as typed.
+        assert!(!Command::ShowQrCode("see {selection}".into()).needs_selection());
         assert_eq!(
             path.with_selection("todo list"),
             Command::OpenQuicklink {

@@ -1026,9 +1026,12 @@ fn render_detail(
         .when(!view.metadata.is_empty(), |body| {
             body.child(
                 div()
+                    .id("detail-metadata")
                     .flex_none()
                     .w(px(220.))
                     .h_full()
+                    // A contact read from a QR code can have more facts than fit.
+                    .overflow_y_scroll()
                     .px_4()
                     .py_4()
                     .border_l_1()

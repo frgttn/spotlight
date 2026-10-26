@@ -5,10 +5,15 @@
 use image::{GrayImage, ImageFormat, Luma, RgbaImage};
 use qrcode::{Color, EcLevel, QrCode};
 use spotlight_core::{
-    item::{Action, Command, Icon, SearchItem},
+    item::{Action, CardKind, Command, Icon, SearchItem, WifiSecurity},
     item_id,
+    quicklink::encode_value,
     view::{DetailView, ListView, View},
 };
+
+mod content;
+
+pub use content::{Contact, Content, Email, Event, link, parse};
 
 /// Light modules around the code, as the standard asks, so readers find it.
 pub const QUIET_ZONE: usize = 4;
@@ -206,42 +211,189 @@ fn read_gray(gray: &GrayImage) -> Vec<String> {
     found
 }
 
-/// The URL a code says, when it says one and nothing else.
-pub fn link(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
-    let is_url = (lower.starts_with("https://") || lower.starts_with("http://"))
-        && !text.contains(char::is_whitespace);
-    is_url.then_some(text)
-}
-
-/// The view of a QR code of `text`. `scanned`: it was read from the screen
-/// or the clipboard, so copying the text comes first rather than the image.
+/// The view of a QR code of `text`: what it says, and actions for what it
+/// is (Connect to Network, Add to Contacts, Open Link…). `scanned`: it was
+/// read from the screen or the clipboard, so using it comes first rather
+/// than copying its image.
 pub fn view(text: &str, scanned: bool) -> View {
-    let mut metadata = Vec::new();
+    let content = parse(text);
+    let mut metadata = details(&content);
+    metadata.push(("Content".into(), content.kind().into()));
+    metadata.push(("Characters".into(), text.chars().count().to_string()));
     if let Ok(code) = Code::new(text) {
         metadata.push(("Size".into(), code.describe_version()));
         metadata.push(("Error Correction".into(), code.describe_level().into()));
     }
-    metadata.push(("Content".into(), kind(text).into()));
-    metadata.push(("Characters".into(), text.chars().count().to_string()));
 
     let copy_text = Action::new("Copy Text", Command::Copy(text.to_owned()));
     let copy_image = Action::new("Copy Image", Command::CopyQrCode(text.to_owned()));
     let save = Action::new("Save Image…", Command::SaveQrCode(text.to_owned()));
-    let open = link(text).map(|url| Action::new("Open Link", Command::OpenUrl(url.to_owned())));
-    let actions = if scanned {
-        [Some(copy_text), open, Some(copy_image), Some(save)]
-    } else {
-        [Some(copy_image), Some(copy_text), Some(save), open]
+    let uses = uses(&content);
+    let actions = match (scanned, &content) {
+        // Plain text and links are mostly copied.
+        (true, Content::Text | Content::Link(_)) => [vec![copy_text], uses, vec![copy_image, save]],
+        (true, _) => [uses, vec![copy_text], vec![copy_image, save]],
+        (false, _) => [vec![copy_image, copy_text, save], uses, Vec::new()],
     };
     View::Detail(DetailView {
         title: "QR Code".into(),
         qr: Some(text.to_owned()),
         markdown: code_block(text),
         metadata,
-        actions: actions.into_iter().flatten().collect(),
+        actions: actions.concat(),
     })
+}
+
+/// What the code says, label by label: the network and its password, the
+/// contact's name and number…
+fn details(content: &Content) -> Vec<(String, String)> {
+    let mut details: Vec<(&str, String)> = Vec::new();
+    match content {
+        Content::Wifi(network) => {
+            details.push(("Network", network.ssid.clone()));
+            let security = match network.security {
+                WifiSecurity::Open => "None",
+                WifiSecurity::Wep => "WEP",
+                WifiSecurity::Wpa => "WPA/WPA2",
+                WifiSecurity::Wpa3 => "WPA3",
+            };
+            details.push(("Security", security.into()));
+            details.push(("Password", network.password.clone()));
+            if network.hidden {
+                details.push(("Hidden", "Yes".into()));
+            }
+        }
+        Content::Contact(contact) => {
+            details.push(("Name", contact.name.clone()));
+            details.push(("Organization", contact.organization.clone()));
+            details.push(("Phone", contact.phones.join(", ")));
+            details.push(("Email", contact.emails.join(", ")));
+            details.push(("Website", contact.website.clone()));
+            details.push(("Address", contact.address.clone()));
+        }
+        Content::Email(email) => {
+            details.push(("To", email.to.clone()));
+            details.push(("Subject", email.subject.clone()));
+        }
+        Content::Phone(number) => details.push(("Number", number.clone())),
+        Content::Sms { number, message } => {
+            details.push(("Number", number.clone()));
+            details.push(("Message", message.clone()));
+        }
+        Content::Place {
+            latitude,
+            longitude,
+        } => {
+            details.push(("Latitude", latitude.clone()));
+            details.push(("Longitude", longitude.clone()));
+        }
+        Content::Event(event) => {
+            details.push(("Event", event.title.clone()));
+            details.push(("Starts", event.start.clone()));
+            details.push(("Ends", event.end.clone()));
+            details.push(("Location", event.location.clone()));
+        }
+        Content::Link(_) | Content::Text => {}
+    }
+    details
+        .into_iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(label, value)| (label.to_owned(), value))
+        .collect()
+}
+
+/// Actions for what the code is.
+fn uses(content: &Content) -> Vec<Action> {
+    let copy = |title: &str, text: &str| {
+        (!text.is_empty()).then(|| Action::new(title, Command::Copy(text.to_owned())))
+    };
+    let open = |title: &str, url: String| Some(Action::new(title, Command::OpenUrl(url)));
+    let actions = match content {
+        Content::Link(url) => vec![open("Open Link", url.clone())],
+        Content::Wifi(network) => vec![
+            Some(Action::new(
+                "Connect to Network",
+                Command::ConnectWifi(network.clone()),
+            )),
+            copy("Copy Password", &network.password),
+            copy("Copy Network Name", &network.ssid),
+        ],
+        Content::Contact(contact) => {
+            let phone = contact.phones.first().map(String::as_str).unwrap_or("");
+            let email = contact.emails.first().map(String::as_str).unwrap_or("");
+            vec![
+                Some(Action::new(
+                    "Add to Contacts",
+                    Command::OpenCard {
+                        kind: CardKind::Contact,
+                        text: contact.vcard.clone(),
+                    },
+                )),
+                copy("Copy Phone Number", phone),
+                copy("Copy Email Address", email),
+                (!email.is_empty())
+                    .then(|| open("Send Email", format!("mailto:{email}")))
+                    .flatten(),
+                link(&contact.website).and_then(|url| open("Open Website", url.to_owned())),
+            ]
+        }
+        Content::Email(email) => vec![
+            open("Send Email", mailto(email)),
+            copy("Copy Email Address", &email.to),
+        ],
+        Content::Phone(number) => vec![
+            open("Call", format!("tel:{}", number.replace(' ', ""))),
+            copy("Copy Phone Number", number),
+        ],
+        Content::Sms { number, message } => vec![
+            copy("Copy Phone Number", number),
+            copy("Copy Message", message),
+        ],
+        Content::Place {
+            latitude,
+            longitude,
+        } => {
+            let coordinates = format!("{latitude},{longitude}");
+            vec![
+                open(
+                    "Open in Maps",
+                    format!(
+                        "https://www.google.com/maps/search/?api=1&query={}",
+                        encode_value(&coordinates, true)
+                    ),
+                ),
+                copy("Copy Coordinates", &coordinates),
+            ]
+        }
+        Content::Event(event) => vec![
+            Some(Action::new(
+                "Add to Calendar",
+                Command::OpenCard {
+                    kind: CardKind::Event,
+                    text: event.ics.clone(),
+                },
+            )),
+            copy("Copy Event Title", &event.title),
+        ],
+        Content::Text => Vec::new(),
+    };
+    actions.into_iter().flatten().collect()
+}
+
+/// A `mailto:` URL that opens a new email as the code describes it.
+fn mailto(email: &Email) -> String {
+    let mut url = format!("mailto:{}", email.to.trim());
+    let fields = [("subject", &email.subject), ("body", &email.body)];
+    let query: Vec<String> = fields
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(name, value)| format!("{name}={}", encode_value(value, true)))
+        .collect();
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query.join("&"));
+    }
+    url
 }
 
 /// What a code scan found: one code opens as it is; several are listed,
@@ -257,18 +409,17 @@ pub fn scanned_view(codes: &[String]) -> Option<View> {
                 .iter()
                 .enumerate()
                 .map(|(ix, text)| {
+                    let content = parse(text);
                     let mut item =
                         SearchItem::new(item_id(ID, &format!("scan{ix}")), first_line(text))
-                            .subtitle(kind(text))
+                            .subtitle(content.kind())
                             .icon(Icon::Glyph(GLYPH))
                             .action(
                                 "Show QR Code",
                                 Command::PushView(Box::new(view(text, true))),
                             )
                             .action("Copy Text", Command::Copy(text.clone()));
-                    if let Some(url) = link(text) {
-                        item = item.action("Open Link", Command::OpenUrl(url.to_owned()));
-                    }
+                    item.actions.extend(uses(&content));
                     item.keywords = vec![text.clone()];
                     item
                 })
@@ -282,30 +433,6 @@ pub fn scanned_view(codes: &[String]) -> Option<View> {
 
 /// The QR code symbol of Segoe Fluent Icons / Segoe MDL2 Assets.
 pub const GLYPH: char = '\u{ED14}';
-
-/// "Link", "Wi-Fi Network", "Text"…: what a code's text is, by its prefix.
-pub fn kind(text: &str) -> &'static str {
-    let upper = text.get(..12).unwrap_or(text).to_ascii_uppercase();
-    if link(text).is_some() {
-        "Link"
-    } else if upper.starts_with("WIFI:") {
-        "Wi-Fi Network"
-    } else if upper.starts_with("BEGIN:VCARD") || upper.starts_with("MECARD:") {
-        "Contact"
-    } else if upper.starts_with("BEGIN:VEVENT") || upper.starts_with("BEGIN:VCALEN") {
-        "Event"
-    } else if upper.starts_with("MAILTO:") || upper.starts_with("MATMSG:") {
-        "Email"
-    } else if upper.starts_with("TEL:") {
-        "Phone Number"
-    } else if upper.starts_with("SMSTO:") || upper.starts_with("SMS:") {
-        "Text Message"
-    } else if upper.starts_with("GEO:") {
-        "Location"
-    } else {
-        "Text"
-    }
-}
 
 /// The text's first non-empty line, cut at 80 characters.
 fn first_line(text: &str) -> String {
@@ -416,6 +543,63 @@ mod tests {
             panic!("not a list");
         };
         assert_eq!(list.items[1].subtitle.as_deref(), Some("Wi-Fi Network"));
+    }
+
+    #[test]
+    fn views_act_on_what_the_code_is() {
+        let titles = |text: &str, scanned: bool| -> Vec<String> {
+            let View::Detail(detail) = view(text, scanned) else {
+                panic!("not a detail");
+            };
+            detail.actions.into_iter().map(|a| a.title).collect()
+        };
+        let wifi = "WIFI:S:Home;T:WPA;P:secret;;";
+        assert_eq!(
+            titles(wifi, true),
+            [
+                "Connect to Network",
+                "Copy Password",
+                "Copy Network Name",
+                "Copy Text",
+                "Copy Image",
+                "Save Image…"
+            ]
+        );
+        assert_eq!(
+            titles(wifi, false)[..3],
+            ["Copy Image", "Copy Text", "Save Image…"]
+        );
+        let View::Detail(detail) = view(wifi, true) else {
+            panic!("not a detail");
+        };
+        assert!(
+            detail
+                .metadata
+                .contains(&("Password".into(), "secret".into()))
+        );
+        assert_eq!(
+            detail.actions[0].command,
+            Command::ConnectWifi(spotlight_core::item::WifiNetwork {
+                ssid: "Home".into(),
+                security: WifiSecurity::Wpa,
+                password: "secret".into(),
+                hidden: false,
+            })
+        );
+
+        let View::Detail(email) = view("MATMSG:TO:a@b.c;SUB:Hi there;BODY:x&y;;", true) else {
+            panic!("not a detail");
+        };
+        assert_eq!(
+            email.actions[0].command,
+            Command::OpenUrl("mailto:a@b.c?subject=Hi%20there&body=x%26y".into())
+        );
+        assert_eq!(titles("tel:+1 555", true)[0], "Call");
+        assert_eq!(titles("geo:1.5,2", true)[0], "Open in Maps");
+        assert_eq!(
+            titles("MECARD:N:A;TEL:1;;", true)[..2],
+            ["Add to Contacts", "Copy Phone Number"]
+        );
     }
 
     #[test]
