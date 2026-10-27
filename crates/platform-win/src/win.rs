@@ -4,7 +4,7 @@
 //! UI frameworks generally have no "hide but keep everything alive" call, so the
 //! launcher takes the HWND and drives visibility and placement directly.
 
-use std::{ffi::c_void, mem::size_of, sync::Mutex, time::Duration};
+use std::{ffi::c_void, mem::size_of};
 
 use spotlight_core::clip::IgnoredApp;
 use windows::{
@@ -16,12 +16,7 @@ use windows::{
                 DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
                 DwmGetWindowAttribute, DwmSetWindowAttribute,
             },
-            Gdi::{
-                BI_RGB, BITMAPINFO, BITMAPINFOHEADER, COLORONCOLOR, CreateCompatibleBitmap,
-                CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
-                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-                ReleaseDC, SRCCOPY, SelectObject, SetStretchBltMode, StretchBlt,
-            },
+            Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
         },
         System::{
             Console::{ATTACH_PARENT_PROCESS, AttachConsole},
@@ -146,16 +141,11 @@ pub fn set_border_color(raw: isize, rgb: u32) {
 ///
 /// GPUI misses a size change made here while it updates the window (see
 /// [`resize`]), so the window should already have the size asked for.
-///
-/// Returns how bright the screen is where the window now is (0 black, 1
-/// white), read just before it showed, so the window can stay dark over a
-/// light background.
 pub fn show_on_active_monitor(
     raw: isize,
     logical_size: Option<(f32, f32)>,
     client_height: Option<f32>,
-) -> Option<f32> {
-    let mut behind = None;
+) {
     unsafe {
         let hwnd = hwnd(raw);
         let mut cursor = POINT::default();
@@ -184,9 +174,6 @@ pub fn show_on_active_monitor(
             let work = info.rcWork;
             let x = work.left + (work.right - work.left - width) / 2;
             let y = work.top + (work.bottom - work.top - height) / 2;
-            // The whole window as it will be, not just a collapsed search row:
-            // the same area in both modes, so switching keeps the reading.
-            let area = (x, y, width, height);
             let height = match client_height {
                 Some(client_height) => {
                     let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
@@ -195,7 +182,6 @@ pub fn show_on_active_monitor(
                 }
                 None => height,
             };
-            behind = remembered_brightness(area);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -211,127 +197,6 @@ pub fn show_on_active_monitor(
         // Allowed because our process just received the hotkey input event.
         let _ = SetForegroundWindow(hwnd);
     }
-    behind
-}
-
-/// The screen area the window was last shown over, with the brightness read
-/// there. Reading the screen costs 5 to 7 ms, too much for every show, so a
-/// show reuses it and [`hide`] reads it again once the window is gone.
-static BEHIND: Mutex<Option<(Area, f32)>> = Mutex::new(None);
-
-/// x, y, width and height in physical pixels.
-type Area = (i32, i32, i32, i32);
-
-/// The brightness behind `area`: the last reading of that very area, or a read
-/// now (the first show, or after the window moved to another place).
-fn remembered_brightness(area: Area) -> Option<f32> {
-    if let Some((seen, value)) = *BEHIND.lock().ok()?
-        && seen == area
-    {
-        return Some(value);
-    }
-    let value = brightness(area.0, area.1, area.2, area.3)?;
-    *BEHIND.lock().ok()? = Some((area, value));
-    Some(value)
-}
-
-/// Reads the area again, off the show path, once the window has gone from
-/// the screen. Dropped if the window came back before the read was done.
-fn refresh_brightness(raw: isize) {
-    let Some((area, _)) = BEHIND.lock().ok().and_then(|behind| *behind) else {
-        return;
-    };
-    std::thread::spawn(move || {
-        // Long enough for the desktop to be composed without the window.
-        std::thread::sleep(Duration::from_millis(150));
-        let shown = || unsafe { IsWindowVisible(hwnd(raw)).as_bool() };
-        if shown() {
-            return;
-        }
-        let value = brightness(area.0, area.1, area.2, area.3);
-        if let (Some(value), false) = (value, shown())
-            && let Ok(mut behind) = BEHIND.lock()
-        {
-            *behind = Some((area, value));
-        }
-    });
-}
-
-/// The mean brightness (0 black, 1 white) of the screen in a rectangle of
-/// physical pixels, from a small sample of it.
-fn brightness(x: i32, y: i32, width: i32, height: i32) -> Option<f32> {
-    const SAMPLE: (i32, i32) = (48, 32);
-    if width <= 0 || height <= 0 {
-        return None;
-    }
-    unsafe {
-        let screen = GetDC(None);
-        if screen.is_invalid() {
-            return None;
-        }
-        let memory = CreateCompatibleDC(Some(screen));
-        let bitmap = CreateCompatibleBitmap(screen, SAMPLE.0, SAMPLE.1);
-        let old = SelectObject(memory, bitmap.into());
-        // Point sampling: a few hundred pixels say enough, and fast.
-        SetStretchBltMode(memory, COLORONCOLOR);
-        let copied = StretchBlt(
-            memory,
-            0,
-            0,
-            SAMPLE.0,
-            SAMPLE.1,
-            Some(screen),
-            x,
-            y,
-            width,
-            height,
-            SRCCOPY,
-        )
-        .as_bool();
-        SelectObject(memory, old);
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: SAMPLE.0,
-                biHeight: -SAMPLE.1,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bgra = vec![0u8; (SAMPLE.0 * SAMPLE.1 * 4) as usize];
-        let rows = copied.then(|| {
-            GetDIBits(
-                memory,
-                bitmap,
-                0,
-                SAMPLE.1 as u32,
-                Some(bgra.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            )
-        });
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(memory);
-        ReleaseDC(None, screen);
-        if rows.unwrap_or(0) == 0 {
-            return None;
-        }
-        Some(mean_brightness(&bgra))
-    }
-}
-
-/// The mean luma of BGRA pixels, 0 to 1.
-fn mean_brightness(bgra: &[u8]) -> f32 {
-    let (pixels, _) = bgra.as_chunks::<4>();
-    let count = pixels.len().max(1) as f32;
-    let sum: f32 = pixels
-        .iter()
-        .map(|pixel| 0.0722 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.2126 * pixel[2] as f32)
-        .sum();
-    sum / count / 255.
 }
 
 /// Changes the window's size, keeping its top-left corner and z-order.
@@ -433,7 +298,6 @@ pub fn hide(raw: isize) {
     unsafe {
         let _ = ShowWindow(hwnd(raw), SW_HIDE);
     }
-    refresh_brightness(raw);
 }
 
 /// Brings an already visible window to the front.
@@ -472,18 +336,4 @@ pub fn user_language() -> String {
 
 pub fn is_visible(raw: isize) -> bool {
     unsafe { IsWindowVisible(hwnd(raw)).as_bool() }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn averages_brightness() {
-        let white = [255u8; 8];
-        assert!((mean_brightness(&white) - 1.).abs() < 1e-3);
-        // One black pixel and one pure green (BGRA).
-        let mixed = [0, 0, 0, 255, 0, 255, 0, 255];
-        assert!((mean_brightness(&mixed) - 0.3576).abs() < 1e-3);
-    }
 }

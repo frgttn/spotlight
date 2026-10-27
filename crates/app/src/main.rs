@@ -50,7 +50,7 @@ use spotlight_providers::{
 };
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
-    launcher::{self, HomeSection, Launcher, OpenSettings, Quit, WindowMode, WindowOpacity},
+    launcher::{self, HomeSection, Launcher, OpenSettings, Quit, WindowMode},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
     text_input, theme,
 };
@@ -70,8 +70,6 @@ const RANK_BY_USAGE_SETTING: &str = "rank_by_usage";
 /// `settings` key: the root search sections hidden before anything is
 /// typed, `HomeSection`'s setting forms comma-separated; missing means none.
 const HIDDEN_SECTIONS_SETTING: &str = "hidden_home_sections";
-/// `settings` key: the launcher's opacity in percent; missing means the default.
-const WINDOW_OPACITY_SETTING: &str = "window_opacity";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
@@ -103,7 +101,6 @@ struct AppState {
     compact_favorites: Cell<bool>,
     rank_by_usage: Cell<bool>,
     hidden_sections: RefCell<Vec<HomeSection>>,
-    opacity: Cell<WindowOpacity>,
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
@@ -189,9 +186,6 @@ fn main() {
                 .filter_map(|name| HomeSection::from_setting(name.trim()))
                 .collect()
         })
-        .unwrap_or_default();
-    let opacity = setting(WINDOW_OPACITY_SETTING)
-        .and_then(|text| WindowOpacity::from_setting(&text))
         .unwrap_or_default();
     // Before any window opens, which then start out in the right colours.
     // `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved
@@ -370,7 +364,6 @@ fn main() {
                 launcher.set_compact_favorites(compact_favorites, cx);
                 launcher.set_rank_by_usage(rank_by_usage, cx);
                 launcher.set_hidden_sections(hidden_sections.clone(), cx);
-                launcher.set_window_opacity(opacity, cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 launcher.set_file_prefix(file_search.prefix.clone());
@@ -418,7 +411,6 @@ fn main() {
             compact_favorites: Cell::new(compact_favorites),
             rank_by_usage: Cell::new(rank_by_usage),
             hidden_sections: RefCell::new(hidden_sections),
-            opacity: Cell::new(opacity),
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
@@ -611,7 +603,6 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.compact_favorites.get(),
                 view_state.rank_by_usage.get(),
                 view_state.hidden_sections.borrow().clone(),
-                view_state.opacity.get(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
@@ -721,16 +712,6 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .collect::<Vec<_>>()
                 .join(",");
             save_setting(state, HIDDEN_SECTIONS_SETTING, text, cx);
-        }
-        SettingsEvent::WindowOpacityChanged(opacity) => {
-            state.opacity.set(*opacity);
-            state
-                .launcher
-                .update(cx, |launcher, _, cx| {
-                    launcher.set_window_opacity(*opacity, cx)
-                })
-                .ok();
-            save_setting(state, WINDOW_OPACITY_SETTING, opacity.to_setting(), cx);
         }
         SettingsEvent::ThemeChanged(choice) => {
             theme::set_choice(*choice);

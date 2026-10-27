@@ -17,10 +17,9 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, FontWeight, Image, ImageFormat, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, PathPromptOptions, Pixels, ScrollHandle, SharedString, Stateful, Subscription,
-    Task, Window, WindowControlArea, actions, canvas, deferred, div, img, prelude::*, px, relative,
-    rgba,
+    Focusable, FontWeight, Image, ImageFormat, KeyBinding, MouseDownEvent, PathPromptOptions,
+    Pixels, ScrollHandle, SharedString, Stateful, Subscription, Task, Window, WindowControlArea,
+    actions, canvas, deferred, div, img, prelude::*, px, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
@@ -37,9 +36,7 @@ use spotlight_platform_win::{
 };
 
 use crate::{
-    launcher::{
-        ExtensionItem, HomeSection, Shortcut, Source, WindowMode, WindowOpacity, icon_font,
-    },
+    launcher::{ExtensionItem, HomeSection, Shortcut, Source, WindowMode, icon_font},
     smooth_scroll::{Scroller, capture_wheel},
     text_input::{self, TextInput},
     theme,
@@ -105,8 +102,6 @@ pub enum SettingsEvent {
     RankByUsageChanged(bool),
     /// Root search no longer lists these kinds before anything is typed.
     HiddenSectionsChanged(Vec<HomeSection>),
-    /// The launcher's background lets this much through from now on.
-    WindowOpacityChanged(WindowOpacity),
     /// The theme choice is now this one; apply it, redraw and save it.
     ThemeChanged(theme::Choice),
     /// The web search engine is now this one; switch to it and save it.
@@ -179,9 +174,6 @@ pub struct Settings {
     compact_favorites: bool,
     rank_by_usage: bool,
     hidden_sections: Vec<HomeSection>,
-    opacity: WindowOpacity,
-    /// Where the opacity slider's track was last laid out.
-    opacity_track: Rc<Cell<Bounds<Pixels>>>,
     /// The theme dropdown whose menu is open.
     theme_menu: Option<theme::Appearance>,
     /// Where each theme dropdown's button was last laid out (dark, light).
@@ -257,7 +249,6 @@ impl Settings {
         compact_favorites: bool,
         rank_by_usage: bool,
         hidden_sections: Vec<HomeSection>,
-        opacity: WindowOpacity,
         search_engine: SearchEngine,
         clipboard_retention: Retention,
         win_v: bool,
@@ -367,8 +358,6 @@ impl Settings {
             compact_favorites,
             rank_by_usage,
             hidden_sections,
-            opacity,
-            opacity_track: Rc::default(),
             theme_menu: None,
             theme_buttons: Default::default(),
             custom_engine: match &search_engine {
@@ -795,95 +784,6 @@ impl Settings {
             self.hidden_sections.clone(),
         ));
         cx.notify();
-    }
-
-    /// Sets the opacity from where the pointer is along the slider's track.
-    fn slide_opacity(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let track = self.opacity_track.get();
-        let width = f32::from(track.size.width);
-        if width <= 0. {
-            return;
-        }
-        let fraction = (f32::from(x - track.origin.x) / width).clamp(0., 1.);
-        let range = f32::from(WindowOpacity::MAX - WindowOpacity::MIN);
-        let percent = WindowOpacity::MIN + (fraction * range).round() as u8;
-        self.set_opacity(WindowOpacity::new(percent), cx);
-    }
-
-    /// A slider from the most see-through opacity to fully opaque.
-    fn opacity_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let range = f32::from(WindowOpacity::MAX - WindowOpacity::MIN);
-        let fraction = f32::from(self.opacity.percent() - WindowOpacity::MIN) / range;
-        let track = self.opacity_track.clone();
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_3()
-            .child(
-                div()
-                    .id("opacity-slider")
-                    .w(px(180.))
-                    .h(px(22.))
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .child(
-                        canvas(move |bounds, _, _| track.set(bounds), |_, _, _, _| {})
-                            .absolute()
-                            .size_full(),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(4.))
-                            .rounded_full()
-                            .bg(rgba(theme::p().surface_hover))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(fraction))
-                                    .rounded_full()
-                                    .bg(rgba(theme::p().accent)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(relative(fraction))
-                            .ml(px(-8.))
-                            .size(px(16.))
-                            .rounded_full()
-                            .bg(rgba(0xffffffff)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.slide_opacity(event.position.x, cx)
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        if event.pressed_button == Some(MouseButton::Left) {
-                            this.slide_opacity(event.position.x, cx)
-                        }
-                    })),
-            )
-            .child(
-                div()
-                    .w(px(36.))
-                    .text_size(px(13.))
-                    .text_color(rgba(theme::p().text_muted))
-                    .child(format!("{}%", self.opacity.percent())),
-            )
-    }
-
-    fn set_opacity(&mut self, opacity: WindowOpacity, cx: &mut Context<Self>) {
-        if opacity != self.opacity {
-            self.opacity = opacity;
-            cx.emit(SettingsEvent::WindowOpacityChanged(opacity));
-            cx.notify();
-        }
     }
 
     fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
@@ -2806,14 +2706,6 @@ impl Settings {
                         self.smooth_scrolling,
                         cx.listener(|this, _, _, cx| this.toggle_smooth_scrolling(cx)),
                     )),
-                )
-                .child(divider())
-                .child(
-                    row(
-                        "Window Opacity",
-                        "How much of what's behind shows through the launcher, blurred.",
-                    )
-                    .child(self.opacity_slider(cx)),
                 )
                 .into_any_element(),
             section_title("Search"),

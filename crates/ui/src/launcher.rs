@@ -398,61 +398,32 @@ impl HomeSection {
     }
 }
 
-/// How dense the launcher's tint over its blurred background is, in percent:
-/// [`Self::MIN`] lets the most of what's behind show through, 100 none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WindowOpacity(u8);
+/// How dense the launcher's tint over its blurred background is: what
+/// shows through, blurred, is a hint of what's behind, not something to read.
+const TINT_DENSITY: f32 = 0.93;
 
-impl Default for WindowOpacity {
-    fn default() -> Self {
-        Self(97)
-    }
+/// The tint drawn over the blur: [`TINT_DENSITY`] of the current theme's
+/// background, or denser where the theme needs it to stay dark over a white
+/// background — a light background, blurred, stays light, and would turn the
+/// window brighter than `MAX_BRIGHTNESS`, grey.
+///
+/// A light theme works the same mirrored: a black background shining through
+/// it would turn the window grey.
+fn tint() -> u32 {
+    tint_for(theme::p().background, theme::current().appearance)
 }
 
-impl WindowOpacity {
-    pub const MIN: u8 = 80;
-    pub const MAX: u8 = 100;
-
-    pub fn new(percent: u8) -> Self {
-        Self(percent.clamp(Self::MIN, Self::MAX))
-    }
-
-    pub fn percent(self) -> u8 {
-        self.0
-    }
-
-    /// The tint drawn over the blur, over a background `behind` this bright
-    /// (0 black, 1 white): this option's own density, or denser where that
-    /// would leave the window brighter than [`MAX_BRIGHTNESS`] — a light
-    /// background, blurred, stays light, and would turn the window grey.
-    ///
-    /// The tint's colour is the current theme's background. A light theme
-    /// works the same mirrored: a dark background shining through it would
-    /// turn the window grey.
-    pub fn tint(self, behind: Option<f32>) -> u32 {
-        const MAX_BRIGHTNESS: f32 = 0.24;
-        let background = theme::p().background;
-        let light = theme::current().appearance == theme::Appearance::Light;
-        // Everything below is in terms of "distance from the theme's own
-        // extreme": for a light theme, brightness is flipped.
-        let flip = |brightness: f32| if light { 1. - brightness } else { brightness };
-        let tint = flip(f32::from((background >> 24) as u8) / 255.);
-        let own = f32::from(self.0) / 100.;
-        let needed = match behind.map(flip) {
-            Some(behind) if behind > MAX_BRIGHTNESS => (behind - MAX_BRIGHTNESS) / (behind - tint),
-            _ => 0.,
-        };
-        let alpha = own.max(needed).min(1.);
-        (background & 0xffffff00) | (alpha * 255.).round() as u32
-    }
-
-    pub fn to_setting(self) -> String {
-        self.0.to_string()
-    }
-
-    pub fn from_setting(text: &str) -> Option<Self> {
-        text.parse().ok().map(Self::new)
-    }
+/// [`tint`] for a theme with this background and appearance.
+fn tint_for(background: u32, appearance: theme::Appearance) -> u32 {
+    const MAX_BRIGHTNESS: f32 = 0.24;
+    let light = appearance == theme::Appearance::Light;
+    // In terms of "distance from the theme's own extreme": for a light
+    // theme, brightness is flipped, and the worst background is black.
+    let own = f32::from((background >> 24) as u8) / 255.;
+    let own = if light { 1. - own } else { own };
+    let needed = (1. - MAX_BRIGHTNESS) / (1. - own);
+    let alpha = TINT_DENSITY.max(needed).min(1.);
+    (background & 0xffffff00) | (alpha * 255.).round() as u32
 }
 
 /// How long the list of installed games is trusted before the next show reads it again.
@@ -524,9 +495,6 @@ pub struct Launcher {
     show_stats: bool,
     /// The kinds of items root search doesn't list before anything is typed.
     hidden_sections: Vec<HomeSection>,
-    opacity: WindowOpacity,
-    /// How bright the screen was under the window when it last showed.
-    behind: Option<f32>,
     /// Item id → its registered hotkey.
     item_hotkeys: HashMap<String, Hotkey>,
     hotkeys: hotkey::Service,
@@ -730,8 +698,6 @@ impl Launcher {
             sections: Vec::new(),
             show_stats: std::env::var_os("SPOTLIGHT_STATS").is_some(),
             hidden_sections: Vec::new(),
-            opacity: WindowOpacity::default(),
-            behind: None,
             hotkeys,
             editor: None,
             screens: Vec::new(),
@@ -1107,11 +1073,6 @@ impl Launcher {
         self.hidden_sections = hidden;
         let query = self.query(cx);
         self.refilter(&query);
-        cx.notify();
-    }
-
-    pub fn set_window_opacity(&mut self, opacity: WindowOpacity, cx: &mut Context<Self>) {
-        self.opacity = opacity;
         cx.notify();
     }
 
@@ -1727,7 +1688,7 @@ impl Launcher {
         self.window_collapsed = self.collapsed(cx);
         // Explicit size: with `show: false` GPUI defers its own placement to
         // `activate()`, which we bypass, so the window would keep CW_USEDEFAULT.
-        self.behind = win::show_on_active_monitor(
+        win::show_on_active_monitor(
             self.hwnd,
             Some(WINDOW_SIZE),
             self.window_collapsed.then_some(COMPACT_HEIGHT),
@@ -4051,7 +4012,7 @@ impl Render for Launcher {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(self.opacity.tint(self.behind)))
+            .bg(rgba(tint()))
             .text_color(rgba(theme::p().text))
             .text_size(px(14.))
             .child(
@@ -4541,21 +4502,21 @@ mod tests {
     }
 
     #[test]
-    fn darkens_the_tint_over_light_backgrounds() {
-        let alpha = |tint: u32| tint & 0xff;
-        // Over a dark background each option keeps its own density.
-        let translucent = WindowOpacity::new(80);
-        assert_eq!(alpha(translucent.tint(Some(0.1))), 204);
-        assert_eq!(alpha(translucent.tint(None)), 204);
-        assert_eq!(alpha(WindowOpacity::new(97).tint(Some(1.))), 247);
-        assert_eq!(WindowOpacity::new(10), WindowOpacity::new(80));
-        assert_eq!(
-            WindowOpacity::from_setting("88"),
-            Some(WindowOpacity::new(88))
-        );
-        // Over white a see-through tint gets denser, enough to stay dark.
-        let over_white = alpha(translucent.tint(Some(1.)));
-        assert!((210..=225).contains(&over_white), "{over_white}");
+    fn tints_every_theme_dense_enough_over_any_background() {
+        let alpha = |tint: u32| (tint & 0xff) as f32 / 255.;
+        for theme in theme::THEMES {
+            let density = alpha(tint_for(theme.palette.background, theme.appearance));
+            assert!(density >= TINT_DENSITY - 0.005, "{}: {density}", theme.id);
+            // The window over white (black for a light theme) stays within
+            // a quarter of the way from the theme's own extreme.
+            let own = (theme.palette.background >> 24) as f32 / 255.;
+            let own = match theme.appearance {
+                theme::Appearance::Light => 1. - own,
+                theme::Appearance::Dark => own,
+            };
+            let window = density * own + (1. - density);
+            assert!(window <= 0.245, "{}: {window}", theme.id);
+        }
     }
 
     #[test]
