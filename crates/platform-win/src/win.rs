@@ -4,7 +4,7 @@
 //! UI frameworks generally have no "hide but keep everything alive" call, so the
 //! launcher takes the HWND and drives visibility and placement directly.
 
-use std::{ffi::c_void, mem::size_of};
+use std::{ffi::c_void, mem::size_of, sync::Mutex, time::Duration};
 
 use spotlight_core::clip::IgnoredApp;
 use windows::{
@@ -193,7 +193,8 @@ pub fn show_on_active_monitor(
                 None => height,
             };
             // The whole window as it will be, not just a collapsed search row.
-            behind = brightness(x, y, width, height.max(rect.bottom - rect.top));
+            let area = (x, y, width, height.max(rect.bottom - rect.top));
+            behind = remembered_brightness(area);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -210,6 +211,49 @@ pub fn show_on_active_monitor(
         let _ = SetForegroundWindow(hwnd);
     }
     behind
+}
+
+/// The screen area the window was last shown over, with the brightness read
+/// there. Reading the screen costs 5 to 7 ms, too much for every show, so a
+/// show reuses it and [`hide`] reads it again once the window is gone.
+static BEHIND: Mutex<Option<(Area, f32)>> = Mutex::new(None);
+
+/// x, y, width and height in physical pixels.
+type Area = (i32, i32, i32, i32);
+
+/// The brightness behind `area`: the last reading of that very area, or a read
+/// now (the first show, or after the window moved to another place).
+fn remembered_brightness(area: Area) -> Option<f32> {
+    if let Some((seen, value)) = *BEHIND.lock().ok()?
+        && seen == area
+    {
+        return Some(value);
+    }
+    let value = brightness(area.0, area.1, area.2, area.3)?;
+    *BEHIND.lock().ok()? = Some((area, value));
+    Some(value)
+}
+
+/// Reads the area again, off the show path, once the window has gone from
+/// the screen. Dropped if the window came back before the read was done.
+fn refresh_brightness(raw: isize) {
+    let Some((area, _)) = BEHIND.lock().ok().and_then(|behind| *behind) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        // Long enough for the desktop to be composed without the window.
+        std::thread::sleep(Duration::from_millis(150));
+        let shown = || unsafe { IsWindowVisible(hwnd(raw)).as_bool() };
+        if shown() {
+            return;
+        }
+        let value = brightness(area.0, area.1, area.2, area.3);
+        if let (Some(value), false) = (value, shown())
+            && let Ok(mut behind) = BEHIND.lock()
+        {
+            *behind = Some((area, value));
+        }
+    });
 }
 
 /// The mean brightness (0 black, 1 white) of the screen in a rectangle of
@@ -388,6 +432,7 @@ pub fn hide(raw: isize) {
     unsafe {
         let _ = ShowWindow(hwnd(raw), SW_HIDE);
     }
+    refresh_brightness(raw);
 }
 
 /// Brings an already visible window to the front.
