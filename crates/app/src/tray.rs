@@ -1,8 +1,10 @@
-//! Notification-area icon: open the launcher or settings, toggle start at login, quit.
+//! Notification-area icon: open the launcher or settings, toggle start at login,
+//! update, quit.
 //!
 //! `tray-icon` creates a hidden window on the calling thread, so this must run
 //! on GPUI's main thread, whose message loop then dispatches the tray messages.
 
+use spotlight_core::update::Status as UpdateStatus;
 use spotlight_platform_win::autostart;
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -13,12 +15,15 @@ pub enum Command {
     Open,
     Settings,
     ToggleAutostart,
+    /// Check for updates, or restart into the downloaded one.
+    Update,
     Quit,
 }
 
 pub struct Tray {
     icon: TrayIcon,
     autostart: CheckMenuItem,
+    update: MenuItem,
 }
 
 impl Tray {
@@ -27,6 +32,7 @@ impl Tray {
         let open = MenuItem::new("Open Spotlight", true, None);
         let settings = MenuItem::new("Settings…", true, None);
         let autostart = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
+        let update = MenuItem::new("Check for Updates", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
         menu.append_items(&[
@@ -34,15 +40,17 @@ impl Tray {
             &settings,
             &PredefinedMenuItem::separator(),
             &autostart,
+            &update,
             &PredefinedMenuItem::separator(),
             &quit,
         ])
         .map_err(|err| err.to_string())?;
 
-        let ids: [(MenuId, fn() -> Command); 4] = [
+        let ids: [(MenuId, fn() -> Command); 5] = [
             (open.id().clone(), || Command::Open),
             (settings.id().clone(), || Command::Settings),
             (autostart.id().clone(), || Command::ToggleAutostart),
+            (update.id().clone(), || Command::Update),
             (quit.id().clone(), || Command::Quit),
         ];
         let menu_commands = commands.clone();
@@ -69,7 +77,11 @@ impl Tray {
             .with_menu_on_left_click(false)
             .build()
             .map_err(|err| err.to_string())?;
-        Ok(Self { icon, autostart })
+        Ok(Self {
+            icon,
+            autostart,
+            update,
+        })
     }
 
     pub fn set_hotkey(&self, hotkey: &str) {
@@ -88,6 +100,20 @@ impl Tray {
     /// Updates the check mark after start at login changed elsewhere (the settings window).
     pub fn sync_autostart(&self) {
         self.autostart.set_checked(autostart::is_enabled());
+    }
+
+    /// Shows what the update item does now. Off while checking or
+    /// downloading, and for a copy the installer didn't put there.
+    pub fn set_update_status(&self, status: &UpdateStatus) {
+        let text = match status {
+            UpdateStatus::Checking => "Checking for Updates…".to_owned(),
+            UpdateStatus::Downloading(version) => format!("Downloading v{version}…"),
+            UpdateStatus::Ready(version) => format!("Restart to Update to v{version}"),
+            _ => "Check for Updates".to_owned(),
+        };
+        self.update.set_text(text);
+        self.update
+            .set_enabled(!status.busy() && *status != UpdateStatus::Unmanaged);
     }
 }
 

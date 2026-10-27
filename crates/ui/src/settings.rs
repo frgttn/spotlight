@@ -26,6 +26,7 @@ use spotlight_core::{
     clip::{self, IgnoredApp, Retention},
     file_search::{self, Config as FileSearchConfig, Status as FileSearchStatus},
     item::Command,
+    update::Status as UpdateStatus,
     web::{self, SearchEngine},
     window::GAPS,
 };
@@ -83,6 +84,9 @@ pub type LauncherReader = Rc<dyn Fn(&App) -> Option<LauncherState>>;
 
 /// Reads how far file indexing has got.
 pub type FileStatusReader = Rc<dyn Fn() -> FileSearchStatus>;
+
+/// Reads where updating Spotlight has got.
+pub type UpdateStatusReader = Rc<dyn Fn() -> UpdateStatus>;
 
 /// File Search's page id, as its provider names itself.
 const FILES_PAGE: &str = "files";
@@ -149,6 +153,10 @@ pub enum SettingsEvent {
     },
     /// This command asks again before it opens from a link.
     LinkDistrusted(String),
+    /// Look for a newer version now, and download it if there is one.
+    CheckForUpdates,
+    /// Quit and start the downloaded version.
+    RestartToUpdate,
 }
 
 pub struct Settings {
@@ -220,6 +228,7 @@ pub struct Settings {
     autostart: bool,
     /// The build's version, shown on About.
     version: &'static str,
+    update_status: UpdateStatusReader,
     data_path: SharedString,
     /// Pages visited, for back and forward; `history_ix` is the one shown.
     history: Vec<Page>,
@@ -259,6 +268,7 @@ impl Settings {
         file_search: FileSearchConfig,
         file_status: FileStatusReader,
         version: &'static str,
+        update_status: UpdateStatusReader,
         data_path: SharedString,
         launcher: LauncherReader,
         window: &mut Window,
@@ -389,6 +399,7 @@ impl Settings {
             service_message: None,
             autostart: autostart::is_enabled(),
             version,
+            update_status,
             data_path,
             history: vec![Page::General],
             history_ix: 0,
@@ -405,6 +416,11 @@ impl Settings {
     /// Re-reads start at login, which the tray menu can change too.
     pub fn refresh_autostart(&mut self, cx: &mut Context<Self>) {
         self.autostart = autostart::is_enabled();
+        cx.notify();
+    }
+
+    /// Redraws About after the updater moved on.
+    pub fn refresh_updates(&mut self, cx: &mut Context<Self>) {
         cx.notify();
     }
 
@@ -2961,8 +2977,25 @@ impl Settings {
     }
 
     /// The logo, name and version, then updates, links and where the data is.
-    fn about_page(&self) -> Vec<AnyElement> {
-        let version = format!("v{}", self.version);
+    fn about_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let status = (self.update_status)();
+        let description = format!("v{} · {}", self.version, status.describe());
+        let update_button = match &status {
+            UpdateStatus::Unmanaged => {
+                Some(button("check-updates", "Download").on_click(|_, _, _| {
+                    open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest"))
+                }))
+            }
+            UpdateStatus::Ready(_) => Some(
+                button("restart-to-update", "Restart to Update")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::RestartToUpdate))),
+            ),
+            status if status.busy() => None,
+            _ => Some(
+                button("check-updates", "Check now")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::CheckForUpdates))),
+            ),
+        };
         let mut links = vec![
             link_row("website", '\u{E774}', "Website", WEBSITE),
             link_row("github", '\u{E943}', "GitHub", REPOSITORY),
@@ -3016,11 +3049,7 @@ impl Settings {
                 .into_any_element(),
             section_title("Updates"),
             card()
-                .child(row("Spotlight Updates", version).child(
-                    button("check-updates", "Check now").on_click(|_, _, _| {
-                        open_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest"))
-                    }),
-                ))
+                .child(row("Spotlight Updates", description).children(update_button))
                 .child(divider())
                 .child(card_row_corners(
                     link_row(
@@ -3180,7 +3209,7 @@ impl Render for Settings {
             Page::General => self.general_page(cx),
             Page::Extensions => self.extensions_page(cx),
             Page::Shortcuts => self.shortcuts_page(cx),
-            Page::About => self.about_page(),
+            Page::About => self.about_page(cx),
             Page::Extension(id) => self.extension_page(id, cx),
         };
 

@@ -12,6 +12,7 @@ pub mod provider;
 pub mod quicklink;
 pub mod run;
 pub mod snippet;
+pub mod update;
 pub mod view;
 pub mod web;
 pub mod window;

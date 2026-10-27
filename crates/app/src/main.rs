@@ -19,6 +19,7 @@
 
 mod selftest;
 mod tray;
+mod update;
 
 use std::{
     cell::{Cell, RefCell},
@@ -55,7 +56,10 @@ use spotlight_ui::{
     text_input, theme,
 };
 
-use crate::tray::{Command, Tray};
+use crate::{
+    tray::{Command, Tray},
+    update::Updater,
+};
 
 /// `settings` key holding the launcher hotkey, in `Hotkey`'s display form.
 const HOTKEY_SETTING: &str = "hotkey";
@@ -119,11 +123,15 @@ struct AppState {
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
+    updater: Arc<Updater>,
     settings: RefCell<Option<WindowHandle<Settings>>>,
 }
 
 fn main() {
     win::attach_parent_console();
+    // The installer's calls exit here; a downloaded update restarts into
+    // the new version.
+    update::run_installer_hooks();
     let self_test = env::var_os("SPOTLIGHT_SELFTEST").is_some();
     let settings_requested = env::args().skip(1).any(|arg| arg == "--settings");
     let link = env::args().skip(1).find(|arg| is_link(arg));
@@ -402,6 +410,11 @@ fn main() {
         let tray = Tray::create(&hotkey_label, commands_tx)
             .inspect_err(|err| eprintln!("[spotlight] could not create the tray icon: {err}"))
             .ok();
+        let (updates_tx, updates_rx) = async_channel::unbounded();
+        let updater = Updater::new(updates_tx);
+        if let Some(tray) = &tray {
+            tray.set_update_status(&updater.status());
+        }
         let state = Rc::new(AppState {
             launcher: window,
             hotkeys: hotkeys.clone(),
@@ -424,8 +437,34 @@ fn main() {
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
+            updater,
             settings: RefCell::new(None),
         });
+
+        // The tray item and Settings › About follow the updater.
+        let updates_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(()) = updates_rx.recv().await {
+                let state = &updates_state;
+                cx.update(|cx| {
+                    if let Some(tray) = &state.tray {
+                        tray.set_update_status(&state.updater.status());
+                    }
+                    let settings = *state.settings.borrow();
+                    if let Some(settings) = settings {
+                        settings
+                            .update(cx, |settings, _, cx| settings.refresh_updates(cx))
+                            .ok();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+        // The self-test runs beside an installed copy, which checks.
+        if !self_test {
+            state.updater.check_periodically();
+        }
 
         // A busy folder File Search left out on its own is saved like a
         // change made in Settings.
@@ -516,6 +555,7 @@ fn main() {
                                 .ok();
                         }
                     }
+                    Command::Update => update_or_check(&state.updater),
                     Command::Quit => cx.quit(),
                 })
                 .ok();
@@ -593,6 +633,8 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
     let view_state = state.clone();
     let files = state.files.clone();
     let file_status: settings::FileStatusReader = Rc::new(move || files.status());
+    let updater = state.updater.clone();
+    let update_status: settings::UpdateStatusReader = Rc::new(move || updater.status());
     let opened = cx.open_window(options, move |window, cx| {
         let view = cx.new(|cx| {
             Settings::new(
@@ -613,6 +655,7 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.files.config(),
                 file_status,
                 env!("SPOTLIGHT_VERSION"),
+                update_status,
                 view_state.data_path.clone(),
                 launcher_reader(view_state.launcher, view_state.web.clone()),
                 window,
@@ -875,6 +918,17 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, cx| launcher.distrust_link(item_id, cx))
                 .ok();
         }
+        SettingsEvent::CheckForUpdates => state.updater.check(),
+        SettingsEvent::RestartToUpdate => state.updater.restart(),
+    }
+}
+
+/// The tray's update item: restart into a downloaded update, or look for one.
+fn update_or_check(updater: &Arc<Updater>) {
+    if matches!(updater.status(), spotlight_core::update::Status::Ready(_)) {
+        updater.restart();
+    } else {
+        updater.check();
     }
 }
 

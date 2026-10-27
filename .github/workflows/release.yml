@@ -1,0 +1,90 @@
+name: Release
+
+# Pushing a tag `v<version>` builds Spotlight, packs it with Velopack and
+# publishes a GitHub release: the installer (`Spotlight-win-Setup.exe`), a
+# portable zip, and the packages and feed the installed app updates from.
+# The tag must match the workspace version, and CHANGELOG.md must have a
+# section for it; see "Releasing" in README.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep equal to the `velopack` crate in Cargo.toml.
+  VPK_VERSION: 1.3.39-g8d2844f
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version and release notes
+        id: version
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $crate = ($metadata.packages | Where-Object name -eq 'spotlight').version
+          if ($crate -ne $version) {
+            throw "The tag says $version, but the workspace version is $crate"
+          }
+          # The CHANGELOG.md section "## [<version>] …", without its heading.
+          $section = (Get-Content CHANGELOG.md -Raw) -split '(?m)^## ' |
+            Where-Object { $_ -match "^\[$([regex]::Escape($version))\]" }
+          if (-not $section) { throw "CHANGELOG.md has no section for $version" }
+          ($section -replace '^[^\n]*\n', '').Trim() | Set-Content release-notes.md
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release -p spotlight -p spotlight-service
+
+      - name: Install vpk
+        run: dotnet tool install --global vpk --version $env:VPK_VERSION
+
+      # The previous release, so the new one also ships a delta package (a
+      # small update for those on it). There is none before the first.
+      - name: Download the previous release
+        continue-on-error: true
+        run: >
+          vpk download github
+          --repoUrl ${{ github.server_url }}/${{ github.repository }}
+          --token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pack
+        run: |
+          New-Item -ItemType Directory publish | Out-Null
+          Copy-Item target/release/spotlight.exe, target/release/spotlight-service.exe publish/
+          vpk pack `
+            --packId Spotlight `
+            --packVersion ${{ steps.version.outputs.version }} `
+            --packTitle Spotlight `
+            --packAuthors frgttn `
+            --packDir publish `
+            --mainExe spotlight.exe `
+            --icon crates/app/assets/icon.ico `
+            --releaseNotes release-notes.md `
+            --shortcuts StartMenuRoot
+
+      - name: Publish
+        run: >
+          vpk upload github
+          --repoUrl ${{ github.server_url }}/${{ github.repository }}
+          --token ${{ secrets.GITHUB_TOKEN }}
+          --tag ${{ github.ref_name }}
+          --releaseName "Spotlight ${{ steps.version.outputs.version }}"
+          --publish
