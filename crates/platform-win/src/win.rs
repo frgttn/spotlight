@@ -184,6 +184,9 @@ pub fn show_on_active_monitor(
             let work = info.rcWork;
             let x = work.left + (work.right - work.left - width) / 2;
             let y = work.top + (work.bottom - work.top - height) / 2;
+            // The whole window as it will be, not just a collapsed search row:
+            // the same area in both modes, so switching keeps the reading.
+            let area = (x, y, width, height);
             let height = match client_height {
                 Some(client_height) => {
                     let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
@@ -192,8 +195,6 @@ pub fn show_on_active_monitor(
                 }
                 None => height,
             };
-            // The whole window as it will be, not just a collapsed search row.
-            let area = (x, y, width, height.max(rect.bottom - rect.top));
             behind = remembered_brightness(area);
             let _ = SetWindowPos(
                 hwnd,
