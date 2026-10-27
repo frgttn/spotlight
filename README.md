@@ -31,7 +31,7 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
 - **Text input** with IME support.
 - **Icons:** real app icons from the shell, extracted in the background after startup (letter badges show until they arrive).
 - **Single instance:** launching Spotlight again (Start menu, a shortcut) opens the running instance instead of starting a second one.
-- **Tray icon:** left click opens the launcher; the menu has Open, Settings, Start at login and Quit.
+- **Tray icon:** left click opens the launcher; the menu has Open, Settings, Start at login, Check for Updates (Restart to Update once one is downloaded) and Quit.
 - **Settings window** (Ctrl+, in the launcher, the tray menu, or `spotlight.exe --settings`), frameless like the launcher: drag it by the header, close it with ✕ or Esc.
   - *Launcher hotkey:* click the field and press a combination. While recording, a low-level keyboard hook catches the keys, so a combination another app already owns is caught too and reported as taken; the old hotkey then stays. The choice is saved in the database.
   - *Smooth scrolling:* the result list animates to its new position when you move the selection or turn the mouse wheel (touchpad scrolling is already smooth and is left alone). On by default.
@@ -39,6 +39,10 @@ A fast keyboard launcher for Windows, in the spirit of Raycast and macOS Spotlig
   - *Start at login:* stored in the per-user `Run` registry key. Disabling it in Task Manager's Startup tab is respected. Also in the tray menu.
 
 The binary uses the Windows GUI subsystem, so no console window opens. Logs still go to the terminal it was started from.
+
+## Install
+
+Download `Spotlight-win-Setup.exe` from the [latest release](https://github.com/frgttn/spotlight/releases/latest) and run it. It installs for your user into `%LocalAppData%\Spotlight` without an administrator prompt, adds Spotlight to the Start menu and turns on start at login. Updates download in the background; *Restart to Update* in the tray menu or Settings › About applies them, or the next start does. Uninstall from Windows Settings › Apps: that removes start at login, the `spotlight://` links and the file index service (with a UAC prompt) too, and keeps your data in `%APPDATA%\spotlight`.
 
 ## Requirements
 
@@ -74,6 +78,14 @@ cargo run -p spotlight --example baseline --release
 ```
 
 Results and the reasoning behind choosing GPUI: [docs/ui-framework-decision.md](docs/ui-framework-decision.md).
+
+## Releasing
+
+1. Set the new `version` in the workspace `Cargo.toml`.
+2. Move the notes under `[Unreleased]` in [CHANGELOG.md](CHANGELOG.md) to a section `## [<version>] - <date>`.
+3. Commit, then tag and push: `git tag v<version>` and `git push origin v<version>`.
+
+[`release.yml`](.github/workflows/release.yml) then builds, packs with [Velopack](https://velopack.io) and publishes the GitHub release, which installed copies update from. A copy run from `target/` (not installed) doesn't update itself.
 
 ## Layout
 

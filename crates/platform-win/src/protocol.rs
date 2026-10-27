@@ -3,7 +3,10 @@
 //! instance gets the link over the instance pipe.
 
 use windows::{
-    Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW},
+    Win32::{
+        Foundation::ERROR_FILE_NOT_FOUND,
+        System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteTreeW, RegSetKeyValueW},
+    },
     core::{HSTRING, PCWSTR},
 };
 
@@ -25,6 +28,25 @@ pub fn register(scheme: &str) -> Result<(), String> {
     set(&key, "URL Protocol", "")?;
     set(&format!(r"{key}\DefaultIcon"), "", &format!("\"{exe}\",0"))?;
     set(&open, "", &command)
+}
+
+/// Removes the scheme, if it points at the running executable: another copy
+/// of Spotlight may own the links now.
+pub fn unregister(scheme: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let key = format!(r"Software\Classes\{scheme}");
+    let command = format!("\"{}\" \"%1\"", exe.display());
+    let open = format!(r"HKCU\{key}\shell\open\command");
+    if registry::string(&open, "").as_deref() != Some(command.as_str()) {
+        return Ok(());
+    }
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(key.as_str())) };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    status
+        .ok()
+        .map_err(|err| format!("could not remove {key}: {err}"))
 }
 
 fn set(key: &str, name: &str, value: &str) -> Result<(), String> {
