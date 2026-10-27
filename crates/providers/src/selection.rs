@@ -42,15 +42,15 @@ impl Provider for Selection {
     }
 
     fn catalog(&self) -> Vec<SearchItem> {
-        let engine = self.web.engine();
-        let search = engine.template().replace("{query}", SELECTION);
+        let (name, template) = self.web.resolved();
+        let search = template.replace("{query}", SELECTION);
         let translate = format!(
             "https://translate.google.com/?sl=auto&tl={}&text={SELECTION}&op=translate",
             self.language
         );
         vec![
             SearchItem::new(item_id(ID, "search"), "Search Selection on the Web")
-                .subtitle(engine.name())
+                .subtitle(name)
                 .keywords(&["selected text", "google", "look up"])
                 .icon(Icon::Glyph(glyph::SEARCH))
                 .action("Search in Browser", Command::OpenUrl(search)),
@@ -71,7 +71,10 @@ mod tests {
 
     #[test]
     fn commands_take_the_selection() {
-        let selection = Selection::new(Arc::new(Web::new(SearchEngine::default())), "ru".into());
+        let selection = Selection::new(
+            Arc::new(Web::new(SearchEngine::default(), None)),
+            "ru".into(),
+        );
         let items = selection.catalog();
         for item in &items {
             assert!(item.actions[0].command.needs_selection(), "{}", item.title);

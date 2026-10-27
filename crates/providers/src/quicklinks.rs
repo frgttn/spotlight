@@ -5,11 +5,13 @@
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use spotlight_core::{
-    item::{Action, Command, Icon, SearchItem},
+    deeplink, favicon,
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     quicklink::{self, Argument, DEFAULTS, Quicklink},
     view::{Field, FieldKind, FormView, ListView, View},
+    web::SearchEngine,
 };
 use spotlight_platform_win::links::{self, Browser};
 use spotlight_store::Store;
@@ -88,10 +90,20 @@ impl Quicklinks {
             .collect();
         item.actions.push(open_action(link, &[]));
         let mut item = item.action("Copy Link", Command::Copy(link.link.clone()));
+        if self.editable() && quicklink::search_template(&link.link).is_some() {
+            item = item.action(
+                "Use as Web Search",
+                Command::SetSearchEngine {
+                    engine: SearchEngine::Quicklink(link.id),
+                    name: link.name.clone(),
+                },
+            );
+        }
         if self.editable() {
             let edit = self.edit_form("Edit Quicklink", link);
             item = item
                 .action("Edit Quicklink…", Command::PushView(Box::new(edit)))
+                .shortcut(shortcut::EDIT)
                 .action("Delete Quicklink", Command::DeleteQuicklink(link.id));
         }
         item
@@ -184,6 +196,16 @@ impl Provider for Quicklinks {
         "Your saved links and !keyword searches."
     }
 
+    /// The form of a quicklink whose arguments all have defaults, for a
+    /// link that brings arguments (see `deeplink::ARGUMENTS_VIEW`).
+    fn view(&self, id: &str) -> Option<View> {
+        let id: i64 = id.strip_prefix(deeplink::ARGUMENTS_VIEW)?.parse().ok()?;
+        let links = self.links.read().ok()?;
+        let link = links.iter().find(|link| link.id == id)?;
+        let arguments = quicklink::arguments(&link.link);
+        (!arguments.is_empty()).then(|| arguments_form(link, &arguments, &[]))
+    }
+
     fn catalog(&self) -> Vec<SearchItem> {
         let links = self.load();
         // The stock quicklinks are too many for root search: they're reached
@@ -220,13 +242,23 @@ impl Provider for Quicklinks {
                 open_with: None,
             };
             let create = self.edit_form("Create Quicklink", &blank);
-            items.push(
+            items.extend([
                 SearchItem::new(item_id(ID, "create"), "Create Quicklink")
                     .subtitle("Quicklinks")
                     .keywords(&["new quicklink", "add link", "bookmark"])
                     .icon(Icon::Glyph(glyph::ADD))
                     .action("Create Quicklink", Command::PushView(Box::new(create))),
-            );
+                SearchItem::new(item_id(ID, "import"), "Import Quicklinks")
+                    .subtitle("Quicklinks")
+                    .keywords(&["raycast", "json", "bookmarks"])
+                    .icon(Icon::Glyph(glyph::IMPORT))
+                    .action("Import from JSON…", Command::ImportQuicklinks),
+                SearchItem::new(item_id(ID, "export"), "Export Quicklinks")
+                    .subtitle("Quicklinks")
+                    .keywords(&["raycast", "json", "backup"])
+                    .icon(Icon::Glyph(glyph::EXPORT))
+                    .action("Export to JSON…", Command::ExportQuicklinks),
+            ]);
         }
         if let Ok(mut cached) = self.links.write() {
             *cached = links;
@@ -268,8 +300,13 @@ impl Provider for Quicklinks {
             .take(BANG_SUGGESTIONS)
             .map(|link| {
                 let mut item = self.item(link);
-                if !complete {
-                    let trigger = link.keyword.as_deref().unwrap_or_default();
+                let trigger = link.keyword.as_deref().unwrap_or_default();
+                // A link that takes no typed text (`{clipboard}` only) opens
+                // on Enter once its keyword is typed in full.
+                let takes_text = quicklink::arguments(&link.link)
+                    .iter()
+                    .any(Argument::is_free_text);
+                if !complete && (takes_text || trigger != keyword) {
                     item.actions.insert(0, complete_action(trigger));
                 }
                 item
@@ -296,10 +333,10 @@ impl Quicklinks {
 
 /// Enter on a suggestion: `!g` becomes `!gh `, ready for the text.
 fn complete_action(trigger: &str) -> Action {
-    Action {
-        title: format!("Use !{trigger}"),
-        command: Command::Complete(format!("!{trigger} ")),
-    }
+    Action::new(
+        format!("Use !{trigger}"),
+        Command::Complete(format!("!{trigger} ")),
+    )
 }
 
 /// Opens `link`, or its form when an argument is still missing: `values` are
@@ -318,10 +355,7 @@ fn open_action(link: &Quicklink, values: &[String]) -> Action {
     } else {
         Command::PushView(Box::new(arguments_form(link, &arguments, values)))
     };
-    Action {
-        title: "Open Quicklink".into(),
-        command,
-    }
+    Action::new("Open Quicklink", command)
 }
 
 /// A field per argument; submitting opens the link with them.
@@ -382,10 +416,17 @@ fn is_stock(link: &Quicklink) -> bool {
 
 /// The browser it opens in, the folder or file it opens, or a link symbol.
 fn icon(link: &Quicklink) -> Icon {
+    let target = link.link.trim();
+    // A site's own icon says more than the browser it opens in.
+    if let Some(origin) = favicon::origin(target) {
+        return Icon::Site {
+            origin,
+            glyph: glyph::LINK,
+        };
+    }
     if let Some(app) = &link.open_with {
         return Icon::Shell(app.clone());
     }
-    let target = link.link.trim();
     if !quicklink::is_url(target) && !target.contains(['{', '%']) {
         return Icon::Shell(target.to_owned());
     }
@@ -432,7 +473,15 @@ mod tests {
     fn stock_quicklinks_stay_out_of_root_search() {
         let provider = provider();
         let items = provider.catalog();
-        assert_eq!(titles(&items), ["Search Quicklinks", "Create Quicklink"]);
+        assert_eq!(
+            titles(&items),
+            [
+                "Search Quicklinks",
+                "Create Quicklink",
+                "Import Quicklinks",
+                "Export Quicklinks"
+            ]
+        );
         assert_eq!(all_links(&items).len(), DEFAULTS.len());
 
         // Changing one (or adding one) brings it to root search.
@@ -449,14 +498,14 @@ mod tests {
             .unwrap();
         let items = provider.catalog();
         assert_eq!(titles(&items)[0], "My GitHub");
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 5);
     }
 
     #[test]
     fn catalog_has_the_defaults_and_commands() {
         let provider = provider();
         let catalog = provider.catalog();
-        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.len(), 4);
         let items = all_links(&catalog);
         assert_eq!(items.len(), DEFAULTS.len());
         let github = find(&items, "GitHub");
@@ -483,9 +532,23 @@ mod tests {
             [
                 "Open Quicklink",
                 "Copy Link",
+                "Use as Web Search",
                 "Edit Quicklink…",
                 "Delete Quicklink"
             ]
+        );
+        let id = github
+            .id
+            .strip_prefix("quicklinks:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            github.actions[2].command,
+            Command::SetSearchEngine {
+                engine: SearchEngine::Quicklink(id),
+                name: "GitHub".into()
+            }
         );
         find(&catalog, "Create Quicklink");
     }
@@ -543,6 +606,32 @@ mod tests {
         let items = provider.answers("!gh ");
         assert_eq!(titles(&items), ["GitHub"]);
         assert_eq!(items[0].actions[0].title, "Open Quicklink");
+    }
+
+    #[test]
+    fn a_full_keyword_without_text_opens_directly() {
+        let provider = provider();
+        let link = Quicklink {
+            id: 0,
+            name: "Translate From Clipboard".into(),
+            link: "https://translate.google.com/?text={clipboard}".into(),
+            keyword: Some("tracl".into()),
+            open_with: None,
+        };
+        let store = provider.store.as_ref().unwrap();
+        store.lock().unwrap().save_quicklink(&link).unwrap();
+        provider.catalog();
+
+        let items = provider.answers("!tracl");
+        assert_eq!(titles(&items), ["Translate From Clipboard"]);
+        assert!(matches!(
+            items[0].actions[0].command,
+            Command::OpenQuicklink { .. }
+        ));
+        // Still being typed: Enter completes it.
+        let items = provider.answers("!tra");
+        let item = find(&items, "Translate From Clipboard");
+        assert_eq!(item.actions[0].command, Command::Complete("!tracl ".into()));
     }
 
     #[test]

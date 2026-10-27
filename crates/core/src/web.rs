@@ -44,12 +44,16 @@ pub const PRESETS: &[Preset] = &[
 ];
 
 const CUSTOM_PREFIX: &str = "custom:";
+const QUICKLINK_PREFIX: &str = "quicklink:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchEngine {
     Preset(&'static Preset),
     /// A URL template the user typed, already checked by [`check_template`].
     Custom(String),
+    /// The user's quicklink with this id. Only the web provider can look its
+    /// link up; on its own it stands for the default engine.
+    Quicklink(i64),
 }
 
 impl Default for SearchEngine {
@@ -64,6 +68,7 @@ impl SearchEngine {
         match self {
             SearchEngine::Preset(preset) => preset.name.to_owned(),
             SearchEngine::Custom(template) => host(template).to_owned(),
+            SearchEngine::Quicklink(_) => PRESETS[0].name.to_owned(),
         }
     }
 
@@ -71,6 +76,7 @@ impl SearchEngine {
         match self {
             SearchEngine::Preset(preset) => preset.template,
             SearchEngine::Custom(template) => template,
+            SearchEngine::Quicklink(_) => PRESETS[0].template,
         }
     }
 
@@ -79,11 +85,13 @@ impl SearchEngine {
         self.template().replace("{query}", &encode_query(query))
     }
 
-    /// The form kept in the settings table: a preset id or `custom:<template>`.
+    /// The form kept in the settings table: a preset id, `custom:<template>`
+    /// or `quicklink:<id>`.
     pub fn to_setting(&self) -> String {
         match self {
             SearchEngine::Preset(preset) => preset.id.to_owned(),
             SearchEngine::Custom(template) => format!("{CUSTOM_PREFIX}{template}"),
+            SearchEngine::Quicklink(id) => format!("{QUICKLINK_PREFIX}{id}"),
         }
     }
 
@@ -93,6 +101,9 @@ impl SearchEngine {
             return check_template(template)
                 .ok()
                 .map(|()| SearchEngine::Custom(template.to_owned()));
+        }
+        if let Some(id) = text.strip_prefix(QUICKLINK_PREFIX) {
+            return id.parse().ok().map(SearchEngine::Quicklink);
         }
         PRESETS
             .iter()
@@ -158,13 +169,10 @@ mod tests {
 
     #[test]
     fn settings_round_trip() {
-        for engine in PRESETS
-            .iter()
-            .map(SearchEngine::Preset)
-            .chain([SearchEngine::Custom(
-                "https://www.startpage.com/do/search?q={query}".into(),
-            )])
-        {
+        for engine in PRESETS.iter().map(SearchEngine::Preset).chain([
+            SearchEngine::Custom("https://www.startpage.com/do/search?q={query}".into()),
+            SearchEngine::Quicklink(42),
+        ]) {
             assert_eq!(
                 SearchEngine::from_setting(&engine.to_setting()),
                 Some(engine)
@@ -172,6 +180,7 @@ mod tests {
         }
         assert_eq!(SearchEngine::from_setting("altavista"), None);
         assert_eq!(SearchEngine::from_setting("custom:ftp://x/{query}"), None);
+        assert_eq!(SearchEngine::from_setting("quicklink:gh"), None);
     }
 
     #[test]

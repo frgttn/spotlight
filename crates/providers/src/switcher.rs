@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use spotlight_core::{
-    item::{Command, Icon, SearchItem},
+    item::{Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     view::{ListFilter, ListView, View},
@@ -154,7 +154,8 @@ fn process_item(process: ProcessInfo) -> SearchItem {
     if let Some(exe) = process.exe {
         item = item
             .action("Show in Folder", Command::ShowInFolder(exe.clone()))
-            .action("Copy Path", Command::Copy(exe));
+            .action("Copy Path", Command::Copy(exe))
+            .shortcut(shortcut::COPY_TERTIARY);
     }
     item
 }

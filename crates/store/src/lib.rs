@@ -17,7 +17,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 pub use rusqlite::{Error, ErrorCode};
 use spotlight_core::{
-    clip::{self, ClipKind, Retention},
+    clip::{self, ClipKind, Retention, RichText},
     frecency::Frecency,
     quicklink::{self, Quicklink},
     snippet::Snippet,
@@ -93,7 +93,49 @@ const MIGRATIONS: &[&str] = &[
     // No schema change: swaps the first nine default quicklinks for the
     // current `quicklink::DEFAULTS`; see `refresh_default_quicklinks`.
     "SELECT 1;",
+    // Icons already extracted from the shell, so a start doesn't extract them
+    // all again. `name` is what the shell was asked for, `size` the pixel size.
+    "CREATE TABLE icons (
+        name     TEXT NOT NULL,
+        size     INTEGER NOT NULL,
+        width    INTEGER NOT NULL,
+        height   INTEGER NOT NULL,
+        bgra     BLOB NOT NULL,
+        saved_at INTEGER NOT NULL,
+        PRIMARY KEY (name, size)
+    );",
+    // The formatting copied with a text entry, to paste it back formatted.
+    // Lists leave the blobs out; only putting the entry back reads them.
+    "ALTER TABLE clips ADD COLUMN html BLOB;
+    ALTER TABLE clips ADD COLUMN rtf BLOB;",
+    // Commands run from Run, as typed, most recent first when listed.
+    "CREATE TABLE run_history (
+        command TEXT PRIMARY KEY,
+        runs    INTEGER NOT NULL,
+        used_at INTEGER NOT NULL
+    );",
+    // Items the user pinned to the top of root search, in their order.
+    "CREATE TABLE favorites (
+        item_id  TEXT PRIMARY KEY,
+        position INTEGER NOT NULL
+    );",
+    // What the QR codes in an image entry say, found when it was copied.
+    "ALTER TABLE clips ADD COLUMN qr TEXT;",
 ];
+
+/// An icon nobody asked for in this long is forgotten (about two months).
+const ICON_KEEP_SECS: i64 = 60 * 24 * 3600;
+
+/// A shell icon as saved: BGRA pixels with straight alpha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedIcon {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+    /// Unix seconds it was extracted.
+    pub saved_at: i64,
+}
 
 /// The migration that creates `quicklinks`: databases created before it get
 /// the default quicklinks once too, and deleting them later sticks.
@@ -201,6 +243,11 @@ pub struct Clip {
     pub pinned: bool,
     /// Unix seconds, of the latest copy.
     pub copied_at: i64,
+    /// Whether formatting came with the text (see [`Store::clip_rich`]).
+    /// Read only: [`Store::add_clip`] takes the formatting itself.
+    pub rich: bool,
+    /// What the QR codes in an image say.
+    pub qr: Vec<String>,
 }
 
 impl Clip {
@@ -214,7 +261,11 @@ impl Clip {
     }
 }
 
-const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at";
+const CLIP_COLUMNS: &str = "id, kind, content, width, height, app, app_path, pinned, copied_at,
+    html IS NOT NULL OR rtf IS NOT NULL, qr";
+
+/// Between the QR codes' texts in the `qr` column; no text has it.
+const QR_SEPARATOR: char = '\u{1e}';
 
 fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
     let kind: String = row.get(1)?;
@@ -228,6 +279,11 @@ fn clip_row(row: &rusqlite::Row) -> Result<Clip> {
         app_path: row.get(6)?,
         pinned: row.get(7)?,
         copied_at: row.get(8)?,
+        rich: row.get(9)?,
+        qr: row
+            .get::<_, Option<String>>(10)?
+            .map(|codes| codes.split(QR_SEPARATOR).map(str::to_owned).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -286,6 +342,48 @@ impl Store {
             tx.commit()?;
         }
         Ok(Self { conn })
+    }
+
+    /// The saved icons among `names` at pixel size `size`.
+    pub fn icons(&self, names: &[String], size: u32) -> Result<Vec<CachedIcon>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT width, height, bgra, saved_at FROM icons WHERE name = ?1 AND size = ?2",
+        )?;
+        let mut found = Vec::new();
+        for name in names {
+            let icon = stmt
+                .query_row(params![name, size], |row| {
+                    Ok(CachedIcon {
+                        name: name.clone(),
+                        width: row.get(0)?,
+                        height: row.get(1)?,
+                        bgra: row.get(2)?,
+                        saved_at: row.get(3)?,
+                    })
+                })
+                .optional()?;
+            found.extend(icon);
+        }
+        Ok(found)
+    }
+
+    /// Saves `icons` at pixel size `size`, replacing earlier ones, and drops
+    /// icons nobody has asked for since `ICON_KEEP_SECS` before `now`.
+    pub fn save_icons(&mut self, icons: &[CachedIcon], size: u32, now: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for icon in icons {
+            tx.execute(
+                "INSERT OR REPLACE INTO icons (name, size, width, height, bgra, saved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![icon.name, size, icon.width, icon.height, icon.bgra, now],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM icons WHERE saved_at < ?1",
+            [now - ICON_KEEP_SECS],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -467,6 +565,20 @@ impl Store {
         .collect()
     }
 
+    /// Adds new quicklinks (their ids are ignored) all at once, or none if
+    /// one fails. Returns how many were added.
+    pub fn add_quicklinks(&mut self, links: &[Quicklink]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        for link in links {
+            tx.execute(
+                "INSERT INTO quicklinks (name, link, keyword, open_with) VALUES (?1, ?2, ?3, ?4)",
+                params![link.name, link.link, link.keyword, link.open_with],
+            )?;
+        }
+        tx.commit()?;
+        Ok(links.len())
+    }
+
     /// Adds `link` (id 0) or replaces the one with its id. Returns its id.
     pub fn save_quicklink(&self, link: &Quicklink) -> Result<i64> {
         let Quicklink {
@@ -562,7 +674,7 @@ impl Store {
     /// (newer id, so it's first even within the same second), keeping its
     /// pin, and its app if `clip` has none (as when Spotlight itself put it
     /// back). Returns the new id and whether the content is new.
-    pub fn add_clip(&mut self, clip: &Clip, hash: &str) -> Result<(i64, bool)> {
+    pub fn add_clip(&mut self, clip: &Clip, hash: &str, rich: &RichText) -> Result<(i64, bool)> {
         let tx = self.conn.transaction()?;
         let existing = tx
             .query_row(
@@ -587,8 +699,9 @@ impl Store {
         };
         tx.execute(
             "INSERT INTO clips
-                (kind, content, hash, width, height, app, app_path, pinned, copied_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (kind, content, hash, width, height, app, app_path, pinned, copied_at, html, rtf,
+                 qr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 clip.kind.as_str(),
                 clip.content,
@@ -598,7 +711,10 @@ impl Store {
                 app,
                 app_path,
                 pinned,
-                clip.copied_at
+                clip.copied_at,
+                rich.html,
+                rich.rtf,
+                (!clip.qr.is_empty()).then(|| clip.qr.join(&QR_SEPARATOR.to_string()))
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -625,6 +741,65 @@ impl Store {
                 clip_row,
             )
             .optional()
+    }
+
+    /// The favorite items' ids, in order.
+    pub fn favorites(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT item_id FROM favorites ORDER BY position")?;
+        stmt.query_map([], |row| row.get(0))?.collect()
+    }
+
+    /// Makes `ids` the favorites, in this order.
+    pub fn set_favorites(&self, ids: &[String]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM favorites", [])?;
+        for (position, id) in ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO favorites (item_id, position) VALUES (?1, ?2)",
+                params![id, position as i64],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Commands run from Run, most recently run first, at most `limit`.
+    pub fn run_history(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT command FROM run_history ORDER BY used_at DESC, runs DESC LIMIT ?1")?;
+        stmt.query_map([limit as i64], |row| row.get(0))?.collect()
+    }
+
+    /// `command` was run at `now` (unix seconds).
+    pub fn record_run(&self, command: &str, now: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_history (command, runs, used_at) VALUES (?1, 1, ?2)
+             ON CONFLICT (command) DO UPDATE SET runs = runs + 1, used_at = ?2",
+            params![command, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_run(&self, command: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM run_history WHERE command = ?1", [command])?;
+        Ok(())
+    }
+
+    /// The formatting entry `id` was copied with; empty when it has none.
+    pub fn clip_rich(&self, id: i64) -> Result<RichText> {
+        Ok(self
+            .conn
+            .query_row("SELECT html, rtf FROM clips WHERE id = ?1", [id], |row| {
+                Ok(RichText {
+                    html: row.get(0)?,
+                    rtf: row.get(1)?,
+                })
+            })
+            .optional()?
+            .unwrap_or_default())
     }
 
     pub fn pin_clip(&self, id: i64, pinned: bool) -> Result<()> {
@@ -912,6 +1087,8 @@ mod tests {
             app_path: None,
             pinned: false,
             copied_at,
+            rich: false,
+            qr: Vec::new(),
         }
     }
 
@@ -994,15 +1171,19 @@ mod tests {
     #[test]
     fn clipboard_history_moves_repeats_up_and_pins_first() {
         let mut store = Store::open_in_memory().unwrap();
-        let (a, new) = store.add_clip(&text_clip("a", 10), "ha").unwrap();
+        let (a, new) = store
+            .add_clip(&text_clip("a", 10), "ha", &RichText::default())
+            .unwrap();
         assert!(new);
-        store.add_clip(&text_clip("b", 20), "hb").unwrap();
+        store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
         // Copied again, by Spotlight itself (no app): moves up, keeps its app.
         let again = Clip {
             app: None,
             ..text_clip("a", 30)
         };
-        let (again_id, new) = store.add_clip(&again, "ha").unwrap();
+        let (again_id, new) = store.add_clip(&again, "ha", &RichText::default()).unwrap();
         assert!(!new && again_id != a);
         assert_eq!(store.clip(a).unwrap(), None);
         assert_eq!(contents(store.clips(None).unwrap()), ["a", "b"]);
@@ -1023,11 +1204,78 @@ mod tests {
     }
 
     #[test]
+    fn keeps_favorites_in_order() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.favorites().unwrap().is_empty());
+        let ids = ["apps:b".to_owned(), "system:lock".to_owned()];
+        store.set_favorites(&ids).unwrap();
+        assert_eq!(store.favorites().unwrap(), ids);
+        store.set_favorites(&[ids[1].clone()]).unwrap();
+        assert_eq!(store.favorites().unwrap(), [ids[1].clone()]);
+    }
+
+    #[test]
+    fn remembers_run_commands() {
+        let store = Store::open_in_memory().unwrap();
+        store.record_run("cmd", 10).unwrap();
+        store.record_run("gpedit.msc", 20).unwrap();
+        store.record_run("cmd", 30).unwrap();
+        assert_eq!(store.run_history(10).unwrap(), ["cmd", "gpedit.msc"]);
+        assert_eq!(store.run_history(1).unwrap(), ["cmd"]);
+        store.forget_run("cmd").unwrap();
+        assert_eq!(store.run_history(10).unwrap(), ["gpedit.msc"]);
+    }
+
+    #[test]
+    fn keeps_what_qr_codes_say() {
+        let mut store = Store::open_in_memory().unwrap();
+        let codes = vec!["https://a.b".to_owned(), "line 1\nline 2".to_owned()];
+        let image = Clip {
+            kind: ClipKind::Image,
+            qr: codes.clone(),
+            ..text_clip("C:\\images\\1.png", 10)
+        };
+        let (id, _) = store.add_clip(&image, "hi", &RichText::default()).unwrap();
+        store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
+        assert_eq!(store.clip(id).unwrap().unwrap().qr, codes);
+        assert!(store.clips(None).unwrap()[0].qr.is_empty());
+    }
+
+    #[test]
+    fn keeps_the_formatting_out_of_lists() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rich = RichText {
+            html: Some(b"Version:0.9 <b>a</b>".to_vec()),
+            rtf: None,
+        };
+        let (id, _) = store.add_clip(&text_clip("a", 10), "ha", &rich).unwrap();
+        let (plain, _) = store
+            .add_clip(&text_clip("b", 20), "hb", &RichText::default())
+            .unwrap();
+        let clips = store.clips(None).unwrap();
+        assert_eq!(
+            clips.iter().map(|clip| clip.rich).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(store.clip_rich(id).unwrap(), rich);
+        assert!(store.clip_rich(plain).unwrap().is_empty());
+        // Copied again without formatting: the entry loses it.
+        let (again, _) = store
+            .add_clip(&text_clip("a", 30), "ha", &RichText::default())
+            .unwrap();
+        assert!(!store.clip(again).unwrap().unwrap().rich);
+    }
+
+    #[test]
     fn trimming_keeps_the_newest_and_drops_the_old() {
         let mut store = Store::open_in_memory().unwrap();
         for ix in 0..6 {
             let text = ix.to_string();
-            store.add_clip(&text_clip(&text, ix * 100), &text).unwrap();
+            store
+                .add_clip(&text_clip(&text, ix * 100), &text, &RichText::default())
+                .unwrap();
         }
         let oldest = store.clips(None).unwrap().last().unwrap().id;
         store.pin_clip(oldest, true).unwrap();
@@ -1155,5 +1403,32 @@ mod tests {
         assert_eq!(store.setting("a").unwrap().as_deref(), Some("b"));
         drop(store);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn icons_are_kept_per_size_and_old_ones_dropped() {
+        let mut store = Store::open_in_memory().unwrap();
+        let icon = |name: &str| CachedIcon {
+            name: name.into(),
+            width: 1,
+            height: 1,
+            bgra: vec![1, 2, 3, 4],
+            saved_at: 0,
+        };
+        store
+            .save_icons(&[icon("a"), icon("b")], 48, 1_000)
+            .unwrap();
+        let names = ["a".to_owned(), "c".to_owned()];
+        let found = store.icons(&names, 48).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bgra, [1, 2, 3, 4]);
+        assert_eq!(found[0].saved_at, 1_000);
+        assert!(store.icons(&names, 55).unwrap().is_empty());
+
+        store
+            .save_icons(&[icon("c")], 48, 1_000 + ICON_KEEP_SECS + 1)
+            .unwrap();
+        assert_eq!(store.icons(&names, 48).unwrap().len(), 1);
+        assert_eq!(store.icons(&names, 48).unwrap()[0].name, "c");
     }
 }

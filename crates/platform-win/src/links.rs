@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use spotlight_core::quicklink::Moment;
+use spotlight_core::{datetime::LocalTime, quicklink::Moment};
 use windows::{
     Win32::{
         System::{Com::CoTaskMemFree, SystemInformation::GetLocalTime},
@@ -25,28 +25,18 @@ const BROWSER_KEYS: &[&str] = &[
     r"HKLM\SOFTWARE\Clients\StartMenuInternet",
 ];
 
-/// `SYSTEMTIME::wDayOfWeek` counts from Sunday.
-const DAYS: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-
 /// The local date and time, and a fresh random UUID.
 pub fn moment() -> Moment {
     let now = unsafe { GetLocalTime() };
     Moment {
-        date: format!("{:04}-{:02}-{:02}", now.wYear, now.wMonth, now.wDay),
-        time: format!("{:02}:{:02}", now.wHour, now.wMinute),
-        day: DAYS
-            .get(now.wDayOfWeek as usize)
-            .copied()
-            .unwrap_or_default()
-            .to_owned(),
+        now: LocalTime {
+            year: i32::from(now.wYear),
+            month: now.wMonth as u8,
+            day: now.wDay as u8,
+            hour: now.wHour as u8,
+            minute: now.wMinute as u8,
+            second: now.wSecond as u8,
+        },
         uuid: GUID::new()
             .map(|guid| format!("{guid:?}").to_lowercase())
             .unwrap_or_default(),
@@ -157,8 +147,8 @@ mod tests {
     #[test]
     fn reads_the_moment() {
         let moment = moment();
-        assert_eq!(moment.date.len(), "2026-10-23".len());
-        assert_eq!(moment.time.len(), "14:05".len());
+        assert_eq!(moment.date().len(), "2026-10-23".len());
+        assert_eq!(moment.time().len(), "14:05".len());
         assert_eq!(moment.uuid.len(), 36);
         assert_ne!(moment.uuid, super::moment().uuid);
     }

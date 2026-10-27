@@ -1,0 +1,15 @@
+[package]
+name = "spotlight-qr"
+description = "QR codes for Spotlight: making them from text, reading them from images, and the view that shows one"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { workspace = true, features = ["png"] }
+qrcode.workspace = true
+rqrr.workspace = true
+spotlight-core.workspace = true

@@ -2,8 +2,13 @@
 //! deeplink), with placeholders filled in when they're opened.
 //!
 //! Placeholders, as in Raycast (see [`crate::placeholder`]): `{query}`,
-//! `{argument …}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}` and
-//! `{selection}`. Anything else in braces is left as it is.
+//! `{argument …}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}`,
+//! `{selection}` and `{clipboard}`. Anything else in braces is left as it is.
+//!
+//! They move to and from Raycast as JSON: an array of `{"name", "link",
+//! "openWith"}` objects (plus our `"keyword"`, which Raycast ignores).
+
+use serde_json::{Map, Value, json};
 
 use crate::placeholder::{self, Placeholder};
 pub use crate::placeholder::{Argument, Moment, arguments, field_id, with_field_ids};
@@ -593,9 +598,39 @@ pub fn has_selection(link: &str) -> bool {
 
 /// `link` with `{selection}` replaced by `text`, encoded as typed values are.
 pub fn fill_selection(link: &str, text: &str) -> String {
+    fill_with(link, &Placeholder::Selection, text)
+}
+
+/// `link` as a web search template (see [`crate::web`]): `{query}` where its
+/// first free-text argument goes, the other arguments at their defaults.
+/// `None` unless it is an `http(s)` URL with such an argument.
+pub fn search_template(link: &str) -> Option<String> {
+    // Alphanumeric, so `fill` leaves it as it is.
+    const MARK: &str = "SPOTLIGHTQUERYMARK";
+    let arguments = arguments(link);
+    if !arguments.iter().any(Argument::is_free_text) {
+        return None;
+    }
+    let template = fill(link, &bang_values(&arguments, MARK)).replace(MARK, "{query}");
+    crate::web::check_template(&template)
+        .ok()
+        .map(|()| template)
+}
+
+/// Whether `link` contains `{clipboard}`.
+pub fn has_clipboard(link: &str) -> bool {
+    placeholder::contains(link, |placeholder| *placeholder == Placeholder::Clipboard)
+}
+
+/// `link` with `{clipboard}` replaced by `text`, encoded as typed values are.
+pub fn fill_clipboard(link: &str, text: &str) -> String {
+    fill_with(link, &Placeholder::Clipboard, text)
+}
+
+fn fill_with(link: &str, which: &Placeholder, text: &str) -> String {
     let value = encode_value(text.trim(), is_url(link));
     placeholder::replace(link, |placeholder| {
-        (*placeholder == Placeholder::Selection).then(|| value.clone())
+        (placeholder == which).then(|| value.clone())
     })
 }
 
@@ -637,6 +672,101 @@ pub fn check_link(link: &str) -> Result<(), &'static str> {
         return Err("Use a URL (https://…) or a full path (C:\\…)");
     }
     Ok(())
+}
+
+/// What [`import`] makes of a JSON file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Imported {
+    /// To save: new, and with keywords nothing else has. `open_with` is as
+    /// the file has it: Raycast writes an app's name, which the caller turns
+    /// into a browser's exe (or drops).
+    pub added: Vec<Quicklink>,
+    /// Already there: same name and link.
+    pub duplicates: usize,
+    /// Left out because a quicklink already has their keyword.
+    pub taken: usize,
+    /// Without a link, or with one or a keyword that can't be used.
+    pub invalid: usize,
+}
+
+/// The quicklinks in `json` (as Raycast exports them, or one such object)
+/// that `existing` doesn't have yet. `Err` when it isn't such a file at all.
+pub fn import(json: &str, existing: &[Quicklink]) -> Result<Imported, String> {
+    let json = json.trim_start_matches('\u{feff}');
+    let value: Value =
+        serde_json::from_str(json).map_err(|err| format!("Not a JSON file: {err}"))?;
+    let entries = match value {
+        Value::Array(entries) => entries,
+        Value::Object(_) => vec![value],
+        _ => return Err("Not a list of quicklinks".into()),
+    };
+    let mut imported = Imported::default();
+    for entry in entries {
+        let Some(link) = parse_entry(&entry) else {
+            imported.invalid += 1;
+            continue;
+        };
+        let known = existing.iter().chain(&imported.added);
+        if known
+            .clone()
+            .any(|other| other.name == link.name && other.link == link.link)
+        {
+            imported.duplicates += 1;
+        } else if link.keyword.is_some()
+            && known.into_iter().any(|other| other.keyword == link.keyword)
+        {
+            imported.taken += 1;
+        } else {
+            imported.added.push(link);
+        }
+    }
+    Ok(imported)
+}
+
+/// One object of an import; `None` when it can't be a quicklink.
+fn parse_entry(entry: &Value) -> Option<Quicklink> {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let link = text("link")?.to_owned();
+    check_link(&link).ok()?;
+    let keyword = match text("keyword") {
+        Some(keyword) => normalize_keyword(keyword).ok()?,
+        None => None,
+    };
+    let name = text("name").map_or_else(|| host(&link).unwrap_or(&link).to_owned(), str::to_owned);
+    Some(Quicklink {
+        id: 0,
+        name,
+        link,
+        keyword,
+        open_with: text("openWith").map(str::to_owned),
+    })
+}
+
+/// `links` as JSON Raycast can import. `open_with` names a browser by its
+/// exe; `app_name` gives the name Raycast looks it up by.
+pub fn export(links: &[Quicklink], app_name: impl Fn(&str) -> String) -> String {
+    let entries: Vec<Value> = links
+        .iter()
+        .map(|link| {
+            let mut entry = Map::new();
+            entry.insert("name".into(), json!(link.name));
+            entry.insert("link".into(), json!(link.link));
+            if let Some(app) = &link.open_with {
+                entry.insert("openWith".into(), json!(app_name(app)));
+            }
+            if let Some(keyword) = &link.keyword {
+                entry.insert("keyword".into(), json!(keyword));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into())
 }
 
 /// `C:\…`, `\\server\share` or `%USERPROFILE%\…`.
@@ -751,11 +881,61 @@ mod tests {
     }
 
     #[test]
+    fn imports_what_it_exports() {
+        let link = |name: &str, url: &str, keyword: Option<&str>| Quicklink {
+            id: 0,
+            name: name.into(),
+            link: url.into(),
+            keyword: keyword.map(str::to_owned),
+            open_with: None,
+        };
+        let existing = [link(
+            "GitHub",
+            "https://github.com/search?q={query}",
+            Some("gh"),
+        )];
+        let mut chrome = link("Docs", "https://docs.rs/{query}", None);
+        chrome.open_with = Some(r"C:\Chrome\chrome.exe".into());
+        let json = export(&[chrome.clone()], |_| "Google Chrome".into());
+        assert!(json.contains(r#""openWith": "Google Chrome""#));
+        let back = import(&json, &[]).unwrap();
+        assert_eq!(back.added[0].open_with.as_deref(), Some("Google Chrome"));
+
+        let json = r#"[
+            {"name": "GitHub", "link": "https://github.com/search?q={query}"},
+            {"name": "Code search", "link": "https://cs.github.com/?q={query}", "keyword": "!GH"},
+            {"link": "https://example.com/a"},
+            {"name": "Script", "link": "javascript:alert(1)"},
+            {"name": "No link"},
+            7
+        ]"#;
+        let imported = import(json, &existing).unwrap();
+        assert_eq!(
+            imported.added,
+            [link("example.com", "https://example.com/a", None)]
+        );
+        assert_eq!(
+            (imported.duplicates, imported.taken, imported.invalid),
+            (1, 1, 3)
+        );
+        // One object, as a shared link brings.
+        let one = import(r#"{"name": "Zed", "link": "https://zed.dev"}"#, &[]).unwrap();
+        assert_eq!(one.added.len(), 1);
+        assert!(import("[1", &[]).is_err());
+        assert!(import("\"text\"", &[]).is_err());
+    }
+
+    #[test]
     fn expands_the_moment() {
         let moment = Moment {
-            date: "2026-10-23".into(),
-            time: "14:05".into(),
-            day: "Friday".into(),
+            now: crate::datetime::LocalTime {
+                year: 2026,
+                month: 10,
+                day: 23,
+                hour: 14,
+                minute: 5,
+                second: 0,
+            },
             uuid: "u".into(),
         };
         let link = r"C:\Notes\{date} {time} {uuid} {query} {day} {datetime}.md";
@@ -764,6 +944,38 @@ mod tests {
         assert_eq!(
             expand_moment(link, &moment),
             r"C:\Notes\2026-10-23 14:05 u {query} Friday 2026-10-23 14:05.md"
+        );
+    }
+
+    #[test]
+    fn makes_search_templates() {
+        assert_eq!(
+            search_template("https://github.com/search?q={query}&type=repositories").as_deref(),
+            Some("https://github.com/search?q={query}&type=repositories")
+        );
+        assert_eq!(
+            search_template(
+                "https://x.com/{argument name=\"Lang\" options=\"en, de\"}/{argument name=\"Text\"}"
+            )
+            .as_deref(),
+            Some("https://x.com/en/{query}")
+        );
+        assert_eq!(search_template("https://x.com/home"), None);
+        assert_eq!(search_template(r"C:\Notes\{query}.md"), None);
+    }
+
+    #[test]
+    fn fills_the_clipboard() {
+        let link = "https://translate.google.com/?text={clipboard}&q={query}";
+        assert!(has_clipboard(link));
+        assert!(!has_clipboard("https://x.com/{selection}"));
+        assert_eq!(
+            fill_clipboard(link, " a&b c\n"),
+            "https://translate.google.com/?text=a%26b%20c&q={query}"
+        );
+        assert_eq!(
+            fill_clipboard(r"C:\Notes\{clipboard}.md", "todo"),
+            r"C:\Notes\todo.md"
         );
     }
 

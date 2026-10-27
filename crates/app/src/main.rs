@@ -3,7 +3,10 @@
 //! Environment:
 //! - `SPOTLIGHT_SYNTHETIC=10000` adds that many filler rows for the list test.
 //! - `SPOTLIGHT_SHOW_ON_START=1` shows the window immediately (handy while developing).
+//!   With `SPOTLIGHT_QUERY=<text>` that text is typed into it (for screenshots).
 //! - `SPOTLIGHT_SELFTEST=1` runs the scripted measurement in `selftest.rs` and quits.
+//! - `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved theme.
+//! - `SPOTLIGHT_WINDOW_MODE=compact|expanded` overrides the saved window mode.
 //! - `SPOTLIGHT_DATA_DIR=<dir>` keeps the database there instead of `%APPDATA%\spotlight`.
 //!
 //! `spotlight.exe --settings` opens the settings window (of the running
@@ -32,21 +35,24 @@ use gpui::{
 };
 use spotlight_core::{
     clip::{IGNORED_APPS_SETTING, IgnoredApp, Retention},
-    deeplink, file_search, snippet,
+    deeplink, file_search, run as run_command, snippet,
     web::SearchEngine,
+    window as window_layout,
 };
 use spotlight_platform_win::{
     clipboard,
     hotkey::{self, Hotkey},
     instance::{self, Instance},
-    metrics, protocol, vault, win,
+    metrics, protocol, vault, win, wm,
 };
-use spotlight_providers::{Builtins, clipboard::ClipboardHistory, files::Files, web::Web};
+use spotlight_providers::{
+    Builtins, clipboard::ClipboardHistory, files::Files, run::Run, web::Web,
+};
 use spotlight_store::{Key, Store};
 use spotlight_ui::{
-    launcher::{self, Launcher, OpenSettings, Quit, WindowMode},
+    launcher::{self, HomeSection, Launcher, OpenSettings, Quit, WindowMode},
     settings::{self, LauncherReader, LauncherState, Settings, SettingsEvent},
-    text_input,
+    text_input, theme,
 };
 
 use crate::tray::{Command, Tray};
@@ -57,6 +63,13 @@ const HOTKEY_SETTING: &str = "hotkey";
 const SMOOTH_SCROLLING_SETTING: &str = "smooth_scrolling";
 /// `settings` key: `WindowMode`'s setting form; missing means expanded.
 const WINDOW_MODE_SETTING: &str = "window_mode";
+/// `settings` key: `"true"` or `"false"`; missing means on.
+const COMPACT_FAVORITES_SETTING: &str = "compact_favorites";
+/// `settings` key: `"true"` or `"false"`; missing means on.
+const RANK_BY_USAGE_SETTING: &str = "rank_by_usage";
+/// `settings` key: the root search sections hidden before anything is
+/// typed, `HomeSection`'s setting forms comma-separated; missing means none.
+const HIDDEN_SECTIONS_SETTING: &str = "hidden_home_sections";
 /// `settings` key: `SearchEngine`'s setting form; missing means Google.
 const SEARCH_ENGINE_SETTING: &str = "search_engine";
 /// `settings` key: ids of the turned-off search providers, comma-separated;
@@ -85,6 +98,9 @@ struct AppState {
     hotkey: Cell<Option<Hotkey>>,
     smooth_scrolling: Cell<bool>,
     window_mode: Cell<WindowMode>,
+    compact_favorites: Cell<bool>,
+    rank_by_usage: Cell<bool>,
+    hidden_sections: RefCell<Vec<HomeSection>>,
     search_engine: RefCell<SearchEngine>,
     /// The web provider, to switch its search engine.
     web: Arc<Web>,
@@ -92,9 +108,14 @@ struct AppState {
     clipboard: Arc<ClipboardHistory>,
     /// File Search, to index again when what it covers changes.
     files: Arc<Files>,
+    /// Run, to change its prefix.
+    run: Arc<Run>,
+    run_prefix: RefCell<String>,
     win_v: Cell<bool>,
     selection_copy: Cell<bool>,
     snippet_expansion: Cell<bool>,
+    /// Pixels layouts leave between windows, and whether halves cycle.
+    window_layout: Cell<(i32, bool)>,
     store: Option<Arc<Mutex<Store>>>,
     data_path: SharedString,
     tray: Option<Tray>,
@@ -157,7 +178,40 @@ fn main() {
             .and_then(|store| store.lock().ok()?.setting(key).ok().flatten())
     };
     let smooth_scrolling = setting(SMOOTH_SCROLLING_SETTING).is_none_or(|value| value != "false");
-    let window_mode = setting(WINDOW_MODE_SETTING)
+    let rank_by_usage = setting(RANK_BY_USAGE_SETTING).is_none_or(|value| value != "false");
+    let compact_favorites = setting(COMPACT_FAVORITES_SETTING).is_none_or(|value| value != "false");
+    let hidden_sections: Vec<HomeSection> = setting(HIDDEN_SECTIONS_SETTING)
+        .map(|text| {
+            text.split(',')
+                .filter_map(|name| HomeSection::from_setting(name.trim()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Before any window opens, which then start out in the right colours.
+    // `SPOTLIGHT_THEME=light|dark|system|<theme id>` overrides the saved
+    // choice, for screenshots.
+    let mut choice = theme::Choice::from_settings(
+        setting(theme::MODE_SETTING).as_deref(),
+        setting(theme::LIGHT_SETTING).as_deref(),
+        setting(theme::DARK_SETTING).as_deref(),
+    );
+    if let Ok(text) = env::var("SPOTLIGHT_THEME") {
+        if let Some(mode) = theme::Mode::from_setting(&text) {
+            choice.mode = mode;
+        } else if let Some(found) = theme::theme(text.trim()) {
+            choice = choice.with_theme(found.id);
+            choice.mode = match found.appearance {
+                theme::Appearance::Dark => theme::Mode::Dark,
+                theme::Appearance::Light => theme::Mode::Light,
+            };
+        }
+    }
+    theme::set_choice(choice);
+    // `SPOTLIGHT_WINDOW_MODE=compact|expanded` overrides the saved one, for
+    // screenshots.
+    let window_mode = env::var("SPOTLIGHT_WINDOW_MODE")
+        .ok()
+        .or_else(|| setting(WINDOW_MODE_SETTING))
         .and_then(|text| {
             let mode = WindowMode::from_setting(&text);
             if mode.is_none() {
@@ -208,6 +262,16 @@ fn main() {
     let selection_copy = setting(SELECTION_COPY_SETTING).is_none_or(|value| value != "false");
     let snippet_expansion =
         setting(snippet::EXPANSION_SETTING).is_none_or(|value| value != "false");
+    let window_layout = (
+        setting(window_layout::GAP_SETTING)
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0),
+        setting(window_layout::CYCLE_SETTING).is_none_or(|value| value != "false"),
+    );
+    wm::set_layout_options(window_layout.0, window_layout.1);
+    let run_prefix = setting(run_command::PREFIX_SETTING)
+        .map(|prefix| prefix.trim().to_owned())
+        .unwrap_or_else(|| run_command::DEFAULT_PREFIX.to_owned());
     let file_search = file_search::Config::from_settings(setting);
     if win_v && !self_test {
         set_win_v(&hotkeys, true);
@@ -243,12 +307,14 @@ fn main() {
             web,
             clipboard: clipboard_history,
             files,
+            run,
         } = spotlight_providers::all(
             search_engine.clone(),
             data_dir.clone(),
             store.clone(),
             retention,
             file_search.clone(),
+            run_prefix.clone(),
         );
         if !disabled_providers.iter().any(|id| id == FILES_PROVIDER) {
             files.start();
@@ -293,14 +359,18 @@ fn main() {
             )
             .expect("failed to open the launcher window");
         window
-            .update(cx, |launcher, _, cx| {
+            .update(cx, |launcher, window, cx| {
                 launcher.set_window_mode(window_mode, cx);
+                launcher.set_compact_favorites(compact_favorites, cx);
+                launcher.set_rank_by_usage(rank_by_usage, cx);
+                launcher.set_hidden_sections(hidden_sections.clone(), cx);
                 launcher.set_selection_copy(selection_copy);
                 launcher.set_snippet_expansion(snippet_expansion);
                 launcher.set_file_prefix(file_search.prefix.clone());
+                launcher.set_run_prefix(run_prefix.clone());
                 // The self-test runs beside a normal instance, which expands them.
                 if !self_test {
-                    launcher.start_expander();
+                    launcher.start_expander(window, cx);
                 }
             })
             .ok();
@@ -338,13 +408,19 @@ fn main() {
             hotkey: Cell::new(hotkey),
             smooth_scrolling: Cell::new(smooth_scrolling),
             window_mode: Cell::new(window_mode),
+            compact_favorites: Cell::new(compact_favorites),
+            rank_by_usage: Cell::new(rank_by_usage),
+            hidden_sections: RefCell::new(hidden_sections),
             search_engine: RefCell::new(search_engine.clone()),
             web,
             clipboard: clipboard_history,
             files,
+            run,
+            run_prefix: RefCell::new(run_prefix),
             win_v: Cell::new(win_v),
             selection_copy: Cell::new(selection_copy),
             snippet_expansion: Cell::new(snippet_expansion),
+            window_layout: Cell::new(window_layout),
             store: store.clone(),
             data_path: data_path.clone(),
             tray,
@@ -361,6 +437,22 @@ fn main() {
         cx.spawn(async move |cx| {
             while let Ok(config) = file_config_rx.recv().await {
                 cx.update(|cx| save_file_search(&file_config_state, &config, cx))
+                    .ok();
+            }
+        })
+        .detach();
+
+        // A quicklink made the web search engine from the launcher is
+        // applied and saved like a choice made in Settings.
+        let (engines_tx, engines_rx) = async_channel::unbounded();
+        window
+            .update(cx, |launcher, _, _| launcher.set_engine_sender(engines_tx))
+            .ok();
+        let engines_state = state.clone();
+        cx.spawn(async move |cx| {
+            while let Ok(engine) = engines_rx.recv().await {
+                let event = SettingsEvent::SearchEngineChanged(engine);
+                cx.update(|cx| settings_changed(&engines_state, &event, cx))
                     .ok();
             }
         })
@@ -451,6 +543,21 @@ fn main() {
                 .detach();
         } else if show_on_start {
             presses_tx.send_blocking(Instant::now()).ok();
+            // `SPOTLIGHT_QUERY=<text>` types it into the search field once
+            // shown, for screenshots of a search.
+            if let Ok(query) = env::var("SPOTLIGHT_QUERY") {
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    window
+                        .update(cx, |launcher, window, cx| {
+                            launcher.type_text(&query, window, cx)
+                        })
+                        .ok();
+                })
+                .detach();
+            }
         }
     });
 }
@@ -493,16 +600,21 @@ fn open_settings(state: &Rc<AppState>, cx: &mut App) {
                 view_state.hotkey.get(),
                 view_state.smooth_scrolling.get(),
                 view_state.window_mode.get(),
+                view_state.compact_favorites.get(),
+                view_state.rank_by_usage.get(),
+                view_state.hidden_sections.borrow().clone(),
                 view_state.search_engine.borrow().clone(),
                 view_state.clipboard.retention(),
                 view_state.win_v.get(),
                 view_state.selection_copy.get(),
                 view_state.snippet_expansion.get(),
+                view_state.window_layout.get(),
+                view_state.run_prefix.borrow().clone(),
                 view_state.files.config(),
                 file_status,
                 env!("SPOTLIGHT_VERSION"),
                 view_state.data_path.clone(),
-                launcher_reader(view_state.launcher),
+                launcher_reader(view_state.launcher, view_state.web.clone()),
                 window,
                 cx,
             )
@@ -565,6 +677,59 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, cx| launcher.set_window_mode(*mode, cx))
                 .ok();
             save_setting(state, WINDOW_MODE_SETTING, mode.to_setting().to_owned(), cx);
+        }
+        SettingsEvent::CompactFavoritesChanged(enabled) => {
+            state.compact_favorites.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_compact_favorites(*enabled, cx)
+                })
+                .ok();
+            save_setting(state, COMPACT_FAVORITES_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::RankByUsageChanged(enabled) => {
+            state.rank_by_usage.set(*enabled);
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_rank_by_usage(*enabled, cx)
+                })
+                .ok();
+            save_setting(state, RANK_BY_USAGE_SETTING, enabled.to_string(), cx);
+        }
+        SettingsEvent::HiddenSectionsChanged(hidden) => {
+            *state.hidden_sections.borrow_mut() = hidden.clone();
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| {
+                    launcher.set_hidden_sections(hidden.clone(), cx)
+                })
+                .ok();
+            let text = hidden
+                .iter()
+                .map(|section| section.to_setting())
+                .collect::<Vec<_>>()
+                .join(",");
+            save_setting(state, HIDDEN_SECTIONS_SETTING, text, cx);
+        }
+        SettingsEvent::ThemeChanged(choice) => {
+            theme::set_choice(*choice);
+            // The system's setting may have changed while nothing listened.
+            theme::set_system(theme::appearance_of(cx.window_appearance()));
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.theme_changed(cx))
+                .ok();
+            cx.refresh_windows();
+            save_setting(
+                state,
+                theme::MODE_SETTING,
+                choice.mode.to_setting().to_owned(),
+                cx,
+            );
+            save_setting(state, theme::LIGHT_SETTING, choice.light.to_owned(), cx);
+            save_setting(state, theme::DARK_SETTING, choice.dark.to_owned(), cx);
         }
         SettingsEvent::SourceToggled { id, enabled } => {
             if *id == CLIPBOARD_PROVIDER {
@@ -633,6 +798,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .ok();
             save_setting(state, snippet::EXPANSION_SETTING, enabled.to_string(), cx);
         }
+        SettingsEvent::WindowLayoutChanged { gap, cycle } => {
+            state.window_layout.set((*gap, *cycle));
+            wm::set_layout_options(*gap, *cycle);
+            save_setting(state, window_layout::GAP_SETTING, gap.to_string(), cx);
+            save_setting(state, window_layout::CYCLE_SETTING, cycle.to_string(), cx);
+        }
         SettingsEvent::ExcludedAppsChanged(apps) => {
             state
                 .launcher
@@ -657,6 +828,19 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, _| launcher.set_file_prefix(prefix))
                 .ok();
             save_file_search(state, config, cx);
+        }
+        SettingsEvent::RunPrefixChanged(prefix) => {
+            state.run_prefix.replace(prefix.clone());
+            state.run.set_prefix(prefix.clone());
+            state
+                .launcher
+                .update(cx, |launcher, window, cx| {
+                    launcher.set_run_prefix(prefix.clone());
+                    // Its row says what to type.
+                    launcher.reload_provider(spotlight_providers::run::ID, window, cx);
+                })
+                .ok();
+            save_setting(state, run_command::PREFIX_SETTING, prefix.clone(), cx);
         }
         SettingsEvent::FileSearchRebuild => {
             if files_enabled(state, cx) {
@@ -683,6 +867,12 @@ fn settings_changed(state: &AppState, event: &SettingsEvent, cx: &mut App) {
                 .update(cx, |launcher, _, cx| {
                     launcher.hotkey_assigned(item_id, *hotkey, cx)
                 })
+                .ok();
+        }
+        SettingsEvent::LinkDistrusted(item_id) => {
+            state
+                .launcher
+                .update(cx, |launcher, _, cx| launcher.distrust_link(item_id, cx))
                 .ok();
         }
     }
@@ -735,15 +925,18 @@ fn record_clipboard(history: Arc<ClipboardHistory>) {
 
 /// How the settings window reads the launcher's aliases, item hotkeys and
 /// search sources.
-fn launcher_reader(launcher: WindowHandle<Launcher>) -> LauncherReader {
+fn launcher_reader(launcher: WindowHandle<Launcher>, web: Arc<Web>) -> LauncherReader {
     Rc::new(move |cx: &App| {
         let launcher = launcher.read(cx).ok()?;
+        let (name, _) = web.resolved();
         Some(LauncherState {
             shortcuts: launcher.shortcuts(),
             items: launcher.extension_items(),
             sources: launcher.sources(),
             ignored_apps: launcher.ignored_clip_apps(),
             excluded_apps: launcher.excluded_snippet_apps(),
+            search_engine: (web.engine(), name),
+            trusted_links: launcher.trusted_links(),
         })
     })
 }

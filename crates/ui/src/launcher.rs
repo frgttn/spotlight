@@ -2,7 +2,9 @@
 //! views opened on top of it (see `views`).
 
 mod clipboard;
+mod json_files;
 mod links;
+mod qr;
 mod quicklinks;
 mod snippets;
 mod views;
@@ -22,36 +24,41 @@ use std::{
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EntityInputHandler, FocusHandle, Focusable,
-    Hsla, KeyBinding, RenderImage, SharedString, Subscription, Task, UniformListScrollHandle,
-    Window, actions, canvas, div, hsla, img, prelude::*, px, rgb, rgba, uniform_list,
+    Hsla, KeyBinding, KeyDownEvent, Keystroke, RenderImage, ScrollHandle, SharedString,
+    Subscription, Task, UniformListScrollHandle, Window, actions, canvas, div, hsla, img,
+    prelude::*, px, relative, rgba, uniform_list,
 };
 use image::{Frame, RgbaImage};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
     deeplink,
     frecency::{self, Frecency},
-    item::{Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
-    view::{ListView, View},
+    view::{Field, FieldKind, FormView, ListView, View},
+    web::SearchEngine,
+    window::WindowCommand,
 };
 use spotlight_platform_win::{
-    clipboard as system_clipboard, commands, expander,
+    clipboard as system_clipboard, commands, expander, favicon,
     hotkey::{self, Hotkey, Recorded, SetError},
     icons,
     metrics::{self, PaintProbe, Percentiles, Probe, Summary, ms},
     selection, win,
+    wm::{self, RunningApp},
 };
-use spotlight_search::{Candidate, RootSearch, Row, Searcher};
-use spotlight_store::{Calculation, Store};
+use spotlight_search::{Candidate, RootSearch, Row, Searcher, Split};
+use spotlight_store::{CachedIcon, Calculation, Store};
 
 use self::{
     clipboard::{PREVIEW_LIST_WIDTH, PreviewImage},
     links::PendingLink,
+    qr::QrImage,
     views::{CHOICE_CONTEXT, GRID_COLUMNS, Screen},
 };
 use crate::{
-    smooth_scroll::{SmoothScroll, capture_wheel},
+    smooth_scroll::{SmoothScroll, capture_wheel, drag_track},
     text_input::{self, TextInput},
     theme,
 };
@@ -76,23 +83,37 @@ actions!(
 );
 
 const CONTEXT: &str = "Launcher";
-const ROW_HEIGHT: f32 = 44.;
+const ROW_HEIGHT: f32 = 40.;
+/// Lines of the list an answer card ([`SearchItem::card`]) takes.
+const CARD_LINES: usize = 3;
 /// Space above the first and below the last row.
 const LIST_PADDING: f32 = 4.;
+/// How much of a list's first line is hidden when it is a section heading,
+/// so the heading sits close to the search field, not a whole row below it.
+const HEADING_TRIM: f32 = 10.;
 /// Row icon size in logical pixels.
-const ICON_SIZE: f32 = 26.;
+const ICON_SIZE: f32 = 22.;
 /// Icons are extracted at the grid's tile size, so tiles are sharp too.
 const ICON_EXTRACT_SIZE: f32 = 44.;
+/// A saved icon older than this is extracted again (an app update may change it).
+const ICON_REFRESH_SECS: i64 = 7 * 24 * 3600;
 /// Launcher window size in logical (96-DPI) pixels.
-pub const WINDOW_SIZE: (f32, f32) = (680., 420.);
+pub const WINDOW_SIZE: (f32, f32) = (750., 475.);
 /// The collapsed window's height in compact mode: just the search row.
-const COMPACT_HEIGHT: f32 = 52.;
+const COMPACT_HEIGHT: f32 = 64.;
+/// How many favorites the collapsed window shows beside the search field,
+/// and Ctrl+1 to Ctrl+8 run.
+const COMPACT_FAVORITES: usize = 8;
+/// How many recently used items root search suggests before anything is typed.
+const SUGGESTIONS: usize = 8;
 /// The apps provider's id; its catalog load time is the "apps" figure in the
 /// footer and the self-test summary.
 const APPS_PROVIDER: &str = "apps";
 /// File Search: its provider and the live list root search's file prefix
 /// asks for rows.
 const FILES_PROVIDER: &str = "files";
+/// Run's provider, whose rows alone follow its prefix.
+const RUN_PROVIDER: &str = "run";
 const FILES_VIEW: &str = "search";
 /// How long a footer toast stays.
 const TOAST_DURATION: Duration = Duration::from_millis(2500);
@@ -153,6 +174,8 @@ impl Provider for Synthetic {
 struct Entry {
     title: String,
     kind: EntryKind,
+    /// The keys it asks for; see [`entry_keys`] for the ones it gets.
+    shortcut: Option<String>,
 }
 
 #[derive(Clone)]
@@ -173,9 +196,34 @@ enum EntryKind {
     CopyDeeplink,
     /// Asks again before the item opens from a link.
     DistrustLink,
+    /// Adds the item to the favorites, or takes it out.
+    ToggleFavorite,
+    /// Moves a favorite up (-1) or down (1).
+    MoveFavorite(isize),
 }
 
 impl Entry {
+    fn new(title: impl Into<String>, kind: EntryKind) -> Self {
+        Self {
+            title: title.into(),
+            kind,
+            shortcut: None,
+        }
+    }
+
+    fn of(action: &Action) -> Self {
+        Self {
+            title: action.title.clone(),
+            kind: EntryKind::Command(action.command.clone()),
+            shortcut: action.shortcut().map(str::to_owned),
+        }
+    }
+
+    fn with_shortcut(mut self, keys: &str) -> Self {
+        self.shortcut = Some(keys.to_owned());
+        self
+    }
+
     fn needs_confirmation(&self) -> bool {
         match &self.kind {
             EntryKind::Command(command) => command.needs_confirmation(),
@@ -281,16 +329,129 @@ impl WindowMode {
     }
 }
 
+/// What root search lists below its suggestions before anything is typed,
+/// each kind under its own heading; any of them can be hidden in Settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeSection {
+    Commands,
+    Applications,
+    Quicklinks,
+    Snippets,
+    Games,
+    SystemSettings,
+    ControlPanel,
+}
+
+impl HomeSection {
+    /// In the order root search lists them.
+    pub const ALL: [Self; 7] = [
+        Self::Commands,
+        Self::Applications,
+        Self::Quicklinks,
+        Self::Snippets,
+        Self::Games,
+        Self::SystemSettings,
+        Self::ControlPanel,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Commands => "Commands",
+            Self::Applications => "Applications",
+            Self::Quicklinks => "Quicklinks",
+            Self::Snippets => "Snippets",
+            Self::Games => "Games",
+            Self::SystemSettings => "System Settings",
+            Self::ControlPanel => "Control Panel",
+        }
+    }
+
+    pub fn to_setting(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Applications => "apps",
+            Self::Quicklinks => "quicklinks",
+            Self::Snippets => "snippets",
+            Self::Games => "games",
+            Self::SystemSettings => "settings",
+            Self::ControlPanel => "control-panel",
+        }
+    }
+
+    pub fn from_setting(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|section| section.to_setting() == text)
+    }
+
+    /// The section catalog item `id` is listed in.
+    fn of(id: &str) -> Self {
+        match kind_of(id) {
+            "Application" => Self::Applications,
+            "Game" => Self::Games,
+            "System Setting" => Self::SystemSettings,
+            "Control Panel" => Self::ControlPanel,
+            "Quicklink" => Self::Quicklinks,
+            "Snippet" => Self::Snippets,
+            _ => Self::Commands,
+        }
+    }
+}
+
+/// How dense the launcher's tint over its blurred background is: what
+/// shows through, blurred, is a hint of what's behind, not something to read.
+const TINT_DENSITY: f32 = 0.93;
+
+/// The tint drawn over the blur: [`TINT_DENSITY`] of the current theme's
+/// background, or denser where the theme needs it to stay dark over a white
+/// background — a light background, blurred, stays light, and would turn the
+/// window brighter than `MAX_BRIGHTNESS`, grey.
+///
+/// A light theme works the same mirrored: a black background shining through
+/// it would turn the window grey.
+fn tint() -> u32 {
+    tint_for(theme::p().background, theme::current().appearance)
+}
+
+/// [`tint`] for a theme with this background and appearance.
+fn tint_for(background: u32, appearance: theme::Appearance) -> u32 {
+    const MAX_BRIGHTNESS: f32 = 0.24;
+    let light = appearance == theme::Appearance::Light;
+    // In terms of "distance from the theme's own extreme": for a light
+    // theme, brightness is flipped, and the worst background is black.
+    let own = f32::from((background >> 24) as u8) / 255.;
+    let own = if light { 1. - own } else { own };
+    let needed = (1. - MAX_BRIGHTNESS) / (1. - own);
+    let alpha = TINT_DENSITY.max(needed).min(1.);
+    (background & 0xffffff00) | (alpha * 255.).round() as u32
+}
+
+/// How long the list of installed games is trusted before the next show reads it again.
+const GAMES_REFRESH: Duration = Duration::from_secs(60);
+
 pub struct Launcher {
     hwnd: isize,
     input: Entity<TextInput>,
     search: RootSearch,
     /// Catalogs still loading at startup.
     loading: usize,
+    /// When the catalogs of installed games were last read; a game installed
+    /// while the launcher runs shows up on the next [`Self::show`] after
+    /// [`GAMES_REFRESH`].
+    games_loaded: Instant,
+    /// The apps running when the window was last shown, for Quit Application
+    /// on their rows.
+    running_apps: Vec<RunningApp>,
     results: Vec<Row>,
     selected: usize,
-    /// The action panel (Ctrl+K) is open, with this action selected.
+    /// The action panel (Ctrl+K) is open, with this row of it selected:
+    /// an index into [`Self::panel_entries`], which its search narrows.
     panel: Option<usize>,
+    /// The panel's search field, which has the keyboard while it's open.
+    panel_input: Entity<TextInput>,
+    /// What had the keyboard before the panel opened, to give it back.
+    panel_return: Option<FocusHandle>,
+    panel_scroll: ScrollHandle,
     /// Set by a first Enter on an action that asks for confirmation (restart,
     /// shut down): that item's id and the action's index. Moving the selection
     /// or typing clears it.
@@ -314,10 +475,26 @@ pub struct Launcher {
     icons: HashMap<String, Arc<RenderImage>>,
     /// In-memory copy of the store's frecency table, updated on every launch.
     frecency: HashMap<String, Frecency>,
+    /// Whether root search ranks by frecency. Off, usage is still recorded.
+    rank_by_usage: bool,
+    /// Compact mode shows the favorites beside the search field and runs
+    /// them with Ctrl+1 to Ctrl+8.
+    compact_favorites: bool,
+    /// Where search engines chosen here (a quicklink's "Use as Web Search")
+    /// go, so the app applies and saves them as it does Settings' choice.
+    engines: Option<async_channel::Sender<SearchEngine>>,
     /// `None` when the database couldn't be opened; usage is then not remembered.
     store: Option<Arc<Mutex<Store>>>,
     /// Item id → the user's alias for it.
     aliases: HashMap<String, String>,
+    /// Ids of the items pinned to the top of root search, in order.
+    favorites: Vec<String>,
+    /// Where root search's sections start, by row, with their headings.
+    sections: Vec<(usize, SharedString)>,
+    /// Whether the footer shows timings and memory (`SPOTLIGHT_STATS=1`).
+    show_stats: bool,
+    /// The kinds of items root search doesn't list before anything is typed.
+    hidden_sections: Vec<HomeSection>,
     /// Item id → its registered hotkey.
     item_hotkeys: HashMap<String, Hotkey>,
     hotkeys: hotkey::Service,
@@ -336,8 +513,12 @@ pub struct Launcher {
     live_generation: u64,
     /// The window's scale as last seen, for icons that arrive later.
     window_scale: f32,
+    /// Rows whose site icon [`Self::load_site_icons`] already asked for.
+    asked_icons: HashSet<String>,
     /// What a root search starts with to search files ("*"); empty: off.
     file_prefix: String,
+    /// What a root search starts with to run a command (Run).
+    run_prefix: String,
     /// The files found for root search's text after the file prefix.
     prefix_rows: Vec<SearchItem>,
     visible: bool,
@@ -356,10 +537,15 @@ pub struct Launcher {
     selection_copy: bool,
     /// Expands snippet keywords typed in other apps; `None` until started.
     expander: Option<expander::Service>,
+    /// The window a snippet's keyword was typed in, while its form is open:
+    /// submitting it pastes there through the expander.
+    keyword_target: Option<isize>,
     /// Whether keywords expand, as set in Settings (Snippets must be on too).
     snippet_expansion: bool,
     /// The clipboard preview's image.
     preview_image: Option<PreviewImage>,
+    /// The QR code drawn in the open view.
+    qr_image: Option<QrImage>,
     /// Images no longer shown, freed on the next frame (it takes the window).
     stale_images: Vec<Arc<RenderImage>>,
     stats: Stats,
@@ -384,9 +570,17 @@ impl Launcher {
             other => panic!("expected a Win32 window handle, got {other:?}"),
         };
         win::round_corners(hwnd);
+        theme::set_system(theme::appearance_of(cx.window_appearance()));
+        win::set_border_color(hwnd, theme::p().window_border);
 
         let input = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
+        let panel_input = cx.new(|cx| TextInput::new("Search for actions…", cx));
         let subscriptions = vec![
+            cx.subscribe(&panel_input, |this, _, _: &text_input::Changed, cx| {
+                if this.panel.is_some() {
+                    this.select_panel_row(0, cx);
+                }
+            }),
             cx.subscribe_in(
                 &input,
                 window,
@@ -398,6 +592,10 @@ impl Launcher {
                 }
             }),
             cx.observe_self(Self::sync_window_height),
+            // Windows' light/dark setting changed.
+            cx.observe_window_appearance(window, |this, _, cx| {
+                this.follow_system(cx);
+            }),
         ];
 
         if synthetic > 0 {
@@ -418,6 +616,10 @@ impl Launcher {
             .as_ref()
             .and_then(|store| store.lock().ok()?.setting(links::TRUSTED_SETTING).ok()?)
             .map(|setting| links::parse_trusted(&setting).collect())
+            .unwrap_or_default();
+        let favorites = store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.favorites().ok())
             .unwrap_or_default();
         let (aliases, saved_hotkeys) = store
             .as_ref()
@@ -462,10 +664,15 @@ impl Launcher {
             hwnd,
             input,
             loading: 0,
+            games_loaded: Instant::now(),
+            running_apps: Vec::new(),
             search,
             results: Vec::new(),
             selected: 0,
             panel: None,
+            panel_input,
+            panel_return: None,
+            panel_scroll: ScrollHandle::new(),
             confirming: None,
             pending_link: None,
             trusted_links,
@@ -481,9 +688,16 @@ impl Launcher {
             },
             icons: HashMap::new(),
             frecency,
+            rank_by_usage: true,
+            compact_favorites: true,
+            engines: None,
             store,
             aliases,
             item_hotkeys,
+            favorites,
+            sections: Vec::new(),
+            show_stats: std::env::var_os("SPOTLIGHT_STATS").is_some(),
+            hidden_sections: Vec::new(),
             hotkeys,
             editor: None,
             screens: Vec::new(),
@@ -493,7 +707,9 @@ impl Launcher {
             live_cancel: None,
             live_generation: 0,
             window_scale: window.scale_factor(),
+            asked_icons: HashSet::new(),
             file_prefix: spotlight_core::file_search::DEFAULT_PREFIX.to_owned(),
+            run_prefix: spotlight_core::run::DEFAULT_PREFIX.to_owned(),
             prefix_rows: Vec::new(),
             visible: false,
             window_mode: WindowMode::default(),
@@ -503,8 +719,10 @@ impl Launcher {
             previous_window: 0,
             selection_copy: true,
             expander: None,
+            keyword_target: None,
             snippet_expansion: true,
             preview_image: None,
+            qr_image: None,
             stale_images: Vec::new(),
             stats: Stats {
                 hotkey,
@@ -607,7 +825,7 @@ impl Launcher {
         }
         let shell_icons: Vec<(String, String)> = items
             .iter()
-            .filter_map(|item| Some((item.id.clone(), shell_name(&item.icon)?)))
+            .filter_map(|item| Some((item.id.clone(), icon_source(&item.icon)?)))
             .collect();
 
         self.search.set_catalog(provider, items);
@@ -619,9 +837,31 @@ impl Launcher {
         cx.notify();
     }
 
-    /// Extracts shell icons in the background; rows switch from badges to icons
-    /// as they arrive. `items` holds (item id, shell parsing name) pairs; each
-    /// distinct icon is extracted once (every Settings page has the same one).
+    /// Sites' icons for rows this query brought that no catalog has (the
+    /// stock quicklink `!yt` opens): saved ones at once, the rest fetched.
+    /// Each is asked for once per run.
+    fn load_site_icons(&mut self, cx: &mut Context<Self>) {
+        let rows: Vec<(String, String)> = self
+            .results
+            .iter()
+            .filter_map(|row| match row {
+                Row::Computed(item) if matches!(item.icon, Icon::Site { .. }) => {
+                    Some((item.id.clone(), icon_source(&item.icon)?))
+                }
+                _ => None,
+            })
+            .collect();
+        let wanted: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|(id, _)| !self.icons.contains_key(id) && self.asked_icons.insert(id.clone()))
+            .collect();
+        self.load_icons(wanted, self.window_scale, cx);
+    }
+
+    /// Extracts shell icons and fetches sites' icons in the background; rows
+    /// switch from badges to icons as they arrive. `items` holds (item id,
+    /// [`icon_source`]) pairs; each distinct icon is loaded once (every
+    /// Settings page has the same one).
     fn load_icons(
         &mut self,
         items: Vec<(String, String)>,
@@ -644,15 +884,95 @@ impl Launcher {
         }
         // Sized for the monitor the window was created on; GPUI scales it if that changes.
         let size = (ICON_EXTRACT_SIZE * window_scale).ceil() as u32;
-        let (tx, rx) = async_channel::unbounded();
-        icons::spawn(names, size, tx);
 
+        // What an earlier run saved shows at once; only icons that are missing
+        // or old are extracted again, and those replace the saved ones.
+        let now = frecency::now();
+        let mut fresh = vec![false; names.len()];
+        let cached = self
+            .store
+            .as_ref()
+            .and_then(|store| store.lock().ok()?.icons(&names, size).ok())
+            .unwrap_or_default();
+        for saved in cached {
+            let Some(ix) = names.iter().position(|name| *name == saved.name) else {
+                continue;
+            };
+            fresh[ix] = now - saved.saved_at < ICON_REFRESH_SECS;
+            let icon = icons::Icon {
+                width: saved.width,
+                height: saved.height,
+                bgra: saved.bgra,
+            };
+            if let Some(image) = render_image(icon) {
+                for id in &ids[ix] {
+                    self.icons.insert(id.clone(), image.clone());
+                }
+            }
+        }
+        // Shell icons first: `icons::spawn` numbers them from 0, and sites
+        // are numbered after them.
+        let (shell, sites): (Vec<usize>, Vec<usize>) = (0..names.len())
+            .filter(|&ix| !fresh[ix])
+            .partition(|&ix| !names[ix].starts_with(SITE_ICON));
+        let wanted: Vec<usize> = shell.iter().chain(&sites).copied().collect();
+        eprintln!(
+            "[spotlight] icons: {} saved, {} to extract",
+            names.len() - wanted.len(),
+            wanted.len()
+        );
+        if wanted.is_empty() {
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded();
+        let site_keys = sites.iter().enumerate().map(|(k, &ix)| {
+            let origin = names[ix].trim_start_matches(SITE_ICON).to_owned();
+            (shell.len() + k, origin)
+        });
+        favicon::spawn(site_keys.collect(), size, tx.clone());
+        if !shell.is_empty() {
+            icons::spawn(
+                shell.iter().map(|&ix| names[ix].clone()).collect(),
+                size,
+                tx,
+            );
+        }
+
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             while let Ok(first) = rx.recv().await {
                 // Apply whatever else has arrived too, so the list re-renders once per batch.
                 let batch: Vec<_> = std::iter::once(first)
                     .chain(std::iter::from_fn(|| rx.try_recv().ok()))
+                    .map(|(wanted_ix, icon)| (wanted[wanted_ix], icon))
                     .collect();
+                let saved: Vec<CachedIcon> = batch
+                    .iter()
+                    .map(|(ix, icon)| CachedIcon {
+                        name: names[*ix].clone(),
+                        width: icon.width,
+                        height: icon.height,
+                        bgra: icon.bgra.clone(),
+                        saved_at: now,
+                    })
+                    .collect();
+                if let Some(store) = store.clone() {
+                    cx.background_executor()
+                        .spawn(async move {
+                            let result = store
+                                .lock()
+                                .map_err(|_| "store lock poisoned".to_owned())
+                                .and_then(|mut store| {
+                                    store
+                                        .save_icons(&saved, size, now)
+                                        .map_err(|e| e.to_string())
+                                });
+                            if let Err(err) = result {
+                                eprintln!("[spotlight] could not save icons: {err}");
+                            }
+                        })
+                        .detach();
+                }
                 let updated = this.update(cx, |this, cx| {
                     for (ix, icon) in batch {
                         if let Some(image) = render_image(icon) {
@@ -733,6 +1053,29 @@ impl Launcher {
         cx.notify();
     }
 
+    pub fn set_engine_sender(&mut self, engines: async_channel::Sender<SearchEngine>) {
+        self.engines = Some(engines);
+    }
+
+    pub fn set_compact_favorites(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.compact_favorites = enabled;
+        cx.notify();
+    }
+
+    pub fn set_rank_by_usage(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.rank_by_usage = enabled;
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+    }
+
+    pub fn set_hidden_sections(&mut self, hidden: Vec<HomeSection>, cx: &mut Context<Self>) {
+        self.hidden_sections = hidden;
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+    }
+
     pub fn set_window_mode(&mut self, mode: WindowMode, cx: &mut Context<Self>) {
         self.window_mode = mode;
         if !self.visible && self.hud.is_none() {
@@ -805,11 +1148,14 @@ impl Launcher {
     fn refilter(&mut self, query: &str) -> f64 {
         let started = Instant::now();
         let now = frecency::now();
+        let home = (self.screens.is_empty() && query.trim().is_empty()).then(|| self.home());
+        let mut split = None;
         let Self {
             screens,
             list_searcher,
             search,
             frecency,
+            rank_by_usage,
             aliases,
             ..
         } = self;
@@ -820,7 +1166,20 @@ impl Launcher {
                 .position(|provider| provider.id() == FILES_PROVIDER)
                 .is_some_and(|ix| search.is_enabled(ix))
         });
+        // After Run's prefix, only Run: what's typed and the past commands.
+        let run = spotlight_core::run::after_prefix(&self.run_prefix, query).and_then(|_| {
+            let ix = search
+                .providers()
+                .iter()
+                .position(|provider| provider.id() == RUN_PROVIDER)?;
+            search
+                .is_enabled(ix)
+                .then(|| search.providers()[ix].clone())
+        });
         self.results = match screens.last() {
+            None if let Some(run) = run => {
+                run.answers(query).into_iter().map(Row::Computed).collect()
+            }
             // Files only, from the files provider (see `search_prefix`), and
             // a row to go on in Search Files: first while nothing follows
             // the prefix, so Enter opens it.
@@ -833,11 +1192,19 @@ impl Launcher {
                     found.chain(std::iter::once(open)).collect()
                 }
             }
-            None => search.search(
-                query,
-                |id| frecency.get(id).map_or(0., |used| used.score_at(now)),
-                aliases,
-            ),
+            None if let Some((rows, _)) = &home => rows.clone(),
+            None => {
+                let rows = search.search(
+                    query,
+                    |id| match frecency.get(id) {
+                        Some(used) if *rank_by_usage => used.score_at(now),
+                        _ => 0.,
+                    },
+                    aliases,
+                );
+                split = Some(search.last_split());
+                rows
+            }
             // The provider ranked them for this query (or is about to).
             Some(Screen::List { view, .. }) if view.live => view
                 .items
@@ -867,6 +1234,11 @@ impl Launcher {
             }
             Some(_) => Vec::new(),
         };
+        self.sections = match (home, split) {
+            (Some((_, sections)), _) => sections,
+            (None, Some(split)) => self.result_sections(split, query),
+            _ => Vec::new(),
+        };
         self.selected = 0;
         self.panel = None;
         self.confirming = None;
@@ -874,32 +1246,176 @@ impl Launcher {
         ms(started.elapsed())
     }
 
+    /// Root search before anything is typed: the favorites, the items used
+    /// most lately (with Rank by Usage on), then everything else by kind,
+    /// each under its heading.
+    fn home(&self) -> (Vec<Row>, Vec<(usize, SharedString)>) {
+        let catalog = self.search.catalog();
+        let index = |id: &str| catalog.iter().position(|item| item.id == id);
+        let mut rows: Vec<usize> = Vec::new();
+        let mut sections = Vec::new();
+        let mut section = |title: &str, found: Vec<usize>, rows: &mut Vec<usize>| {
+            if !found.is_empty() {
+                sections.push((rows.len(), SharedString::from(title.to_owned())));
+                rows.extend(found);
+            }
+        };
+        let favorites: Vec<usize> = self.favorites.iter().filter_map(|id| index(id)).collect();
+        section("Favorites", favorites, &mut rows);
+        let now = frecency::now();
+        let mut used: Vec<(f64, usize)> = catalog
+            .iter()
+            .enumerate()
+            .filter(|_| self.rank_by_usage)
+            .filter(|(ix, _)| !rows.contains(ix))
+            .filter_map(|(ix, item)| {
+                let score = self.frecency.get(&item.id)?.score_at(now);
+                (score > 0.).then_some((score, ix))
+            })
+            .collect();
+        used.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let suggested = used
+            .into_iter()
+            .take(SUGGESTIONS)
+            .map(|(_, ix)| ix)
+            .collect();
+        section("Suggestions", suggested, &mut rows);
+        let mut kinds = vec![Vec::new(); HomeSection::ALL.len()];
+        for (ix, item) in catalog.iter().enumerate() {
+            if !rows.contains(&ix) {
+                kinds[HomeSection::of(&item.id) as usize].push(ix);
+            }
+        }
+        for (kind, mut found) in HomeSection::ALL.into_iter().zip(kinds) {
+            if self.hidden_sections.contains(&kind) {
+                continue;
+            }
+            found.sort_by_cached_key(|&ix| catalog[ix].title.to_lowercase());
+            section(kind.title(), found, &mut rows);
+        }
+        (rows.into_iter().map(Row::Catalog).collect(), sections)
+    }
+
+    /// The headings of a search's rows: what its answers are (Calculator),
+    /// "Results", then what the fallbacks do with the query.
+    fn result_sections(&self, split: Split, query: &str) -> Vec<(usize, SharedString)> {
+        let mut sections = Vec::new();
+        if split.answers > 0 {
+            let title = self
+                .results
+                .first()
+                .map(|row| answers_heading(&self.item(row).id))
+                .unwrap_or("Answers");
+            sections.push((0, SharedString::from(title)));
+        }
+        if split.matches > 0 {
+            sections.push((split.answers, "Results".into()));
+        }
+        if split.fallbacks > 0 {
+            sections.push((
+                split.answers + split.matches,
+                format!("Use “{}” with…", query.trim()).into(),
+            ));
+        }
+        sections
+    }
+
+    /// The row drawn as an answer card: root search's first, when it has one
+    /// (the calculator's answer).
+    fn card_row(&self) -> Option<usize> {
+        let first = self.results.first()?;
+        (self.screens.is_empty() && self.item(first).card.is_some()).then_some(0)
+    }
+
+    /// Where row `row` is in the list, with the section headings and the
+    /// card's extra lines counted.
+    fn line_of(&self, row: usize) -> usize {
+        let after_card = self.card_row().is_some_and(|card| row > card);
+        self.plain_line_of(row) + if after_card { CARD_LINES - 1 } else { 0 }
+    }
+
+    fn plain_line_of(&self, row: usize) -> usize {
+        row + self
+            .sections
+            .iter()
+            .filter(|(start, _)| *start <= row)
+            .count()
+    }
+
+    fn line_count(&self) -> usize {
+        let card = if self.card_row().is_some() {
+            CARD_LINES - 1
+        } else {
+            0
+        };
+        self.results.len() + self.sections.len() + card
+    }
+
+    /// What line `line` of the list shows: a heading, a row, or the rest of
+    /// the card.
+    fn line_at(&self, line: usize) -> Line {
+        if let Some(row) = self.card_row() {
+            let card = self.plain_line_of(row);
+            if line > card && line < card + CARD_LINES {
+                return Line::CardRest(row, line - card);
+            }
+            if line >= card + CARD_LINES {
+                return self.plain_line_at(line - (CARD_LINES - 1));
+            }
+        }
+        self.plain_line_at(line)
+    }
+
+    fn plain_line_at(&self, line: usize) -> Line {
+        for (ix, (start, title)) in self.sections.iter().enumerate() {
+            let heading = start + ix;
+            if line < heading {
+                return Line::Row(line - ix);
+            }
+            if line == heading {
+                return Line::Heading(title.clone());
+            }
+        }
+        Line::Row(line - self.sections.len())
+    }
+
+    /// Scrolls so the selected row shows, with its heading when it starts a
+    /// section.
+    fn reveal_selected(&mut self) {
+        let line = self.line_of(self.selected);
+        let count = self.line_count();
+        let heading = self
+            .sections
+            .iter()
+            .any(|(start, _)| *start == self.selected);
+        if heading {
+            self.scroll.reveal(line - 1, count);
+        }
+        if self.card_row() == Some(self.selected) {
+            self.scroll.reveal(line + CARD_LINES - 1, count);
+        }
+        self.scroll.reveal(line, count);
+    }
+
     /// The item's actions, then the ones the launcher adds to catalog items.
     /// Computed rows (calculator, web) change with the query, so they can't
     /// keep an alias, a hotkey or a ranking.
     fn actions_for(&self, row: &Row) -> Vec<Entry> {
         let item = self.item(row);
-        let mut entries: Vec<Entry> = item
-            .actions
-            .iter()
-            .map(|action| Entry {
-                title: action.title.clone(),
-                kind: EntryKind::Command(action.command.clone()),
-            })
-            .collect();
+        let mut entries: Vec<Entry> = item.actions.iter().map(Entry::of).collect();
         if let Some(id) = item
             .id
             .strip_prefix(HISTORY_ITEM)
             .and_then(|id| id.parse().ok())
         {
-            entries.push(Entry {
-                title: "Delete Entry".into(),
-                kind: EntryKind::DeleteCalculation(id),
-            });
-            entries.push(Entry {
-                title: "Clear History".into(),
-                kind: EntryKind::ClearCalculations,
-            });
+            entries.push(
+                Entry::new("Delete Entry", EntryKind::DeleteCalculation(id))
+                    .with_shortcut(shortcut::CLEAR),
+            );
+            entries.push(
+                Entry::new("Clear History", EntryKind::ClearCalculations)
+                    .with_shortcut(shortcut::CLEAR_ALL),
+            );
             return entries;
         }
         if !matches!(row, Row::Catalog(_)) || item.actions.is_empty() {
@@ -907,42 +1423,89 @@ impl Launcher {
         }
         if self.link_pending_for(&item.id) {
             return vec![
-                Entry {
-                    title: "Open Command".into(),
-                    kind: EntryKind::OpenLink { always: false },
-                },
-                Entry {
-                    title: "Always Open Command".into(),
-                    kind: EntryKind::OpenLink { always: true },
-                },
+                Entry::new("Open Command", EntryKind::OpenLink { always: false }),
+                Entry::new("Always Open Command", EntryKind::OpenLink { always: true }),
             ];
         }
-        let mut add = |title: &str, kind| {
-            entries.push(Entry {
-                title: title.to_owned(),
-                kind,
-            })
-        };
+        if let Some(app) = self.running_app(item) {
+            entries.push(Entry::new(
+                "Quit Application",
+                EntryKind::Command(Command::QuitApp(app.pid)),
+            ));
+            entries.push(Entry::new(
+                "Force Quit Application",
+                EntryKind::Command(Command::ForceQuit(app.pid)),
+            ));
+        }
+        let favorite = self.favorites.iter().position(|id| *id == item.id);
+        let mut add = |entry: Entry| entries.push(entry);
+        match favorite {
+            Some(ix) => {
+                add(
+                    Entry::new("Remove from Favorites", EntryKind::ToggleFavorite)
+                        .with_shortcut(shortcut::FAVORITE),
+                );
+                if ix > 0 {
+                    add(Entry::new(
+                        "Move Up in Favorites",
+                        EntryKind::MoveFavorite(-1),
+                    ));
+                }
+                if ix + 1 < self.favorites.len() {
+                    add(Entry::new(
+                        "Move Down in Favorites",
+                        EntryKind::MoveFavorite(1),
+                    ));
+                }
+            }
+            None => add(Entry::new("Add to Favorites", EntryKind::ToggleFavorite)
+                .with_shortcut(shortcut::FAVORITE)),
+        }
         if self.aliases.contains_key(&item.id) {
-            add("Change Alias…", EntryKind::EditAlias);
-            add("Remove Alias", EntryKind::RemoveAlias);
+            add(Entry::new("Change Alias…", EntryKind::EditAlias));
+            add(Entry::new("Remove Alias", EntryKind::RemoveAlias));
         } else {
-            add("Set Alias…", EntryKind::EditAlias);
+            add(Entry::new("Set Alias…", EntryKind::EditAlias));
         }
         if self.item_hotkeys.contains_key(&item.id) {
-            add("Change Hotkey…", EntryKind::RecordHotkey);
-            add("Remove Hotkey", EntryKind::RemoveHotkey);
+            add(Entry::new("Change Hotkey…", EntryKind::RecordHotkey));
+            add(Entry::new("Remove Hotkey", EntryKind::RemoveHotkey));
         } else {
-            add("Set Hotkey…", EntryKind::RecordHotkey);
+            add(Entry::new("Set Hotkey…", EntryKind::RecordHotkey));
         }
         if self.frecency.contains_key(&item.id) {
-            add("Reset Ranking", EntryKind::ResetRanking);
+            add(Entry::new("Reset Ranking", EntryKind::ResetRanking));
         }
-        add("Copy Deeplink", EntryKind::CopyDeeplink);
+        add(Entry::new("Copy Deeplink", EntryKind::CopyDeeplink)
+            .with_shortcut(shortcut::COPY_DEEPLINK));
         if self.trusted_links.contains(&item.id) {
-            add("Ask Before Opening from Links", EntryKind::DistrustLink);
+            add(Entry::new(
+                "Ask Before Opening from Links",
+                EntryKind::DistrustLink,
+            ));
         }
         entries
+    }
+
+    /// The running app an installed app's row stands for: by its packaged
+    /// app id, or by its program's path.
+    fn running_app(&self, item: &SearchItem) -> Option<&RunningApp> {
+        let launch_id = item.id.strip_prefix(APPS_PROVIDER)?.strip_prefix(':')?;
+        let path = item
+            .actions
+            .iter()
+            .find_map(|action| match &action.command {
+                Command::ShowInFolder(path) => Some(path.as_str()),
+                _ => None,
+            });
+        self.running_apps.iter().find(|app| {
+            app.aumid.as_deref() == Some(launch_id)
+                || path.is_some_and(|path| {
+                    app.exe
+                        .as_deref()
+                        .is_some_and(|exe| exe.eq_ignore_ascii_case(path))
+                })
+        })
     }
 
     fn item<'a>(&'a self, row: &'a Row) -> &'a SearchItem {
@@ -961,6 +1524,7 @@ impl Launcher {
         self.search_live(cx);
         self.search_prefix(cx);
         let filter_ms = self.refilter(&query);
+        self.load_site_icons(cx);
         self.stats.filter_ms = Some(filter_ms);
         self.stats.filter_samples.push(filter_ms);
         self.stats.paint.borrow_mut().arm(changed_at, Probe::Key);
@@ -968,11 +1532,12 @@ impl Launcher {
     }
 
     /// Self-test: types text through the same IME entry point the platform uses.
-    /// Types into the field that has the keyboard: the alias editor's while
-    /// it's open, or a form's focused text field.
+    /// Types into the field that has the keyboard: the alias editor's or the
+    /// action panel's while open, or a form's focused text field.
     pub fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let input = match &self.editor {
             Some(Editor::Alias { input, .. }) => input.clone(),
+            _ if self.panel.is_some() => self.panel_input.clone(),
             _ => self
                 .focused_form_input(window, cx)
                 .unwrap_or_else(|| self.input.clone()),
@@ -983,12 +1548,12 @@ impl Launcher {
     }
 
     /// The action selected in the open panel. For the self-test.
-    pub fn panel_selected(&self) -> Option<String> {
-        let selected = self.panel?;
-        self.selected_actions()
+    pub fn panel_selected(&self, cx: &App) -> Option<String> {
+        let row = self.panel?;
+        self.panel_entries(cx)
             .into_iter()
-            .nth(selected)
-            .map(|entry| entry.title)
+            .nth(row)
+            .map(|(_, entry)| entry.title)
     }
 
     /// Whether the alias editor is open. For the self-test.
@@ -1006,14 +1571,14 @@ impl Launcher {
         self.loading == 0
     }
 
-    /// Action titles in the open action panel, or `None` when it's closed.
-    /// For the self-test.
-    pub fn panel_actions(&self) -> Option<Vec<String>> {
+    /// Action titles in the open action panel (those its search keeps), or
+    /// `None` when it's closed. For the self-test.
+    pub fn panel_actions(&self, cx: &App) -> Option<Vec<String>> {
         self.panel?;
         Some(
-            self.selected_actions()
+            self.panel_entries(cx)
                 .into_iter()
-                .map(|action| action.title)
+                .map(|(_, entry)| entry.title)
                 .collect(),
         )
     }
@@ -1025,6 +1590,14 @@ impl Launcher {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// Headings of root search's sections, top first. For the self-test.
+    pub fn section_titles(&self) -> Vec<String> {
+        self.sections
+            .iter()
+            .map(|(_, title)| title.to_string())
+            .collect()
     }
 
     /// Titles of the current results, top first. For the self-test.
@@ -1063,12 +1636,45 @@ impl Launcher {
         self.previous_window
     }
 
+    /// Redraws with the current theme: the window's outline is Windows' to
+    /// draw, so it is set again; everything else is read as it's drawn.
+    pub fn theme_changed(&mut self, cx: &mut Context<Self>) {
+        win::set_border_color(self.hwnd, theme::p().window_border);
+        cx.notify();
+    }
+
+    /// Takes the system's light or dark setting as it is now, in case a change
+    /// was missed while hidden. Returns whether the theme changed.
+    pub fn follow_system(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = theme::set_system(theme::appearance_of(cx.window_appearance()));
+        if changed {
+            self.theme_changed(cx);
+            cx.refresh_windows();
+        }
+        changed
+    }
+
     pub fn show(&mut self, pressed_at: Instant, window: &mut Window, cx: &mut Context<Self>) {
+        self.follow_system(cx);
         let foreground = system_clipboard::foreground_window();
         if foreground != self.hwnd {
             self.previous_window = foreground;
         }
         self.hud = None;
+        if self.games_loaded.elapsed() >= GAMES_REFRESH {
+            self.games_loaded = Instant::now();
+            self.reload_catalog("games", window.scale_factor(), cx);
+        }
+        let running = cx.background_executor().spawn(async { wm::running_apps() });
+        cx.spawn(async move |this, cx| {
+            let running = running.await;
+            this.update(cx, |this, cx| {
+                this.running_apps = running;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         if !self.screens.is_empty() {
             self.screens.clear();
             self.input.update(cx, |input, cx| {
@@ -1112,8 +1718,10 @@ impl Launcher {
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.pending_link = None;
+        self.keyword_target = None;
         self.close_editor(None, cx);
         self.forget_preview_image();
+        self.forget_qr_image();
         win::hide(self.hwnd);
         self.visible = false;
         self.prepare_next_show(cx);
@@ -1121,11 +1729,9 @@ impl Launcher {
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(action) = self.panel {
-            let count = self.selected_actions().len();
-            self.panel = Some((action + 1).min(count.saturating_sub(1)));
-            cx.notify();
-            return;
+        if let Some(row) = self.panel {
+            let count = self.panel_entries(cx).len();
+            return self.select_panel_row((row + 1).min(count.saturating_sub(1)), cx);
         }
         if self.collapsed(cx) {
             self.revealed = true;
@@ -1141,16 +1747,14 @@ impl Launcher {
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
             self.confirming = None;
-            self.scroll.reveal(self.selected, self.results.len());
+            self.reveal_selected();
             cx.notify();
         }
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(action) = self.panel {
-            self.panel = Some(action.saturating_sub(1));
-            cx.notify();
-            return;
+        if let Some(row) = self.panel {
+            return self.select_panel_row(row.saturating_sub(1), cx);
         }
         if self.in_grid() {
             return self.grid_move(-(GRID_COLUMNS as isize), cx);
@@ -1161,7 +1765,7 @@ impl Launcher {
         if self.selected > 0 {
             self.selected -= 1;
             self.confirming = None;
-            self.scroll.reveal(self.selected, self.results.len());
+            self.reveal_selected();
             cx.notify();
         }
     }
@@ -1170,19 +1774,64 @@ impl Launcher {
     /// or a detail view's own.
     fn selected_actions(&self) -> Vec<Entry> {
         if let Some(Screen::Detail { view, .. }) = self.screens.last() {
-            return view
-                .actions
-                .iter()
-                .map(|action| Entry {
-                    title: action.title.clone(),
-                    kind: EntryKind::Command(action.command.clone()),
-                })
-                .collect();
+            return view.actions.iter().map(Entry::of).collect();
         }
         self.results
             .get(self.selected)
             .map(|row| self.actions_for(row))
             .unwrap_or_default()
+    }
+
+    /// The selected actions the panel's search keeps, each with its index
+    /// among them all (what [`Self::run_action`] takes).
+    fn panel_entries(&self, cx: &App) -> Vec<(usize, Entry)> {
+        let query = self.panel_input.read(cx).text().to_lowercase();
+        self.selected_actions()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, entry)| matches_words(&entry.title, &query))
+            .collect()
+    }
+
+    /// The action of the panel row selected, as an index among them all;
+    /// `None` when the panel is closed or its search kept nothing.
+    fn panel_action(&self, cx: &App) -> Option<usize> {
+        let row = self.panel?;
+        self.panel_entries(cx).get(row).map(|&(ix, _)| ix)
+    }
+
+    fn select_panel_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.panel = Some(row);
+        self.panel_scroll.scroll_to_item(row);
+        cx.notify();
+    }
+
+    /// Runs the action whose own keys were pressed, panel open or not: the
+    /// launcher's bindings (Enter, Ctrl+K…) and the search field's got the
+    /// keystroke first and passed on it.
+    fn run_shortcut(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_some() {
+            return;
+        }
+        let pressed = &event.keystroke;
+        if self.run_quick_favorite(pressed, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.collapsed(cx) {
+            return;
+        }
+        let entries = self.selected_actions();
+        let Some(ix) = own_keys(&entries).iter().position(|keys| {
+            keys.as_deref()
+                .and_then(|keys| Keystroke::parse(keys).ok())
+                .is_some_and(|keys| keys.modifiers == pressed.modifiers && keys.key == pressed.key)
+        }) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.panel = None;
+        self.run_action(ix, window, cx);
     }
 
     // ←/→ that the search field passes on in a grid.
@@ -1201,6 +1850,9 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.panel.is_some() {
+            return;
+        }
         // After the file prefix, Tab goes on in Search Files.
         if self.screens.is_empty() {
             let query = self.query(cx);
@@ -1220,7 +1872,7 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.step_filter(false, cx) {
+        if self.panel.is_none() && !self.step_filter(false, cx) {
             self.focus_field(false, window, cx);
         }
     }
@@ -1250,10 +1902,14 @@ impl Launcher {
             Some(Editor::Hotkey { .. }) => return,
             None => {}
         }
+        // The panel's search kept nothing: nothing to run.
+        if self.panel.is_some() && self.panel_action(cx).is_none() {
+            return;
+        }
         match self.screens.last() {
             Some(Screen::Form(_)) if self.panel.is_none() => return self.submit_form(window, cx),
             Some(Screen::Detail { .. }) => {
-                let action = self.panel.unwrap_or(0);
+                let action = self.panel_action(cx).unwrap_or(0);
                 return self.run_action(action, window, cx);
             }
             _ => {}
@@ -1267,7 +1923,7 @@ impl Launcher {
                     .is_some_and(|row| &self.item(row).id == id)
             })
             .map(|&(_, action)| action);
-        let action = self.panel.or(waiting).unwrap_or(0);
+        let action = self.panel_action(cx).or(waiting).unwrap_or(0);
         if self.selected_actions().is_empty() {
             self.hide(cx);
         } else {
@@ -1294,16 +1950,18 @@ impl Launcher {
         self.run_action(1, window, cx);
     }
 
-    fn toggle_actions(&mut self, _: &ToggleActions, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_actions(&mut self, _: &ToggleActions, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor.is_some() {
             return;
         }
-        self.panel = match self.panel {
-            Some(_) => None,
-            None if !self.selected_actions().is_empty() => Some(0),
-            None => None,
-        };
         self.confirming = None;
+        if self.panel.take().is_none() && !self.selected_actions().is_empty() {
+            self.panel_input.update(cx, |input, cx| input.clear(cx));
+            self.panel_return = window.focused(cx);
+            window.focus(&self.panel_input.focus_handle(cx));
+            self.select_panel_row(0, cx);
+        }
+        // Closing gives the keyboard back in `render`.
         cx.notify();
     }
 
@@ -1369,6 +2027,8 @@ impl Launcher {
             }
             EntryKind::ClearCalculations => return self.clear_calculations(cx),
             EntryKind::OpenLink { always } => return self.open_pending_link(always, window, cx),
+            EntryKind::ToggleFavorite => return self.toggle_favorite(&id, &title, cx),
+            EntryKind::MoveFavorite(step) => return self.move_favorite(&id, step, cx),
             EntryKind::CopyDeeplink => {
                 return self.run_command(&Command::Copy(deeplink::for_item(&id)), cx);
             }
@@ -1396,6 +2056,7 @@ impl Launcher {
             command,
             Command::SaveQuicklink(_)
                 | Command::DeleteQuicklink(_)
+                | Command::SetSearchEngine { .. }
                 | Command::SaveSnippet(_)
                 | Command::DeleteSnippet(_)
                 | Command::Complete(_)
@@ -1416,8 +2077,24 @@ impl Launcher {
 
     /// Opens a view, or carries out the command and hides the window.
     fn perform(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        if let Command::Window {
+            target,
+            command: ask @ (WindowCommand::AskPosition | WindowCommand::AskSize),
+        } = command
+        {
+            let target = target.unwrap_or(self.previous_window);
+            return self.ask_window_frame(target, *ask == WindowCommand::AskSize, window, cx);
+        }
+        // The user's own quicklink to one of our commands: run here, trusted.
+        if let Command::OpenQuicklink { link, .. } = command
+            && deeplink::parse(link).is_ok()
+            && !command.needs_selection()
+            && !command.needs_clipboard()
+        {
+            return self.open_own_link(link, window, cx);
+        }
         if command.needs_selection() {
-            return self.run_with_selection(command.clone(), cx);
+            return self.run_with_selection(command.clone(), window, cx);
         }
         match command {
             Command::PushView(view) => self.push_view((**view).clone(), window, cx),
@@ -1429,6 +2106,18 @@ impl Launcher {
             Command::PasteSnippet { text, paste } => self.paste_snippet(text, *paste, cx),
             Command::ImportSnippets => self.import_snippets(cx),
             Command::ExportSnippets => self.export_snippets(cx),
+            Command::ImportSnippetsJson(json) => {
+                let message = self.import_snippets_json(json);
+                self.hide(cx);
+                self.show_hud(message.into(), cx);
+            }
+            Command::ImportQuicklinks => self.import_quicklinks(cx),
+            Command::ExportQuicklinks => self.export_quicklinks(cx),
+            Command::ImportQuicklinksJson(json) => {
+                let message = self.import_quicklinks_json(json, cx);
+                self.hide(cx);
+                self.show_hud(message.into(), cx);
+            }
             Command::OpenProviderView { provider, view } => {
                 self.open_provider_view(provider, view, window, cx)
             }
@@ -1449,11 +2138,21 @@ impl Launcher {
                 action,
                 item,
             } => self.provider_action(provider, action, item, cx),
-            Command::RestoreClip { id, paste } => self.restore_clip(*id, *paste, cx),
+            Command::RestoreClip { id, paste, plain } => self.restore_clip(*id, *paste, *plain, cx),
             Command::PinClip { id, pinned } => self.pin_clip(*id, *pinned, window, cx),
             Command::DeleteClip(id) => self.delete_clip(*id, window, cx),
             Command::ClearClipboardHistory => self.clear_clips(window, cx),
             Command::IgnoreClipApp(app) => self.ignore_clip_app(app.clone(), cx),
+            Command::ShowQrCode(text) => self.show_qr_code(text, window, cx),
+            Command::CopyQrCode(text) => self.copy_qr_code(text, cx),
+            Command::SaveQrCode(text) => self.save_qr_code(text, cx),
+            Command::ScanQrCodes(source) => self.scan_qr_codes(*source, window, cx),
+            Command::SetSearchEngine { engine, name } => {
+                if let Some(engines) = &self.engines {
+                    engines.try_send(engine.clone()).ok();
+                }
+                self.show_toast(format!("Web search uses “{name}” from now on").into(), cx);
+            }
             command => self.run_command(command, cx),
         }
     }
@@ -1519,6 +2218,11 @@ impl Launcher {
                 this.show_toast(message.into(), cx);
                 this.search_live(cx);
                 this.search_prefix(cx);
+                // Rows computed from the query (Run's history) change too.
+                if this.screens.is_empty() {
+                    let query = this.query(cx);
+                    this.refilter(&query);
+                }
             })
             .ok();
         })
@@ -1539,11 +2243,21 @@ impl Launcher {
     /// result would otherwise be invisible.
     fn run_command(&mut self, command: &Command, cx: &mut Context<Self>) {
         let mut hud: Option<SharedString> = None;
+        if let Command::QuitApp(pid) | Command::ForceQuit(pid) = command {
+            self.running_apps.retain(|app| app.pid != *pid);
+        }
+        // From Switch Windows or the process list: the list stays open,
+        // without the window (or the app's windows) that went.
+        if self.drop_rows_of(command, cx) {
+            return self.run_in_list(command.clone(), cx);
+        }
         match command {
             Command::Copy(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 hud = Some("Copied to Clipboard".into());
             }
+            // After its `{selection}` was read.
+            Command::PasteSnippet { text, paste } => return self.paste_snippet(text, *paste, cx),
             Command::CopyFile(path) => {
                 let content = system_clipboard::Content::Files(vec![path.clone()]);
                 hud = Some(match system_clipboard::write(self.hwnd, &content) {
@@ -1564,6 +2278,14 @@ impl Launcher {
                     cx,
                 );
             }
+            // Read here, before anything the command runs can change it.
+            command if command.needs_clipboard() => {
+                let text = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                self.run_in_background(command.with_clipboard(&text), cx);
+            }
             command => self.run_in_background(command.clone(), cx),
         }
         self.hide(cx);
@@ -1575,7 +2297,12 @@ impl Launcher {
     /// Reads the text selected in the app the launcher came from, then runs
     /// `command` with it. The launcher hides first: the app has to be in
     /// front for its selection to be read.
-    fn run_with_selection(&mut self, command: Command, cx: &mut Context<Self>) {
+    fn run_with_selection(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let provider = self
             .search
             .providers()
@@ -1588,13 +2315,22 @@ impl Launcher {
         }
         let outcome = selection::spawn(self.previous_window, self.hwnd, self.selection_copy);
         self.hide(cx);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let outcome = outcome
                 .recv()
                 .await
                 .unwrap_or_else(|_| Err("Couldn't read the selection".into()));
-            this.update(cx, |this, cx| match outcome {
+            this.update_in(cx, |this, window, cx| match outcome {
+                // A QR code of it opens in the launcher.
+                Ok(Some(text)) if matches!(command, Command::ShowQrCode(_)) => {
+                    this.show(Instant::now(), window, cx);
+                    this.show_qr_code(&text, window, cx);
+                }
                 Ok(Some(text)) => this.run_command(&command.with_selection(&text), cx),
+                // A snippet still pastes, with nothing where the selection goes.
+                Ok(None) if matches!(command, Command::PasteSnippet { .. }) => {
+                    this.run_command(&command.with_selection(""), cx)
+                }
                 Ok(None) => this.show_hud("No text selected".into(), cx),
                 Err(err) => this.show_hud(err.into(), cx),
             })
@@ -1607,6 +2343,77 @@ impl Launcher {
     /// What a root search starts with to search files; empty turns it off.
     pub fn set_file_prefix(&mut self, prefix: String) {
         self.file_prefix = prefix;
+    }
+
+    /// What a root search starts with to run a command; empty turns it off.
+    pub fn set_run_prefix(&mut self, prefix: String) {
+        self.run_prefix = prefix;
+    }
+
+    /// What the search field's right end says while a prefix is typed:
+    /// where it goes, and the key that goes on there.
+    fn prefix_hint(&self, cx: &App) -> Option<(SharedString, Option<&'static str>)> {
+        if !self.screens.is_empty() {
+            return None;
+        }
+        let query = self.query(cx);
+        if file_query(&self.file_prefix, &query).is_some() {
+            return Some(("Search Files".into(), Some("Tab")));
+        }
+        spotlight_core::run::after_prefix(&self.run_prefix, &query).map(|_| ("Run".into(), None))
+    }
+
+    /// Adds item `id` to the favorites, or takes it out.
+    fn toggle_favorite(&mut self, id: &str, title: &str, cx: &mut Context<Self>) {
+        let message = if let Some(ix) = self.favorites.iter().position(|known| known == id) {
+            self.favorites.remove(ix);
+            format!("Removed {title} from Favorites")
+        } else {
+            self.favorites.push(id.to_owned());
+            format!("Added {title} to Favorites")
+        };
+        self.favorites_changed(cx);
+        self.show_toast(message.into(), cx);
+    }
+
+    /// Moves favorite `id` up (`step` -1) or down (1) among the favorites.
+    fn move_favorite(&mut self, id: &str, step: isize, cx: &mut Context<Self>) {
+        let Some(ix) = self.favorites.iter().position(|known| known == id) else {
+            return;
+        };
+        let to = ix as isize + step;
+        if to < 0 || to as usize >= self.favorites.len() {
+            return;
+        }
+        self.favorites.swap(ix, to as usize);
+        self.favorites_changed(cx);
+        // The moved item stays selected in its new place.
+        if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
+            self.selected = row;
+            self.reveal_selected();
+        }
+    }
+
+    /// The favorites' item ids, in order.
+    pub fn favorites(&self) -> Vec<String> {
+        self.favorites.clone()
+    }
+
+    /// Makes `ids` the favorites, and saves them.
+    pub fn set_favorites(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        self.favorites = ids;
+        self.favorites_changed(cx);
+    }
+
+    /// Saves the favorites and shows them in their new order.
+    fn favorites_changed(&mut self, cx: &mut Context<Self>) {
+        let ids = self.favorites.clone();
+        self.persist(cx, move |store| store.set_favorites(&ids));
+        let selected = self.selected;
+        let query = self.query(cx);
+        self.refilter(&query);
+        self.selected = selected.min(self.results.len().saturating_sub(1));
+        cx.notify();
     }
 
     pub fn set_selection_copy(&mut self, enabled: bool) {
@@ -1641,6 +2448,135 @@ impl Launcher {
         .detach();
     }
 
+    /// The form Move Window… (or Resize Window…, `size`) opens: the window's
+    /// position (or size) now, to change.
+    fn ask_window_frame(
+        &mut self,
+        target: isize,
+        size: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(now) = wm::position(target) else {
+            self.hide(cx);
+            return self.show_hud("No app window is active".into(), cx);
+        };
+        let field = |id: &str, label: &str, value: i32| Field {
+            id: id.into(),
+            label: label.into(),
+            kind: FieldKind::Text {
+                placeholder: format!("{value}"),
+                default: value.to_string(),
+                required: false,
+            },
+        };
+        let (title, fields) = if size {
+            (
+                "Resize Window",
+                vec![
+                    field("width", "Width", now.width),
+                    field("height", "Height", now.height),
+                ],
+            )
+        } else {
+            (
+                "Move Window",
+                vec![field("x", "X", now.x), field("y", "Y", now.y)],
+            )
+        };
+        let template = |id: &str| {
+            if fields.iter().any(|field| field.id == id) {
+                format!("{{{id}}}")
+            } else {
+                String::new()
+            }
+        };
+        let submit = Command::SetWindowFrame {
+            target,
+            x: template("x"),
+            y: template("y"),
+            width: template("width"),
+            height: template("height"),
+        };
+        let form = View::Form(FormView {
+            title: title.into(),
+            fields,
+            submit_title: if size { "Resize" } else { "Move" }.into(),
+            submit,
+        });
+        self.push_view(form, window, cx);
+    }
+
+    /// For a window closed or an app quit from an open list: takes the rows
+    /// it removes out of the list. `false` (nothing changed) for any other
+    /// command, or when no row of the list is about it.
+    fn drop_rows_of(&mut self, command: &Command, cx: &mut Context<Self>) -> bool {
+        let gone = |item: &SearchItem| {
+            item.actions
+                .iter()
+                .any(|action| match (command, &action.command) {
+                    (
+                        Command::Window {
+                            target: Some(closed),
+                            command: WindowCommand::Close,
+                        },
+                        Command::Window {
+                            target: Some(target),
+                            ..
+                        },
+                    ) => closed == target,
+                    (
+                        Command::QuitApp(quit) | Command::ForceQuit(quit),
+                        Command::QuitApp(pid) | Command::ForceQuit(pid),
+                    ) => quit == pid,
+                    _ => false,
+                })
+        };
+        let closes = matches!(
+            command,
+            Command::Window {
+                target: Some(_),
+                command: WindowCommand::Close,
+            } | Command::QuitApp(_)
+                | Command::ForceQuit(_)
+        );
+        let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
+            return false;
+        };
+        if !closes || !view.items.iter().any(gone) {
+            return false;
+        }
+        view.items.retain(|item| !gone(item));
+        let query = self.query(cx);
+        self.refilter(&query);
+        cx.notify();
+        true
+    }
+
+    /// Runs `command` in the background with the launcher kept open; what it
+    /// reports ("Ended Notepad", or why it failed) goes in the footer.
+    fn run_in_list(&mut self, command: Command, cx: &mut Context<Self>) {
+        let outcome = commands::spawn(command);
+        cx.spawn(async move |this, cx| {
+            let Ok(outcome) = outcome.recv().await else {
+                return;
+            };
+            let text = match outcome {
+                Ok(Some(text)) | Err(text) => text,
+                Ok(None) => return,
+            };
+            this.update(cx, |this, cx| {
+                if this.visible {
+                    this.show_toast(text.into(), cx);
+                } else {
+                    this.show_hud(text.into(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// An item hotkey was pressed: runs that item's primary action without
     /// showing the launcher. One that asks for confirmation (Shut Down) opens
     /// the launcher on just that item instead, waiting for Enter.
@@ -1666,12 +2602,7 @@ impl Launcher {
         };
         // Commands that open a view (Clipboard History) open the launcher on
         // it; pressed again while that view is up, the launcher closes.
-        if matches!(
-            action.command,
-            Command::PushView(_)
-                | Command::OpenProviderView { .. }
-                | Command::OpenCalculatorHistory
-        ) {
+        if opens_view(&action.command) {
             let title = &self.search.catalog()[ix].title;
             if self.visible && self.screen_title().as_ref() == Some(title) {
                 self.hide(cx);
@@ -1690,11 +2621,18 @@ impl Launcher {
             // The hotkey was pressed in the app whose selection it's for.
             self.previous_window = system_clipboard::foreground_window();
             self.record_visit(id.to_owned(), cx);
-            return self.run_with_selection(action.command, cx);
+            return self.run_with_selection(action.command, window, cx);
+        }
+        // Scanning the screen hides the launcher first and opens it on what
+        // it finds.
+        if let Command::ScanQrCodes(source) = action.command {
+            self.record_visit(id.to_owned(), cx);
+            return self.scan_qr_codes(source, window, cx);
         }
         if action.command.needs_confirmation() {
             self.show(Instant::now(), window, cx);
             self.results = vec![Row::Catalog(ix)];
+            self.sections.clear();
             self.confirming = Some((id.to_owned(), 0));
             cx.notify();
             return;
@@ -1817,6 +2755,26 @@ impl Launcher {
         shortcuts
     }
 
+    /// The commands that open from links without asking, as id and title,
+    /// by title.
+    pub fn trusted_links(&self) -> Vec<(String, String)> {
+        let mut trusted: Vec<(String, String)> = self
+            .trusted_links
+            .iter()
+            .map(|id| {
+                let title = self
+                    .search
+                    .catalog()
+                    .iter()
+                    .find(|item| &item.id == id)
+                    .map_or_else(|| id.clone(), |item| item.title.clone());
+                (id.clone(), title)
+            })
+            .collect();
+        trusted.sort_by_cached_key(|(_, title)| title.to_lowercase());
+        trusted
+    }
+
     /// Every item that can take an alias or a hotkey (the ones that do
     /// something), by title. A provider that is off has none loaded.
     pub fn extension_items(&self) -> Vec<ExtensionItem> {
@@ -1836,7 +2794,7 @@ impl Launcher {
                 subtitle: item.subtitle.clone(),
                 image: self.icons.get(&item.id).cloned(),
                 glyph: match item.icon {
-                    Icon::Glyph(glyph) => Some(glyph),
+                    Icon::Glyph(glyph) | Icon::Site { glyph, .. } => Some(glyph),
                     _ => None,
                 },
             })
@@ -2010,7 +2968,7 @@ impl Launcher {
         // Keep the same item selected where it now ranks.
         if let Some(row) = self.results.iter().position(|row| self.item(row).id == id) {
             self.selected = row;
-            self.scroll.reveal(row, self.results.len());
+            self.reveal_selected();
         }
         cx.notify();
 
@@ -2198,6 +3156,19 @@ impl Launcher {
             item.subtitle.clone().unwrap_or_default().into()
         };
         let stacked = !subtitle.is_empty() && self.shows_previews(cx);
+        // Root search's catalog rows: the title, then where it's from, and
+        // its kind at the right; other rows keep their subtitle at the right.
+        let catalog_row = self.screens.is_empty() && matches!(self.results[row], Row::Catalog(_));
+        let notice = confirming || (selected && self.link_pending_for(&item.id));
+        let (detail, accessory): (Option<SharedString>, SharedString) = if catalog_row && !notice {
+            let kind = kind_of(&item.id);
+            (
+                detail_of(item.subtitle.as_deref(), kind).map(SharedString::from),
+                kind.into(),
+            )
+        } else {
+            (None, subtitle.clone())
+        };
 
         // Outer row spans the list width (uniform_list items otherwise shrink to
         // their content); the inner block carries the inset, rounded highlight.
@@ -2209,10 +3180,10 @@ impl Launcher {
                 .flex()
                 .items_center()
                 .gap_3()
-                .rounded(px(6.))
-                .when(selected, |row| row.bg(rgba(0xffffff1f)))
+                .rounded(px(8.))
+                .when(selected, |row| row.bg(rgba(theme::p().selected)))
                 .when(!selected, |row| {
-                    row.hover(|style| style.bg(rgba(0xffffff0f)))
+                    row.hover(|style| style.bg(rgba(theme::p().hover)))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.selected != row {
@@ -2245,9 +3216,9 @@ impl Launcher {
                                     .text_size(px(11.))
                                     .line_height(px(15.))
                                     .text_color(if confirming {
-                                        rgba(theme::ERROR)
+                                        rgba(theme::p().error)
                                     } else {
-                                        rgba(0xffffff70)
+                                        rgba(theme::p().text_dim)
                                     })
                                     .child(subtitle.clone()),
                             ),
@@ -2257,8 +3228,28 @@ impl Launcher {
                     row.child(
                         div()
                             .flex_1()
-                            .truncate()
-                            .child(SharedString::from(item.title.clone())),
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(420.))
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .child(SharedString::from(item.title.clone())),
+                            )
+                            .when_some(detail, |title, detail| {
+                                title.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(13.))
+                                        .text_color(rgba(theme::p().text_muted))
+                                        .child(detail),
+                                )
+                            }),
                     )
                 })
                 .when_some(self.aliases.get(&item.id), |row, alias| {
@@ -2268,9 +3259,9 @@ impl Launcher {
                             .px(px(6.))
                             .rounded(px(4.))
                             .border_1()
-                            .border_color(rgba(theme::SURFACE_BORDER))
+                            .border_color(rgba(theme::p().surface_border))
                             .text_size(px(11.))
-                            .text_color(rgba(theme::TEXT_MUTED))
+                            .text_color(rgba(theme::p().text_muted))
                             .child(SharedString::from(alias.clone())),
                     )
                 })
@@ -2281,16 +3272,145 @@ impl Launcher {
                     row.child(
                         div()
                             .flex_none()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(if confirming {
-                                rgba(theme::ERROR)
+                                rgba(theme::p().error)
                             } else {
-                                rgba(0xffffff70)
+                                rgba(theme::p().text_faint)
                             })
-                            .child(subtitle),
+                            .child(accessory),
                     )
                 }),
         )
+    }
+
+    /// Row `row`'s answer card, drawn from list line `line`, which is line
+    /// `part` of the card's: it spills over the lines under it, so the list
+    /// keeps lines of one height.
+    fn render_card(
+        &self,
+        line: usize,
+        row: usize,
+        part: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(card) = self.item(&self.results[row]).card.as_deref() else {
+            return div()
+                .id(("card", line))
+                .h(px(ROW_HEIGHT))
+                .into_any_element();
+        };
+        let selected = row == self.selected;
+        let half = |value: &str, label: &str| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .px_6()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .max_w_full()
+                        .truncate()
+                        .text_size(px(26.))
+                        .line_height(px(32.))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgba(theme::p().text))
+                        .child(SharedString::from(value.to_owned())),
+                )
+                .child(
+                    div()
+                        .max_w_full()
+                        .truncate()
+                        .px(px(6.))
+                        .rounded(px(4.))
+                        .bg(rgba(theme::p().surface_hover))
+                        .text_size(px(11.))
+                        .line_height(px(18.))
+                        .text_color(rgba(theme::p().text_muted))
+                        .child(SharedString::from(label.to_owned())),
+                )
+        };
+        // The divider between the halves, broken by the arrow and the note
+        // under it; a gap as tall as the note above the arrow keeps the arrow
+        // in the middle.
+        let divider = || div().w(px(1.)).flex_1().bg(rgba(theme::p().hairline));
+        let note_line = |text: SharedString| {
+            div()
+                .h(px(16.))
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(rgba(theme::p().text_faint))
+                .child(text)
+        };
+        let middle = div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(divider())
+            .when(card.note.is_some(), |middle| {
+                middle.child(note_line(SharedString::default()))
+            })
+            .child(
+                div()
+                    .py(px(4.))
+                    .text_size(px(16.))
+                    .line_height(px(20.))
+                    .text_color(rgba(theme::p().text_muted))
+                    .child("→"),
+            )
+            .when_some(card.note.clone(), |middle, note| {
+                middle.child(note_line(note.into()))
+            })
+            .child(divider());
+        div()
+            .id(("card", line))
+            .w_full()
+            .h(px(ROW_HEIGHT))
+            .relative()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-(part as f32) * ROW_HEIGHT))
+                    .left_0()
+                    .right_0()
+                    .h(px(CARD_LINES as f32 * ROW_HEIGHT))
+                    .px_2()
+                    .py(px(2.))
+                    .child(
+                        div()
+                            .id("card")
+                            .relative()
+                            .size_full()
+                            .flex()
+                            .rounded(px(8.))
+                            .bg(rgba(if selected {
+                                theme::p().selected
+                            } else {
+                                theme::p().surface
+                            }))
+                            .when(!selected, |card| {
+                                card.hover(|style| style.bg(rgba(theme::p().hover)))
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.selected != row {
+                                    this.selected = row;
+                                    this.confirming = None;
+                                }
+                                this.panel = None;
+                                this.confirm(&Confirm, window, cx);
+                            }))
+                            .child(half(&card.question, &card.question_label))
+                            .child(half(&card.answer, &card.answer_label))
+                            .child(middle),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_icon(&self, item: &SearchItem) -> AnyElement {
@@ -2314,8 +3434,8 @@ impl Launcher {
             .items_center()
             .justify_center();
         match item.icon {
-            Icon::Glyph(glyph) => badge
-                .bg(rgba(0xffffff1a))
+            Icon::Glyph(glyph) | Icon::Site { glyph, .. } => badge
+                .bg(rgba(theme::p().surface_hover))
                 .font_family(icon_font())
                 .text_size(px(15. * scale))
                 .child(SharedString::from(glyph.to_string()))
@@ -2338,59 +3458,151 @@ impl Launcher {
         }
     }
 
-    /// The Ctrl+K panel: the selected item's actions, above the footer's right end.
+    /// Compact mode's collapsed window: the favorites as icons at the right
+    /// of the search field, as Raycast shows them; a click runs one.
+    fn render_compact_favorites(&self, cx: &mut Context<Self>) -> AnyElement {
+        let icons = self
+            .quick_favorites()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                let id = item.id.clone();
+                let title = SharedString::from(format!("{}  ·  Ctrl+{}", item.title, ix + 1));
+                div()
+                    .id(("favorite", ix))
+                    .flex_none()
+                    .size(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme::p().hover)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_favorite(&id, window, cx);
+                    }))
+                    .tooltip(move |_, cx| cx.new(|_| Tooltip(title.clone())).into())
+                    .child(self.render_icon_sized(item, 20.))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(icons)
+            .into_any_element()
+    }
+
+    /// The favorites that Ctrl+1 to Ctrl+8 run, in order: those in the
+    /// catalog, as many as the collapsed window shows.
+    fn quick_favorites(&self) -> Vec<&SearchItem> {
+        let catalog = self.search.catalog();
+        self.favorites
+            .iter()
+            .filter_map(|id| catalog.iter().find(|item| item.id == *id))
+            .take(COMPACT_FAVORITES)
+            .collect()
+    }
+
+    /// Ctrl+1 to Ctrl+8 in the collapsed compact window, where the
+    /// favorites' icons are: runs that favorite. Whether the key was one.
+    fn run_quick_favorite(
+        &mut self,
+        pressed: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let modifiers = pressed.modifiers;
+        if !modifiers.control || modifiers.alt || modifiers.shift || modifiers.platform {
+            return false;
+        }
+        let Some(ix) = pressed
+            .key
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=COMPACT_FAVORITES).contains(n))
+        else {
+            return false;
+        };
+        if !self.compact_favorites || !self.collapsed(cx) {
+            return false;
+        }
+        let Some(id) = self
+            .quick_favorites()
+            .get(ix - 1)
+            .map(|item| item.id.clone())
+        else {
+            return false;
+        };
+        self.run_favorite(&id, window, cx);
+        true
+    }
+
+    /// Runs favorite `id`'s first action from root search's rows, which
+    /// list every favorite (hidden while the window is collapsed).
+    fn run_favorite(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.results.iter().position(|row| self.item(row).id == id) else {
+            // Home lists every favorite in the catalog; this one just left it.
+            return;
+        };
+        self.selected = row;
+        self.confirming = None;
+        self.panel = None;
+        if self.selected_actions().is_empty() {
+            self.hide(cx);
+        } else {
+            self.run_action(0, window, cx);
+        }
+    }
+
+    /// The Ctrl+K panel: the selected item's actions, above the footer's
+    /// right end, with a search field under them.
     fn render_panel(&self, selected: usize, cx: &mut Context<Self>) -> AnyElement {
         let title = self
             .results
             .get(self.selected)
             .map(|row| SharedString::from(self.item(row).title.clone()))
             .unwrap_or_default();
-        let rows = self
-            .selected_actions()
-            .into_iter()
-            .enumerate()
-            .map(|(ix, action)| {
-                let shortcut = match ix {
-                    0 => Some("Enter"),
-                    1 => Some("Ctrl Enter"),
-                    _ => None,
-                };
-                div()
-                    .id(ix)
-                    .h(px(32.))
-                    .px_2()
-                    .mx_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded(px(5.))
-                    .when(ix == selected, |row| row.bg(rgba(0xffffff1f)))
-                    .when(ix != selected, |row| {
-                        row.hover(|style| style.bg(rgba(0xffffff0f)))
-                    })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .truncate()
-                            .child(SharedString::from(action.title)),
-                    )
-                    .children(shortcut.map(keycaps))
-            });
+        let keys = entry_keys(&self.selected_actions());
+        let entries = self.panel_entries(cx);
+        let empty = entries.is_empty();
+        let rows = entries.into_iter().enumerate().map(|(row, (ix, entry))| {
+            div()
+                .id(row)
+                .flex_none()
+                .h(px(32.))
+                .px_2()
+                .mx_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(5.))
+                .when(row == selected, |row| row.bg(rgba(theme::p().selected)))
+                .when(row != selected, |row| {
+                    row.hover(|style| style.bg(rgba(theme::p().hover)))
+                })
+                .on_click(cx.listener(move |this, _, window, cx| this.run_action(ix, window, cx)))
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(SharedString::from(entry.title)),
+                )
+                .children(keys[ix].as_deref().map(|keys| keycaps(&keys_label(keys))))
+        });
         div()
             .absolute()
             .right(px(10.))
             .bottom(px(38.))
-            .w(px(300.))
-            .py_1()
+            .w(px(320.))
+            .pt_1()
             .flex()
             .flex_col()
             .rounded(px(8.))
             .border_1()
-            .border_color(rgba(theme::SURFACE_BORDER))
-            .bg(rgba(theme::PANEL))
+            .border_color(rgba(theme::p().surface_border))
+            .bg(rgba(theme::p().panel))
             .shadow_lg()
             .text_size(px(13.))
             .child(
@@ -2399,11 +3611,40 @@ impl Launcher {
                     .pt_1()
                     .pb_1()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .truncate()
                     .child(title),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("panel-rows")
+                    .max_h(px(PANEL_ROWS * 32.))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.panel_scroll)
+                    .children(rows)
+                    .when(empty, |list| {
+                        list.child(
+                            div()
+                                .h(px(32.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .text_color(rgba(theme::p().text_faint))
+                                .child("No matching actions"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgba(theme::p().surface_border))
+                    .child(self.panel_input.clone()),
+            )
             .into_any_element()
     }
 
@@ -2418,8 +3659,8 @@ impl Launcher {
                         .py_1()
                         .rounded(px(5.))
                         .border_1()
-                        .border_color(rgba(theme::ACCENT))
-                        .bg(rgba(theme::SURFACE))
+                        .border_color(rgba(theme::p().accent))
+                        .bg(rgba(theme::p().surface))
                         .child(input.clone())
                         .into_any_element(),
                     None,
@@ -2447,14 +3688,14 @@ impl Launcher {
             .gap_2()
             .rounded(px(8.))
             .border_1()
-            .border_color(rgba(theme::SURFACE_BORDER))
-            .bg(rgba(theme::PANEL))
+            .border_color(rgba(theme::p().surface_border))
+            .bg(rgba(theme::p().panel))
             .shadow_lg()
             .text_size(px(13.))
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .truncate()
                     .child(SharedString::from(heading)),
             )
@@ -2463,14 +3704,14 @@ impl Launcher {
                 card.child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::ERROR))
+                        .text_color(rgba(theme::p().error))
                         .child(note),
                 )
             })
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child(hint),
             )
             .into_any_element()
@@ -2504,7 +3745,7 @@ impl Launcher {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_color(rgba(theme::TEXT)).child(primary))
+                            .child(div().text_color(rgba(theme::p().text)).child(primary))
                             .child(keycaps(primary_keys)),
                     )
                     .when(has_actions, |hints| {
@@ -2522,22 +3763,30 @@ impl Launcher {
 
     fn render_footer(&self) -> impl IntoElement {
         div()
-            .h(px(30.))
-            .px_4()
+            .h(px(40.))
+            .px(px(16.))
             .flex()
             .items_center()
             .gap_4()
-            .bg(rgba(0x00000033))
-            .text_size(px(11.))
-            .text_color(rgba(0xffffff80))
+            .border_t_1()
+            .border_color(rgba(theme::p().hairline))
+            .text_size(px(12.))
+            .text_color(rgba(theme::p().text_muted))
             .child(match &self.toast {
                 Some(toast) => div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(rgba(theme::SUCCESS))
+                    .text_color(rgba(theme::p().success))
                     .child(toast.clone()),
-                None => div().flex_1().min_w_0().truncate().child(self.footer()),
+                None if self.show_stats => div().flex_1().min_w_0().truncate().child(self.footer()),
+                None => div().flex_1().min_w_0().child(
+                    div()
+                        .font_family(icon_font())
+                        .text_size(px(14.))
+                        .text_color(rgba(theme::p().text_faint))
+                        .child(SharedString::from('\u{E721}'.to_string())),
+                ),
             })
             .child(self.footer_hints())
     }
@@ -2565,6 +3814,15 @@ impl Launcher {
 
 impl Render for Launcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The panel closed (an action ran, Esc, the list changed) while its
+        // search field had the keyboard: give it back.
+        if self.panel.is_none() && self.panel_input.focus_handle(cx).is_focused(window) {
+            let back = self
+                .panel_return
+                .take()
+                .unwrap_or_else(|| self.input.focus_handle(cx));
+            window.focus(&back);
+        }
         if let Some(text) = &self.hud {
             // An explicit size from the top left, not `size_full`: GPUI can
             // still think the window has the launcher's size when the HUD's
@@ -2577,11 +3835,11 @@ impl Render for Launcher {
                 .items_center()
                 .justify_center()
                 .px_4()
-                .bg(rgba(theme::HUD_TINT))
+                .bg(rgba(theme::p().hud))
                 .border_1()
-                .border_color(rgba(theme::SURFACE_BORDER))
+                .border_color(rgba(theme::p().surface_border))
                 .rounded(px(8.))
-                .text_color(rgba(theme::TEXT))
+                .text_color(rgba(theme::p().text))
                 .text_size(px(14.))
                 .line_height(px(20.))
                 .text_center()
@@ -2590,6 +3848,8 @@ impl Render for Launcher {
         }
         self.drop_stale_images(window);
         let collapsed = self.window_collapsed;
+        let favorites =
+            (collapsed && self.compact_favorites).then(|| self.render_compact_favorites(cx));
         // Both run, so neither waits on the other's frame.
         let detail_moving = self.tick_detail_scroll();
         if self.scroll.tick() || detail_moving {
@@ -2604,7 +3864,7 @@ impl Render for Launcher {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgba(0xffffff60))
+                .text_color(rgba(theme::p().text_empty))
                 .child(match self.screens.last() {
                     Some(Screen::List { view, .. }) if view.items.is_empty() => {
                         SharedString::from(view.empty.clone().unwrap_or("Nothing here".into()))
@@ -2613,17 +3873,42 @@ impl Render for Launcher {
                 })
                 .into_any_element()
         } else {
+            let trim = if self.sections.first().is_some_and(|(start, _)| *start == 0) {
+                HEADING_TRIM
+            } else {
+                0.
+            };
+            self.scroll.set_top_inset(trim);
             let list = uniform_list(
                 "results",
-                self.results.len(),
+                self.line_count(),
                 cx.processor(|this, range: Range<usize>, _window, cx| {
+                    let first = range.start;
                     range
-                        .map(|row| this.render_row(row, cx))
+                        .map(|line| match this.line_at(line) {
+                            Line::Row(row) if this.card_row() == Some(row) => {
+                                this.render_card(line, row, 0, cx)
+                            }
+                            Line::Row(row) => this.render_row(row, cx).into_any_element(),
+                            Line::Heading(title) => render_heading(line, title),
+                            // The card is drawn once, by its first line in view.
+                            Line::CardRest(row, part) if line == first => {
+                                this.render_card(line, row, part, cx)
+                            }
+                            Line::CardRest(..) => div()
+                                .id(("card", line))
+                                .h(px(ROW_HEIGHT))
+                                .into_any_element(),
+                        })
                         .collect::<Vec<_>>()
                 }),
             )
             .track_scroll(self.scroll.handle())
-            .size_full()
+            .absolute()
+            .top(px(-trim))
+            .left_0()
+            .right_0()
+            .bottom_0()
             .py(px(LIST_PADDING));
 
             // Wheel notches are animated instead; everything else falls through to GPUI.
@@ -2631,16 +3916,56 @@ impl Render for Launcher {
                 if !this.scroll.is_enabled() {
                     return false;
                 }
-                this.scroll.scroll_by(delta, this.results.len());
+                this.scroll.scroll_by(delta, this.line_count());
                 cx.notify();
                 true
+            });
+
+            // A thin thumb at the right edge when there is more to scroll to.
+            // Its size needs the list's height: until GPUI has laid it out,
+            // draw again once it has.
+            if !self.scroll.is_laid_out() {
+                window.request_animation_frame();
+            }
+            // It can be dragged, and a click on its track jumps there.
+            let dragging = self.scroll.is_dragging();
+            let thumb = self.scroll.thumb(self.line_count()).map(|(top, length)| {
+                div()
+                    .id("scroll-track")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(12.))
+                    .group("scroll-track")
+                    .child(
+                        div()
+                            .absolute()
+                            .top(relative(top))
+                            .h(relative(length))
+                            .right(px(3.))
+                            .w(px(if dragging { 6. } else { 4. }))
+                            .py(px(4.))
+                            .group_hover("scroll-track", |thumb| thumb.w(px(6.)))
+                            .child(div().size_full().rounded_full().bg(rgba(if dragging {
+                                theme::p().scrollbar_active
+                            } else {
+                                theme::p().scrollbar
+                            }))),
+                    )
+                    .child(drag_track(cx.entity().downgrade(), |this: &mut Self| {
+                        let rows = this.line_count();
+                        (&mut this.scroll, rows)
+                    }))
             });
 
             div()
                 .flex_1()
                 .relative()
+                .overflow_hidden()
                 .child(list)
                 .child(wheel)
+                .children(thumb)
                 .into_any_element()
         };
         // Lists with previews (clipboard history): rows on the left, the
@@ -2682,22 +4007,34 @@ impl Render for Launcher {
             .on_action(cx.listener(Self::prev_choice))
             .on_action(cx.listener(Self::toggle_choice))
             .on_action(cx.listener(Self::dismiss))
+            .on_key_down(cx.listener(Self::run_shortcut))
             .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgba(theme::BACKGROUND_TINT))
-            .text_color(rgb(0xececec))
+            .bg(rgba(tint()))
+            .text_color(rgba(theme::p().text))
             .text_size(px(14.))
             .child(
                 div()
-                    .px_4()
-                    .py_3()
+                    .px(px(20.))
+                    .py(px(18.))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .text_size(px(20.))
+                    .gap_3()
+                    .text_size(px(18.))
                     .line_height(px(28.))
+                    // Root search: a search glyph, as Raycast shows its logo.
+                    .when(self.screens.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .font_family(icon_font())
+                                .text_size(px(16.))
+                                .text_color(rgba(theme::p().text_muted))
+                                .child(SharedString::from('\u{E721}'.to_string())),
+                        )
+                    })
                     .map(|row| match self.screens.last() {
                         // Views without a search field show their title there.
                         Some(screen) if !screen.has_search() => row
@@ -2715,7 +4052,7 @@ impl Render for Launcher {
                                     .items_center()
                                     .gap_1()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .child(keycaps("Esc"))
                                     .child("back"),
                             ),
@@ -2726,14 +4063,27 @@ impl Render for Launcher {
                                         .flex_none()
                                         .px_2()
                                         .rounded(px(5.))
-                                        .bg(rgba(theme::SURFACE_HOVER))
+                                        .bg(rgba(theme::p().surface_hover))
                                         .text_size(px(12.))
                                         .line_height(px(22.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .child(SharedString::from(screen.title().to_owned())),
                                 )
                             })
                             .child(div().flex_1().min_w_0().child(self.input.clone()))
+                            .when_some(self.prefix_hint(cx), |row, (label, keys)| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_size(px(13.))
+                                        .text_color(rgba(theme::p().text_muted))
+                                        .child(label)
+                                        .children(keys.map(keycaps)),
+                                )
+                            })
                             .when_some(self.filter_label(), |row, label| {
                                 row.child(
                                     div()
@@ -2745,23 +4095,24 @@ impl Render for Launcher {
                                         .px_2()
                                         .rounded(px(5.))
                                         .border_1()
-                                        .border_color(rgba(theme::SURFACE_BORDER))
+                                        .border_color(rgba(theme::p().surface_border))
                                         .text_size(px(12.))
                                         .line_height(px(22.))
-                                        .text_color(rgba(theme::TEXT_MUTED))
+                                        .text_color(rgba(theme::p().text_muted))
                                         .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                                        .hover(|style| style.bg(rgba(theme::p().surface_hover)))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.step_filter(true, cx);
                                         }))
                                         .child(label)
                                         .child(keycaps("Tab")),
                                 )
-                            }),
+                            })
+                            .children(favorites),
                     }),
             )
             .when(!collapsed, |root| {
-                root.child(div().h(px(1.)).bg(rgba(0xffffff14)))
+                root.child(div().h(px(1.)).bg(rgba(theme::p().hairline)))
                     .child(results)
                     .child(self.render_footer())
             })
@@ -2781,8 +4132,110 @@ impl Render for Launcher {
     }
 }
 
+/// A hover tooltip: one line of text, as the favorites' icons show their
+/// names.
+struct Tooltip(SharedString);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .bg(rgba(theme::p().panel))
+            .border_1()
+            .border_color(rgba(theme::p().surface_border))
+            .text_color(rgba(theme::p().text))
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .child(self.0.clone())
+    }
+}
+
 /// The keys of `hotkey` for [`keycaps`]: `"Ctrl Alt K"`. Key names never
 /// contain `+` (the plus key displays as `=`, the same key).
+/// A line of the result list: a section heading, or a row of the results.
+enum Line {
+    Heading(SharedString),
+    Row(usize),
+    /// Line `.1` (from 1) of row `.0`'s answer card, under its first.
+    CardRest(usize, usize),
+}
+
+/// A section heading, as tall as a row so the list's lines stay uniform;
+/// the text sits at the bottom, close to the rows it heads.
+fn render_heading(line: usize, title: SharedString) -> AnyElement {
+    div()
+        .id(("heading", line))
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .px(px(20.))
+        .pb(px(6.))
+        .flex()
+        .items_end()
+        .text_size(px(12.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgba(theme::p().text_muted))
+        .child(title)
+        .into_any_element()
+}
+
+/// The heading over a search's answers, by the provider of the first one.
+fn answers_heading(id: &str) -> &'static str {
+    match id.split(':').next().unwrap_or_default() {
+        "calc" => "Calculator",
+        "web" => "Open",
+        "quicklinks" => "Quicklinks",
+        "run" => "Run",
+        "files" => "Files",
+        "clipboard" => "Clipboard",
+        _ => "Answers",
+    }
+}
+
+/// What kind of thing a catalog item is, shown at the right of its row as
+/// Raycast does: "Application", "Quicklink", "Command".
+fn kind_of(id: &str) -> &'static str {
+    let (provider, instance) = id.split_once(':').unwrap_or((id, ""));
+    let saved = instance.parse::<i64>().is_ok();
+    match provider {
+        "apps" => "Application",
+        "games" => "Game",
+        "settings" => "System Setting",
+        "control-panel" => "Control Panel",
+        "quicklinks" if saved => "Quicklink",
+        "snippets" if saved => "Snippet",
+        _ => "Command",
+    }
+}
+
+/// What goes after a catalog item's title: its subtitle, without the kind
+/// already shown at the right ("!gh  ·  Quicklink" → "!gh").
+/// Whether `command` opens a view, so the launcher shows when it's run
+/// from a hotkey or a link.
+fn opens_view(command: &Command) -> bool {
+    match command {
+        Command::PushView(_)
+        | Command::OpenProviderView { .. }
+        | Command::OpenCalculatorHistory => true,
+        // One of the selection reads it first, with the launcher hidden.
+        Command::ShowQrCode(_) => !command.needs_selection(),
+        _ => false,
+    }
+}
+
+fn detail_of(subtitle: Option<&str>, kind: &str) -> Option<String> {
+    let subtitle = subtitle?.trim();
+    let subtitle = subtitle
+        .strip_suffix(kind)
+        .map(|rest| rest.trim_end().trim_end_matches('·').trim_end())
+        .unwrap_or(subtitle);
+    let redundant = subtitle.is_empty()
+        || subtitle.eq_ignore_ascii_case(kind)
+        || matches!(subtitle, "Application" | "Applications" | "Command");
+    (!redundant).then(|| subtitle.to_owned())
+}
+
 /// The text after `prefix` when `query` starts with it.
 fn file_query<'a>(prefix: &str, query: &'a str) -> Option<&'a str> {
     if prefix.is_empty() {
@@ -2851,6 +4304,77 @@ fn days_ago(then: i64, now: i64) -> String {
 }
 
 /// Key caps for a shortcut such as `"Ctrl K"`, one per key.
+/// How many rows the action panel shows before it scrolls.
+const PANEL_ROWS: f32 = 9.;
+
+/// Keys the launcher and its search field keep for themselves; an action
+/// asking for one of them gets none.
+const RESERVED_KEYS: &[&str] = &[
+    "enter",
+    "ctrl-enter",
+    "ctrl-k",
+    "ctrl-n",
+    "ctrl-p",
+    "ctrl-q",
+    "ctrl-,",
+    "ctrl-a",
+    "ctrl-c",
+    "ctrl-v",
+    "ctrl-x",
+];
+
+/// The keys each action runs with besides the panel: the ones it asks for,
+/// unless the launcher keeps them or an action above took them. The first
+/// two also run with Enter and Ctrl+Enter.
+fn own_keys(entries: &[Entry]) -> Vec<Option<String>> {
+    let mut taken: Vec<&str> = Vec::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let keys = entry
+                .shortcut
+                .as_deref()
+                .filter(|keys| !RESERVED_KEYS.contains(keys) && !taken.contains(keys))?;
+            taken.push(keys);
+            Some(keys.to_owned())
+        })
+        .collect()
+}
+
+/// The keys the panel shows beside each action: Enter and Ctrl+Enter for
+/// the first two (their own keys still work, as in Raycast), then
+/// [`own_keys`].
+fn entry_keys(entries: &[Entry]) -> Vec<Option<String>> {
+    let mut keys = own_keys(entries);
+    for (ix, shown) in ["enter", "ctrl-enter"].into_iter().enumerate() {
+        if let Some(keys) = keys.get_mut(ix) {
+            *keys = Some(shown.to_owned());
+        }
+    }
+    keys
+}
+
+/// `ctrl-shift-c` as the keycaps show it: `Ctrl Shift C`.
+fn keys_label(keys: &str) -> String {
+    keys.split('-')
+        .map(|key| match key {
+            "ctrl" => "Ctrl".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "enter" => "Enter".to_owned(),
+            key => key.to_uppercase(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether every word of `query` (lowercase) is in `title`, as the action
+/// panel's search keeps actions.
+fn matches_words(title: &str, query: &str) -> bool {
+    let title = title.to_lowercase();
+    query.split_whitespace().all(|word| title.contains(word))
+}
+
 fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
     let keys: Vec<SharedString> = shortcut
         .split(' ')
@@ -2863,18 +4387,23 @@ fn keycaps(shortcut: &str) -> impl IntoElement + use<> {
             div()
                 .px(px(5.))
                 .rounded(px(4.))
-                .bg(rgba(theme::SURFACE_HOVER))
+                .bg(rgba(theme::p().surface_hover))
                 .text_size(px(10.))
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .child(key)
         }))
 }
 
-/// What to extract the icon from, for icons that come from the shell.
-fn shell_name(icon: &Icon) -> Option<String> {
+/// Where a site's icon is fetched from, in [`icon_source`]'s names.
+const SITE_ICON: &str = "favicon:";
+
+/// What to load the icon from: a shell parsing name, or [`SITE_ICON`] and
+/// a site's origin. Also its name in the store's icon cache.
+fn icon_source(icon: &Icon) -> Option<String> {
     match icon {
         Icon::App(launch_id) => Some(format!("shell:AppsFolder\\{launch_id}")),
         Icon::Shell(name) => Some(name.clone()),
+        Icon::Site { origin, .. } => Some(format!("{SITE_ICON}{origin}")),
         Icon::Glyph(_) | Icon::None => None,
     }
 }
@@ -2896,6 +4425,10 @@ pub(crate) fn icon_font() -> &'static str {
 /// GPUI wants BGRA with straight alpha, which is what `icons` produces; the
 /// `RgbaImage` type is only the buffer container here.
 fn render_image(icon: icons::Icon) -> Option<Arc<RenderImage>> {
+    // Remembered as having none (a site without a usable icon).
+    if icon.width == 0 || icon.height == 0 {
+        return None;
+    }
     let buffer = RgbaImage::from_raw(icon.width, icon.height, icon.bgra)?;
     Some(Arc::new(RenderImage::new(vec![Frame::new(buffer)])))
 }
@@ -2924,6 +4457,99 @@ const FILLER: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gives_actions_their_keys() {
+        let entry = |title: &str, keys: Option<&str>| Entry {
+            title: title.to_owned(),
+            kind: EntryKind::ResetRanking,
+            shortcut: keys.map(str::to_owned),
+        };
+        let entries = [
+            entry("Open", Some("ctrl-o")),
+            entry("Run as Administrator", Some(shortcut::TERTIARY)),
+            entry("Copy Path", Some(shortcut::COPY_TERTIARY)),
+            entry("Select All", Some("ctrl-a")),
+            entry("Reset Ranking", None),
+            entry("Copy File", Some(shortcut::COPY)),
+            entry("Copy Deeplink", Some(shortcut::COPY_DEEPLINK)),
+        ];
+        let keys = entry_keys(&entries);
+        assert_eq!(
+            keys.iter().map(Option::as_deref).collect::<Vec<_>>(),
+            [
+                Some("enter"),
+                Some("ctrl-enter"),
+                Some("alt-shift-c"),
+                // The search field's Select All, and taken by Copy File.
+                None,
+                None,
+                Some("ctrl-shift-c"),
+                None,
+            ]
+        );
+        // The second action's own keys still run it.
+        assert_eq!(
+            own_keys(&entries)[..2],
+            [
+                Some("ctrl-o".to_owned()),
+                Some("ctrl-shift-enter".to_owned())
+            ]
+        );
+        assert_eq!(keys_label("ctrl-shift-c"), "Ctrl Shift C");
+        assert_eq!(keys_label("ctrl-alt-enter"), "Ctrl Alt Enter");
+        assert_eq!(keys_label("ctrl-."), "Ctrl .");
+    }
+
+    #[test]
+    fn tints_every_theme_dense_enough_over_any_background() {
+        let alpha = |tint: u32| (tint & 0xff) as f32 / 255.;
+        for theme in theme::THEMES {
+            let density = alpha(tint_for(theme.palette.background, theme.appearance));
+            assert!(density >= TINT_DENSITY - 0.005, "{}: {density}", theme.id);
+            // The window over white (black for a light theme) stays within
+            // a quarter of the way from the theme's own extreme.
+            let own = (theme.palette.background >> 24) as f32 / 255.;
+            let own = match theme.appearance {
+                theme::Appearance::Light => 1. - own,
+                theme::Appearance::Dark => own,
+            };
+            let window = density * own + (1. - density);
+            assert!(window <= 0.245, "{}: {window}", theme.id);
+        }
+    }
+
+    #[test]
+    fn names_kinds_and_details_as_raycast() {
+        assert_eq!(
+            kind_of("apps:Microsoft.WindowsCalculator!App"),
+            "Application"
+        );
+        assert_eq!(kind_of("quicklinks:7"), "Quicklink");
+        assert_eq!(kind_of("quicklinks:-3"), "Quicklink");
+        assert_eq!(kind_of("quicklinks:search"), "Command");
+        assert_eq!(kind_of("snippets:12"), "Snippet");
+        assert_eq!(kind_of("system:lock"), "Command");
+        assert_eq!(detail_of(Some("Application"), "Application"), None);
+        assert_eq!(
+            detail_of(Some("!gh  ·  Quicklink"), "Quicklink").as_deref(),
+            Some("!gh")
+        );
+        assert_eq!(detail_of(Some("Quicklink"), "Quicklink"), None);
+        assert_eq!(
+            detail_of(Some("System"), "Command").as_deref(),
+            Some("System")
+        );
+        assert_eq!(detail_of(None, "Command"), None);
+    }
+
+    #[test]
+    fn searches_actions_by_words() {
+        assert!(matches_words("Copy Deeplink", ""));
+        assert!(matches_words("Copy Deeplink", "deep"));
+        assert!(matches_words("Move to Recycle Bin", "bin move"));
+        assert!(!matches_words("Copy Path", "copy name"));
+    }
 
     #[test]
     fn says_how_long_ago() {

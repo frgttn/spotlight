@@ -1,15 +1,24 @@
 //! Saving and deleting quicklinks from their forms and action panel. The
 //! quicklinks provider lists them; after a change its catalog is loaded again.
 
-use super::{Launcher, views::Screen};
+use std::{fs, path::Path};
+
+use super::{
+    Launcher,
+    json_files::{export_message, import_message},
+    views::Screen,
+};
 use gpui::{Context, Window};
 use spotlight_core::{
     item_id,
     quicklink::{self, Quicklink},
 };
+use spotlight_platform_win::links::{self, Browser};
 
 /// The quicklinks provider's id, whose items these are.
 const PROVIDER: &str = "quicklinks";
+/// What the export file is called unless the user changes it.
+const EXPORT_NAME: &str = "Quicklinks.json";
 
 impl Launcher {
     /// Checks the quicklink a form filled in and saves it, then goes back to
@@ -24,7 +33,7 @@ impl Launcher {
             Ok(saved) => {
                 self.screens.clear();
                 self.enter_screen(window, cx);
-                self.reload_catalog(PROVIDER, window.scale_factor(), cx);
+                self.reload_quicklinks(window.scale_factor(), cx);
                 let message = match &saved.keyword {
                     Some(keyword) => format!("Saved “{}”. Type !{keyword} to open it", saved.name),
                     None => format!("Saved “{}”", saved.name),
@@ -130,7 +139,109 @@ impl Launcher {
         }
         let query = self.query(cx);
         self.refilter(&query);
-        self.reload_catalog(PROVIDER, window.scale_factor(), cx);
+        self.reload_quicklinks(window.scale_factor(), cx);
         self.show_toast(format!("Deleted “{title}”").into(), cx);
     }
+
+    /// Asks for a JSON file (as Raycast exports quicklinks) and adds the
+    /// quicklinks in it that aren't there yet.
+    pub(super) fn import_quicklinks(&mut self, cx: &mut Context<Self>) {
+        self.import_json_file(
+            "Import Quicklinks",
+            |this, path, cx| match fs::read_to_string(path) {
+                Ok(json) => this.import_quicklinks_json(&json, cx),
+                Err(err) => format!("Couldn't read it: {err}"),
+            },
+            cx,
+        );
+    }
+
+    /// Adds the new quicklinks in `json` (a file's, or a link's) and says
+    /// how it went. The app each opens with is matched to an installed
+    /// browser by name, or dropped.
+    pub(super) fn import_quicklinks_json(&mut self, json: &str, cx: &mut Context<Self>) -> String {
+        let browsers = links::browsers();
+        let imported = (|| {
+            let store = self.store.as_ref().ok_or("There is no database")?;
+            let mut store = store.lock().map_err(|_| "The database is unavailable")?;
+            let existing = store.quicklinks().map_err(|err| err.to_string())?;
+            let mut imported = quicklink::import(json, &existing)?;
+            for link in &mut imported.added {
+                link.open_with = link
+                    .open_with
+                    .take()
+                    .and_then(|app| browser_exe(&browsers, &app));
+            }
+            store
+                .add_quicklinks(&imported.added)
+                .map_err(|err| format!("Couldn't save them: {err}"))?;
+            Ok::<_, String>(imported)
+        })();
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(err) => {
+                eprintln!("[spotlight] could not import quicklinks: {err}");
+                return err;
+            }
+        };
+        self.reload_quicklinks(self.window_scale, cx);
+        let skipped = imported.duplicates + imported.taken + imported.invalid;
+        if skipped > 0 {
+            eprintln!(
+                "[spotlight] import skipped {} already there, {} with a keyword in use, {} invalid",
+                imported.duplicates, imported.taken, imported.invalid
+            );
+        }
+        import_message("quicklink", imported.added.len(), skipped)
+    }
+
+    /// Asks where to save every quicklink as JSON Raycast can import.
+    pub(super) fn export_quicklinks(&mut self, cx: &mut Context<Self>) {
+        self.export_json_file(
+            "Export Quicklinks",
+            EXPORT_NAME,
+            |this, path| export_message("quicklink", this.export_quicklinks_to(path)),
+            cx,
+        );
+    }
+
+    /// Writes every quicklink to `path` as JSON. Returns how many.
+    pub fn export_quicklinks_to(&self, path: &Path) -> Result<usize, String> {
+        let saved = self
+            .store
+            .as_ref()
+            .ok_or("There is no database")?
+            .lock()
+            .map_err(|_| "The database is unavailable")?
+            .quicklinks()
+            .map_err(|err| err.to_string())?;
+        let browsers = links::browsers();
+        let json = quicklink::export(&saved, |exe| {
+            browsers
+                .iter()
+                .find(|browser| browser.exe.eq_ignore_ascii_case(exe))
+                .map_or_else(|| exe.to_owned(), |browser| browser.name.clone())
+        });
+        fs::write(path, json).map_err(|err| format!("Couldn't write it: {err}"))?;
+        Ok(saved.len())
+    }
+
+    /// Quicklinks, and the web search rows, which name a quicklink engine
+    /// and carry its link.
+    fn reload_quicklinks(&mut self, scale: f32, cx: &mut Context<Self>) {
+        self.reload_catalog(PROVIDER, scale, cx);
+        self.reload_catalog("web", scale, cx);
+        self.reload_catalog("selection", scale, cx);
+    }
+}
+
+/// The exe of the browser an imported quicklink opens with: `app` is its
+/// name (as Raycast writes it) or already an exe of one.
+fn browser_exe(browsers: &[Browser], app: &str) -> Option<String> {
+    browsers
+        .iter()
+        .find(|browser| {
+            browser.name.eq_ignore_ascii_case(app) || browser.exe.eq_ignore_ascii_case(app)
+        })
+        .map(|browser| browser.exe.clone())
 }

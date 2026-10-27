@@ -102,6 +102,22 @@ impl Retention {
     }
 }
 
+/// The formatting copied with text (a web page's, a document's), as apps put
+/// it on the clipboard, kept so the entry pastes back formatted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RichText {
+    /// The clipboard's "HTML Format": UTF-8 with its offsets header.
+    pub html: Option<Vec<u8>>,
+    /// "Rich Text Format".
+    pub rtf: Option<Vec<u8>>,
+}
+
+impl RichText {
+    pub fn is_empty(&self) -> bool {
+        self.html.is_none() && self.rtf.is_none()
+    }
+}
+
 /// What a clipboard entry holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipKind {

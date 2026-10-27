@@ -6,9 +6,9 @@
 use crate::{
     clip::IgnoredApp,
     quicklink::{self, Quicklink},
-    snippet::Snippet,
+    snippet::{self, Snippet},
     view::{Preview, View},
-    web::encode_query,
+    web::{SearchEngine, encode_query},
     window::WindowCommand,
 };
 
@@ -29,6 +29,21 @@ pub struct SearchItem {
     /// Shown beside the list while the row is selected, in lists that have
     /// previews (clipboard history).
     pub preview: Option<Box<Preview>>,
+    /// Drawn as a large card in place of the row (the calculator's answer).
+    pub card: Option<Box<AnswerCard>>,
+}
+
+/// An answer shown as a card, what was asked on the left and the answer on
+/// the right, each with a label under it: `40 × 10` (Expression) → `400`
+/// (Result), `5 uah` (Ukrainian Hryvnia) → `$0.12` (US Dollar).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnswerCard {
+    pub question: String,
+    pub question_label: String,
+    pub answer: String,
+    pub answer_label: String,
+    /// A small line between the two: "Updated 3 hours ago".
+    pub note: Option<String>,
 }
 
 impl SearchItem {
@@ -41,6 +56,7 @@ impl SearchItem {
             icon: Icon::None,
             actions: Vec::new(),
             preview: None,
+            card: None,
         }
     }
 
@@ -60,15 +76,26 @@ impl SearchItem {
     }
 
     pub fn action(mut self, title: impl Into<String>, command: Command) -> Self {
-        self.actions.push(Action {
-            title: title.into(),
-            command,
-        });
+        self.actions.push(Action::new(title, command));
+        self
+    }
+
+    /// Gives the last action added a key combination of its own (see
+    /// [`shortcut`]), in place of its command's default.
+    pub fn shortcut(mut self, keys: &str) -> Self {
+        if let Some(action) = self.actions.last_mut() {
+            action.shortcut = Some(keys.to_owned());
+        }
         self
     }
 
     pub fn preview(mut self, preview: Preview) -> Self {
         self.preview = Some(Box::new(preview));
+        self
+    }
+
+    pub fn card(mut self, card: AnswerCard) -> Self {
+        self.card = Some(Box::new(card));
         self
     }
 
@@ -88,12 +115,71 @@ pub enum Icon {
     Shell(String),
     /// A symbol from the system icon font (Segoe Fluent Icons / Segoe MDL2 Assets).
     Glyph(char),
+    /// The icon of the site at `origin` (`https://github.com`, see
+    /// [`crate::favicon`]); `glyph` is drawn until it arrives, or without one.
+    Site { origin: String, glyph: char },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Action {
     pub title: String,
     pub command: Command,
+    /// Runs it from the list without opening the action panel, in GPUI's
+    /// keystroke syntax (`ctrl-shift-c`). `None` takes the command's default,
+    /// [`Command::default_shortcut`].
+    pub shortcut: Option<String>,
+}
+
+impl Action {
+    pub fn new(title: impl Into<String>, command: Command) -> Self {
+        Self {
+            title: title.into(),
+            command,
+            shortcut: None,
+        }
+    }
+
+    /// Its own key combination, or its command's default.
+    pub fn shortcut(&self) -> Option<&str> {
+        self.shortcut
+            .as_deref()
+            .or_else(|| self.command.default_shortcut())
+    }
+}
+
+/// Key combinations for actions, named and chosen as Raycast's for Windows
+/// are, so the same action has the same keys in both. The first two actions
+/// are always Enter and Ctrl+Enter, whatever they ask for.
+pub mod shortcut {
+    /// Copies the main thing: a file, a URL.
+    pub const COPY: &str = "ctrl-shift-c";
+    /// Copies something about it: a name.
+    pub const COPY_SECONDARY: &str = "ctrl-alt-c";
+    /// Copies something else about it: a path.
+    pub const COPY_TERTIARY: &str = "alt-shift-c";
+    pub const COPY_DEEPLINK: &str = "ctrl-shift-c";
+    /// Opens it somewhere else: Open With.
+    pub const OPEN: &str = "ctrl-o";
+    /// Shows where it is: Show in Explorer.
+    pub const OPEN_SECONDARY: &str = "ctrl-shift-o";
+    /// A third way to run it: Run as Administrator.
+    pub const TERTIARY: &str = "ctrl-shift-enter";
+    /// A fourth: Open in Terminal.
+    pub const QUATERNARY: &str = "ctrl-alt-enter";
+    /// Deletes it.
+    pub const CLEAR: &str = "ctrl-d";
+    /// Deletes all of them.
+    pub const CLEAR_ALL: &str = "ctrl-alt-d";
+    pub const EDIT: &str = "ctrl-e";
+    /// Creates something from it: a quicklink.
+    pub const SAVE: &str = "ctrl-s";
+    pub const PIN: &str = "ctrl-.";
+    /// Shows more about it: Show Details.
+    pub const INFO: &str = "ctrl-i";
+    /// Adds it to (or removes it from) the favorites.
+    pub const FAVORITE: &str = "ctrl-shift-f";
+    /// Pastes it another way: as plain text.
+    pub const PASTE_PLAIN: &str = "ctrl-shift-v";
 }
 
 /// What an action does. A closed set of safe operations: providers describe
@@ -143,6 +229,11 @@ pub enum Command {
     /// Saves a new (id 0) or edited quicklink. The UI checks it first.
     SaveQuicklink(Quicklink),
     DeleteQuicklink(i64),
+    /// Makes `engine` (named `name`) the web search engine, as in Settings.
+    SetSearchEngine {
+        engine: SearchEngine,
+        name: String,
+    },
     /// Saves a new (id 0) or edited snippet. The UI checks it first.
     SaveSnippet(Snippet),
     DeleteSnippet(i64),
@@ -158,6 +249,14 @@ pub enum Command {
     ImportSnippets,
     /// Asks where to save every snippet as JSON, as Raycast imports them.
     ExportSnippets,
+    /// Adds the snippets in this JSON, which a link brought (`?context=`).
+    ImportSnippetsJson(String),
+    /// Asks for a JSON file of quicklinks, as Raycast exports them, and adds them.
+    ImportQuicklinks,
+    /// Asks where to save every quicklink as JSON, as Raycast imports them.
+    ExportQuicklinks,
+    /// Adds the quicklinks in this JSON, which a link brought (`?context=`).
+    ImportQuicklinksJson(String),
     /// Opens a view on top of the current one; Esc comes back.
     PushView(Box<View>),
     /// Opens a view the provider `provider` builds when asked (see
@@ -171,6 +270,8 @@ pub enum Command {
     RestoreClip {
         id: i64,
         paste: bool,
+        /// Only the text, without the formatting it was copied with.
+        plain: bool,
     },
     /// Pins or unpins a clipboard history entry: pinned ones stay at the top
     /// and are never trimmed.
@@ -201,15 +302,91 @@ pub enum Command {
         target: Option<isize>,
         command: WindowCommand,
     },
+    /// Starts a command line as Windows' Run dialog would (`gpedit.msc`,
+    /// `cmd /k ipconfig`), elevated with `admin`. Only Run produces it.
+    Run {
+        line: String,
+        admin: bool,
+    },
+    /// Moves and resizes window `target` (a raw HWND): pixels, `x` and `y`
+    /// from the top left of its display's work area; an empty one keeps what
+    /// it is. Strings, so a form can fill them in.
+    SetWindowFrame {
+        target: isize,
+        x: String,
+        y: String,
+        width: String,
+        height: String,
+    },
     /// Asks every window of process `pid` to close, as their × buttons would.
     QuitApp(u32),
     /// Ends process `pid` at once; what it hadn't saved is lost.
     ForceQuit(u32),
+    /// Shows a QR code of this text in a view of its own.
+    ShowQrCode(String),
+    /// Puts a QR code of this text on the clipboard, as an image.
+    CopyQrCode(String),
+    /// Asks where to save a QR code of this text as a PNG file.
+    SaveQrCode(String),
+    /// Looks for QR codes and shows what they say.
+    ScanQrCodes(QrSource),
+    /// Saves a Wi-Fi network (a QR code's) to Windows and connects to it.
+    ConnectWifi(WifiNetwork),
+    /// Opens a contact (vCard) or an event (iCalendar) with the app that
+    /// takes them (People, Outlook, Calendar), to add it there.
+    OpenCard {
+        kind: CardKind,
+        text: String,
+    },
+}
+
+/// A Wi-Fi network as a QR code shares it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    pub security: WifiSecurity,
+    /// Empty for an open network.
+    pub password: String,
+    /// It doesn't broadcast its name.
+    pub hidden: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WifiSecurity {
+    /// No password.
+    Open,
+    Wep,
+    /// WPA2 (or WPA) with a password.
+    #[default]
+    Wpa,
+    /// WPA3 with a password.
+    Wpa3,
+}
+
+/// What [`Command::OpenCard`] opens, which picks the file type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CardKind {
+    /// A `.vcf` file.
+    Contact,
+    /// An `.ics` file.
+    Event,
+}
+
+/// Where [`Command::ScanQrCodes`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QrSource {
+    /// Every display, as it is once the launcher is hidden.
+    Screen,
+    /// The image on the clipboard.
+    Clipboard,
 }
 
 /// Where a command takes the text selected in the app the launcher came
-/// from: in an `OpenUrl` URL (percent-encoded) or a quicklink.
+/// from: in an `OpenUrl` URL (percent-encoded) or a quicklink, or as the
+/// whole text of a QR code.
 pub const SELECTION: &str = "{selection}";
+/// A QR code of the clipboard's text: `ShowQrCode(CLIPBOARD)`.
+pub const CLIPBOARD: &str = "{clipboard}";
 
 impl Command {
     /// Whether it uses the selected text ([`SELECTION`]), which the app reads
@@ -218,6 +395,8 @@ impl Command {
         match self {
             Command::OpenUrl(url) => url.contains(SELECTION),
             Command::OpenQuicklink { link, .. } => quicklink::has_selection(link),
+            Command::PasteSnippet { text, .. } => snippet::has_selection(text),
+            Command::ShowQrCode(text) => text == SELECTION,
             _ => false,
         }
     }
@@ -232,8 +411,52 @@ impl Command {
                 link: quicklink::fill_selection(link, text),
                 app: app.clone(),
             },
+            Command::PasteSnippet {
+                text: snippet,
+                paste,
+            } => Command::PasteSnippet {
+                text: snippet::fill_selection(snippet, text),
+                paste: *paste,
+            },
+            Command::ShowQrCode(code) if code == SELECTION => Command::ShowQrCode(text.to_owned()),
             command => command.clone(),
         }
+    }
+
+    /// Whether it's a quicklink with `{clipboard}`, which the app fills in
+    /// with the clipboard's text before running it.
+    pub fn needs_clipboard(&self) -> bool {
+        matches!(self, Command::OpenQuicklink { link, .. } if quicklink::has_clipboard(link))
+    }
+
+    /// The command with `text` in place of `{clipboard}`.
+    pub fn with_clipboard(&self, text: &str) -> Command {
+        match self {
+            Command::OpenQuicklink { link, app } => Command::OpenQuicklink {
+                link: quicklink::fill_clipboard(link, text),
+                app: app.clone(),
+            },
+            command => command.clone(),
+        }
+    }
+
+    /// The keys an action with this command takes when it names none.
+    pub fn default_shortcut(&self) -> Option<&'static str> {
+        Some(match self {
+            Command::OpenWith(_) => shortcut::OPEN,
+            Command::ShowInFolder(_) => shortcut::OPEN_SECONDARY,
+            Command::RunAsAdmin(_) => shortcut::TERTIARY,
+            Command::OpenTerminal(_) => shortcut::QUATERNARY,
+            Command::CopyFile(_) => shortcut::COPY,
+            Command::MoveToTrash(_)
+            | Command::DeleteQuicklink(_)
+            | Command::DeleteSnippet(_)
+            | Command::DeleteClip(_) => shortcut::CLEAR,
+            Command::ClearClipboardHistory => shortcut::CLEAR_ALL,
+            Command::PinClip { .. } => shortcut::PIN,
+            Command::SaveQrCode(_) => shortcut::SAVE,
+            _ => return None,
+        })
     }
 
     /// Commands that are hard to undo ask for a second Enter.
@@ -247,6 +470,9 @@ impl Command {
                 | Command::ClearClipboardHistory
                 | Command::ForceQuit(_)
                 | Command::MoveToTrash(_)
+                // A link brought them: a web page can't add any by itself.
+                | Command::ImportSnippetsJson(_)
+                | Command::ImportQuicklinksJson(_)
         )
     }
 }
@@ -304,6 +530,14 @@ mod tests {
             link: r"C:\Notes\{selection}.md".into(),
             app: None,
         };
+        let qr = Command::ShowQrCode(SELECTION.into());
+        assert!(qr.needs_selection());
+        assert_eq!(
+            qr.with_selection("a {b}"),
+            Command::ShowQrCode("a {b}".into())
+        );
+        // Only the whole text: a code of other text that mentions it is as typed.
+        assert!(!Command::ShowQrCode("see {selection}".into()).needs_selection());
         assert_eq!(
             path.with_selection("todo list"),
             Command::OpenQuicklink {

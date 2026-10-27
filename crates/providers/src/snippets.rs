@@ -8,10 +8,10 @@
 use std::sync::{Arc, Mutex};
 
 use spotlight_core::{
-    item::{Action, Command, Icon, SearchItem},
+    item::{Action, Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
-    snippet::{self, Argument, Snippet},
+    snippet::{self, Snippet},
     view::{Field, FieldKind, FormView, ListView, Preview, PreviewBody, View},
 };
 use spotlight_store::Store;
@@ -56,7 +56,8 @@ impl Snippets {
     }
 
     /// A row of Search Snippets: Enter pastes it, Ctrl+Enter copies it.
-    fn item(&self, snippet: &Snippet) -> SearchItem {
+    /// `all` are every snippet, for the ones it includes.
+    fn item(&self, snippet: &Snippet, all: &[Snippet]) -> SearchItem {
         let mut item = SearchItem::new(item_id(ID, &snippet.id.to_string()), snippet.name.clone())
             .icon(Icon::Glyph(glyph::SNIPPET));
         if let Some(keyword) = &snippet.keyword {
@@ -68,8 +69,8 @@ impl Snippets {
             .cloned()
             .chain([snippet.text.chars().take(SEARCHED_CHARS).collect()])
             .collect();
-        item.actions.push(paste_action(snippet, true));
-        item.actions.push(paste_action(snippet, false));
+        item.actions.push(paste_action(snippet, all, true));
+        item.actions.push(paste_action(snippet, all, false));
         if self.editable() {
             let edit = edit_form("Edit Snippet", snippet);
             let copy = Snippet {
@@ -81,6 +82,7 @@ impl Snippets {
             let duplicate = edit_form("Duplicate Snippet", &copy);
             item = item
                 .action("Edit Snippet…", Command::PushView(Box::new(edit)))
+                .shortcut(shortcut::EDIT)
                 .action("Duplicate Snippet…", Command::PushView(Box::new(duplicate)))
                 .action("Delete Snippet", Command::DeleteSnippet(snippet.id));
         }
@@ -152,11 +154,10 @@ impl Provider for Snippets {
         Some(View::List(ListView {
             title: "Snippets".into(),
             placeholder: Some("Search snippets…".into()),
-            items: self
-                .load()
-                .iter()
-                .map(|snippet| self.item(snippet))
-                .collect(),
+            items: {
+                let all = self.load();
+                all.iter().map(|snippet| self.item(snippet, &all)).collect()
+            },
             empty: Some("No snippets yet. Create one with Create Snippet.".into()),
             filters: Vec::new(),
             live: false,
@@ -208,70 +209,25 @@ fn edit_form(title: &str, snippet: &Snippet) -> View {
     })
 }
 
-/// Pastes (or copies) `snippet`, after a form for its arguments if it has any.
-fn paste_action(snippet: &Snippet, paste: bool) -> Action {
-    let arguments = snippet::arguments(&snippet.text);
-    let command = if arguments.is_empty() {
-        Command::PasteSnippet {
-            text: snippet.text.clone(),
-            paste,
-        }
+/// Pastes (or copies) `snippet`, its `{snippet}`s replaced from `all`,
+/// after a form for its arguments if it has any.
+fn paste_action(snippet: &Snippet, all: &[Snippet], paste: bool) -> Action {
+    let text = snippet::inline(&snippet.text, all);
+    let command = if snippet::arguments(&text).is_empty() {
+        Command::PasteSnippet { text, paste }
     } else {
-        Command::PushView(Box::new(arguments_form(snippet, &arguments, paste)))
-    };
-    Action {
-        title: if paste {
-            "Paste Snippet"
-        } else {
-            "Copy Snippet"
-        }
-        .into(),
-        command,
-    }
-}
-
-/// A field per argument; submitting pastes the snippet with them.
-fn arguments_form(snippet: &Snippet, arguments: &[Argument], paste: bool) -> View {
-    let fields = arguments
-        .iter()
-        .enumerate()
-        .map(|(ix, argument)| {
-            let kind = if argument.is_free_text() {
-                FieldKind::Text {
-                    placeholder: argument.name.clone(),
-                    default: argument.default.clone(),
-                    required: argument.fallback().is_empty(),
-                }
-            } else {
-                FieldKind::Dropdown {
-                    default: argument
-                        .options
-                        .iter()
-                        .position(|option| *option == argument.default)
-                        .unwrap_or(0),
-                    options: argument
-                        .options
-                        .iter()
-                        .map(|option| (option.clone(), option.clone()))
-                        .collect(),
-                }
-            };
-            Field {
-                id: snippet::field_id(ix),
-                label: argument.name.clone(),
-                kind,
-            }
-        })
-        .collect();
-    View::Form(FormView {
-        title: snippet.name.clone(),
-        fields,
-        submit_title: if paste { "Paste" } else { "Copy" }.into(),
-        submit: Command::PasteSnippet {
-            text: snippet::with_field_ids(&snippet.text),
+        Command::PushView(Box::new(snippet::arguments_form(
+            &snippet.name,
+            &text,
             paste,
-        },
-    })
+        )))
+    };
+    let title = if paste {
+        "Paste Snippet"
+    } else {
+        "Copy Snippet"
+    };
+    Action::new(title, command)
 }
 
 /// The text as saved, placeholders and all, and its keyword.

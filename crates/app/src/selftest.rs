@@ -166,20 +166,114 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     press(window, "ctrl-k", cx);
     sleep(SETTLE_MS).await;
     let panel = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten();
     press(window, "escape", cx);
     sleep(SETTLE_MS).await;
     let (closed, visible) = window
-        .update(cx, |launcher, _, _| {
-            (launcher.panel_actions().is_none(), launcher.is_visible())
+        .update(cx, |launcher, _, cx| {
+            (launcher.panel_actions(cx).is_none(), launcher.is_visible())
         })
         .unwrap_or_default();
     let expected = ["Copy Answer", "Copy Calculation"].map(String::from);
     eprintln!(
         "[selftest] action panel: {panel:?}, esc closes it: {closed}, window stays: {visible} {}",
         if panel.as_deref() == Some(&expected[..]) && closed && visible {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // Typing in the open panel narrows its actions.
+    press(window, "ctrl-k", cx);
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.type_text("calc", window, cx)
+        })
+        .ok();
+    sleep(SETTLE_MS).await;
+    let (narrowed, selected) = window
+        .update(cx, |launcher, _, cx| {
+            (launcher.panel_actions(cx), launcher.panel_selected(cx))
+        })
+        .unwrap_or_default();
+    press(window, "escape", cx);
+    sleep(SETTLE_MS).await;
+    let expected = ["Copy Calculation".to_owned()];
+    eprintln!(
+        "[selftest] action panel search: {narrowed:?}, selected {selected:?} {}",
+        if narrowed.as_deref() == Some(&expected[..])
+            && selected.as_deref() == Some("Copy Calculation")
+        {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // Run: after its prefix only Run's rows, the typed command first; a
+    // command's name gets a row under the others. Nothing is run.
+    let mut run_titles = Vec::new();
+    for query in [">cmd /k echo spotlight", "notepad"] {
+        press(window, "ctrl-a", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(query, window, cx)
+            })
+            .ok();
+        sleep(SETTLE_MS).await;
+        run_titles.push(
+            window
+                .update(cx, |launcher, _, _| launcher.result_titles())
+                .unwrap_or_default(),
+        );
+    }
+    let prefixed = run_titles[0].first().map(String::as_str);
+    let by_name = run_titles[1].iter().any(|title| title == "Run notepad.exe");
+    eprintln!(
+        "[selftest] run: prefix -> {prefixed:?}, name row: {by_name} {}",
+        if prefixed == Some("Run “cmd /k echo spotlight”")
+            && run_titles[0]
+                .iter()
+                .all(|title| !title.contains("Search Google"))
+            && by_name
+        {
+            "OK"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // Sections: before anything is typed (the catalog by kind),
+    // and around a search's answer, results and fallbacks.
+    let mut sections = Vec::new();
+    for query in ["", "12*12"] {
+        press(window, "ctrl-a", cx);
+        press(window, "backspace", cx);
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.type_text(query, window, cx)
+            })
+            .ok();
+        sleep(SETTLE_MS).await;
+        sections.push(
+            window
+                .update(cx, |launcher, _, _| launcher.section_titles())
+                .unwrap_or_default(),
+        );
+    }
+    eprintln!(
+        "[selftest] sections: {sections:?} {}",
+        if ["Commands", "Applications"]
+            .iter()
+            .all(|title| sections[0].iter().any(|known| known == title))
+            && sections[1].first().map(String::as_str) == Some("Calculator")
+            && sections[1]
+                .last()
+                .is_some_and(|title| title.starts_with("Use “12*12”"))
+        {
             "OK"
         } else {
             "FAIL"
@@ -209,6 +303,7 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
     for (name, outcome) in [
         ("grid", grid_round_trip(window, cx).await),
         ("detail", detail_round_trip(window, cx).await),
+        ("qr", qr_round_trip(window, cx).await),
         ("form", form_round_trip(window, cx).await),
         ("text area", text_area_round_trip(window, cx).await),
         ("quicklink", quicklink_round_trip(window, cx).await),
@@ -262,6 +357,8 @@ pub async fn run(window: WindowHandle<Launcher>, cx: &mut AsyncApp) {
 
     let compact = compact_round_trip(window, cx).await;
     eprintln!("[selftest] compact mode: {compact}");
+    let favorite_keys = favorite_keys(window, cx).await;
+    eprintln!("[selftest] favorite keys: {favorite_keys}");
 
     // The HUD, for a look from outside: the line below says when it's up.
     sleep(SETTLE_MS).await;
@@ -336,7 +433,7 @@ async fn compact_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         executor.timer(Duration::from_millis(SETTLE_MS)).await;
         let height = height(cx);
         seen.push(format!("{step} {height:.0}"));
-        // Collapsed is the search row alone (52); expanded is hundreds.
+        // Collapsed is the search row alone (64); expanded is hundreds.
         if (height > 100.) != expanded && result == "OK" {
             result = format!("FAIL at {step}");
         }
@@ -349,6 +446,77 @@ async fn compact_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         })
         .ok();
     format!("{result} ({})", seen.join(", "))
+}
+
+/// Makes Keyboard Shortcuts the only favorite, then checks that Ctrl+1
+/// leaves it shut in expanded mode, in compact mode with its favorites
+/// turned off and with the results shown by ↓, that Ctrl+2 (no favorite there) does nothing, and that Ctrl+1
+/// opens it from the collapsed compact window. The favorites are put back
+/// after. Returns how far it got.
+async fn favorite_keys(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    const ITEM: &str = "spotlight:shortcuts";
+    let executor = cx.background_executor().clone();
+    let saved = window
+        .update(cx, |launcher, _, cx| {
+            let saved = launcher.favorites();
+            launcher.set_favorites(vec![ITEM.to_owned()], cx);
+            launcher.set_pinned(true);
+            saved
+        })
+        .unwrap_or_default();
+    // Sets the mode and the switch while hidden, as Settings does, shows
+    // the launcher, presses each of `keys` and returns the open view's title.
+    let try_keys = async |mode: WindowMode, on: bool, keys: &[&str], cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, cx| {
+                launcher.hide(cx);
+                launcher.set_window_mode(mode, cx);
+                launcher.set_compact_favorites(on, cx);
+            })
+            .ok();
+        executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        window
+            .update(cx, |launcher, window, cx| {
+                launcher.show(Instant::now(), window, cx)
+            })
+            .ok();
+        executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        for keys in keys {
+            press(window, keys, cx);
+            executor.timer(Duration::from_millis(SETTLE_MS)).await;
+        }
+        window
+            .update(cx, |launcher, _, _| launcher.screen_title())
+            .ok()
+            .flatten()
+    };
+    let result = 'checks: {
+        let cases = [
+            (WindowMode::Expanded, true, &["ctrl-1"][..], "expanded"),
+            (WindowMode::Compact, false, &["ctrl-1"], "turned off"),
+            (WindowMode::Compact, true, &["down", "ctrl-1"], "shown by ↓"),
+            (WindowMode::Compact, true, &["ctrl-2"], "Ctrl+2"),
+        ];
+        for (mode, on, keys, case) in cases {
+            if let Some(title) = try_keys(mode, on, keys, cx).await {
+                break 'checks format!("FAIL: {case} opened {title:?}");
+            }
+        }
+        match try_keys(WindowMode::Compact, true, &["ctrl-1"], cx).await {
+            Some(title) if title == "Keyboard Shortcuts" => "OK".to_owned(),
+            other => format!("FAIL: Ctrl+1 showed {other:?}"),
+        }
+    };
+    window
+        .update(cx, |launcher, _, cx| {
+            launcher.set_favorites(saved, cx);
+            launcher.set_compact_favorites(true, cx);
+            launcher.set_pinned(false);
+            launcher.hide(cx);
+            launcher.set_window_mode(WindowMode::Expanded, cx);
+        })
+        .ok();
+    result
 }
 
 /// Sends `keystroke` through GPUI's key dispatch, as a real key press arrives.
@@ -382,7 +550,7 @@ async fn alias_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> 
     async fn pick(window: WindowHandle<Launcher>, title: &str, cx: &mut AsyncApp) -> bool {
         press(window, "ctrl-k", cx);
         let titles = window
-            .update(cx, |launcher, _, _| launcher.panel_actions())
+            .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -394,7 +562,7 @@ async fn alias_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> 
             press(window, "down", cx);
         }
         let selected = window
-            .update(cx, |launcher, _, _| launcher.panel_selected())
+            .update(cx, |launcher, _, cx| launcher.panel_selected(cx))
             .ok()
             .flatten();
         if !selected.is_some_and(|selected| selected.starts_with(title)) {
@@ -712,7 +880,7 @@ async fn deeplink_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) 
     press(window, "ctrl-k", cx);
     executor.timer(Duration::from_millis(SETTLE_MS)).await;
     let actions = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten();
     if actions.as_deref() != Some(&["Open Command".to_owned(), "Always Open Command".to_owned()]) {
@@ -787,6 +955,75 @@ async fn detail_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) ->
     press(window, "down", cx);
     match back_to_search(window, cx).await {
         Ok(()) => "opened, scrolled, back to search".into(),
+        Err(why) => why,
+    }
+}
+
+/// `qr <text>` in root search opens the code's view, and the code it draws
+/// is read back from a capture of the screen (only whether it's there is
+/// printed, nothing else the screen shows). `SPOTLIGHT_SELFTEST_HOLD=<ms>`
+/// keeps the view open that long, for a look from outside.
+async fn qr_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -> String {
+    const TEXT: &str = "https://example.com/spotlight-selftest";
+    if let Err(why) = open_from_search(window, &format!("qr {TEXT}"), "Generate QR Code", cx).await
+    {
+        return why;
+    }
+    let title = window
+        .update(cx, |launcher, _, _| launcher.screen_title())
+        .ok()
+        .flatten();
+    if title.as_deref() != Some("QR Code") {
+        return format!("didn't open ({title:?})");
+    }
+    cx.background_executor()
+        .timer(Duration::from_millis(SETTLE_MS))
+        .await;
+    let read = cx
+        .background_executor()
+        .spawn(async {
+            spotlight_platform_win::screen::capture()
+                .map(|screen| spotlight_qr::read(&screen).iter().any(|code| code == TEXT))
+        })
+        .await;
+    let read = match read {
+        Ok(true) => "read back from the screen",
+        Ok(false) => "not found on the screen",
+        Err(_) => "screen not captured",
+    };
+    // A scanned Wi-Fi network's view on top: its panel offers to connect
+    // first. Nothing is run.
+    let wifi = "WIFI:S:Selftest Network;T:WPA;P:example-password;;";
+    window
+        .update(cx, |launcher, window, cx| {
+            launcher.open_view(spotlight_qr::view(wifi, true), window, cx)
+        })
+        .ok();
+    press(window, "ctrl-k", cx);
+    cx.background_executor()
+        .timer(Duration::from_millis(SETTLE_MS))
+        .await;
+    let actions = window
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    press(window, "escape", cx);
+    if actions.first().map(String::as_str) != Some("Connect to Network") {
+        return format!("Wi-Fi code's actions: {actions:?}");
+    }
+    if let Some(hold) = env::var("SPOTLIGHT_SELFTEST_HOLD")
+        .ok()
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        eprintln!("[selftest] qr view held for {hold} ms");
+        cx.background_executor()
+            .timer(Duration::from_millis(hold))
+            .await;
+    }
+    press(window, "escape", cx);
+    match back_to_search(window, cx).await {
+        Ok(()) => format!("opened, {read}, Wi-Fi connects first, back to search"),
         Err(why) => why,
     }
 }
@@ -1039,7 +1276,7 @@ async fn quicklink_save_and_delete(window: WindowHandle<Launcher>, cx: &mut Asyn
     }
     press(window, "ctrl-k", cx);
     let titles = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -1113,7 +1350,7 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
     let delete = |cx: &mut AsyncApp| -> Result<(), String> {
         press(window, "ctrl-k", cx);
         let actions = window
-            .update(cx, |launcher, _, _| launcher.panel_actions())
+            .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -1127,6 +1364,19 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         press(window, "enter", cx);
         Ok(())
     };
+
+    // Export writes every snippet: the data folder may have its own.
+    let file = env::temp_dir().join(format!("spotlight-selftest-{}.json", std::process::id()));
+    let export = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |launcher, _, _| launcher.export_snippets_to(&file))
+            .unwrap_or_else(|_| Err("window gone".into()))
+    };
+    let before = match export(cx) {
+        Ok(count) => count,
+        Err(err) => return format!("couldn't count the snippets: {err}"),
+    };
+    let _ = std::fs::remove_file(&file);
 
     if let Err(why) = create("Selftest Snippet", cx).await {
         return why;
@@ -1157,14 +1407,11 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
         return format!("saved, but the list has {:?}", titles(cx));
     }
 
-    let file = env::temp_dir().join(format!("spotlight-selftest-{}.json", std::process::id()));
-    let exported = window
-        .update(cx, |launcher, _, _| launcher.export_snippets_to(&file))
-        .unwrap_or_else(|_| Err("window gone".into()));
+    let exported = export(cx);
     let json = std::fs::read_to_string(&file).unwrap_or_default();
-    if exported != Ok(1) || !json.contains(r#""keyword": ";zzs""#) {
+    if exported != Ok(before + 1) || !json.contains(r#""keyword": ";zzs""#) {
         let _ = std::fs::remove_file(&file);
-        return format!("listed, but the export gave {exported:?}: {json}");
+        return format!("listed, but the export gave {exported:?} (had {before}): {json}");
     }
 
     if let Err(why) = delete(cx) {
@@ -1185,7 +1432,13 @@ async fn snippet_round_trip(window: WindowHandle<Launcher>, cx: &mut AsyncApp) -
     let first = import(cx);
     let second = import(cx);
     let _ = std::fs::remove_file(&file);
-    if first != "Imported 1 snippet" || second != "Nothing new to import" {
+    // The folder's own snippets are in the file too, and already there.
+    let added = if before == 0 {
+        "Imported 1 snippet".to_owned()
+    } else {
+        format!("Imported 1, skipped {before}")
+    };
+    if first != added || second != "Nothing new to import" {
         return format!("deleted, but importing gave {first:?}, then {second:?}");
     }
     if let Err(why) = back_to_search(window, cx).await {
@@ -1280,7 +1533,7 @@ async fn snippet_paste(window: WindowHandle<Launcher>, target: isize, cx: &mut A
     }
     press(window, "ctrl-k", cx);
     let actions = window
-        .update(cx, |launcher, _, _| launcher.panel_actions())
+        .update(cx, |launcher, _, cx| launcher.panel_actions(cx))
         .ok()
         .flatten()
         .unwrap_or_default();

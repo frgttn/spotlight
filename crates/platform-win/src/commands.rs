@@ -4,7 +4,10 @@
 
 use std::{os::windows::process::CommandExt, process, thread};
 
-use spotlight_core::{item::Command, quicklink};
+use spotlight_core::{
+    item::{CardKind, Command},
+    quicklink,
+};
 use windows::{
     Win32::{
         System::{
@@ -23,9 +26,9 @@ use windows::{
 };
 
 use crate::{
-    links,
+    links, run,
     system::{self, Outcome},
-    wm,
+    wifi, wm,
 };
 
 /// What `OpenUrl` may open. `ShellExecute` would just as happily run a
@@ -34,6 +37,9 @@ const URL_SCHEMES: &[&str] = &[
     "https://",
     "http://",
     "ms-settings:",
+    // A new email, a call (Phone Link): what a QR code's contact offers.
+    "mailto:",
+    "tel:",
     // Game launchers, to start a game they installed.
     "steam://",
     "com.epicgames.launcher://",
@@ -116,11 +122,16 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::PushView(_)
         | Command::SaveQuicklink(_)
         | Command::DeleteQuicklink(_)
+        | Command::SetSearchEngine { .. }
         | Command::SaveSnippet(_)
         | Command::DeleteSnippet(_)
         | Command::PasteSnippet { .. }
         | Command::ImportSnippets
         | Command::ExportSnippets
+        | Command::ImportSnippetsJson(_)
+        | Command::ImportQuicklinks
+        | Command::ExportQuicklinks
+        | Command::ImportQuicklinksJson(_)
         | Command::OpenProviderView { .. }
         | Command::SearchIn { .. }
         | Command::ProviderAction { .. }
@@ -129,6 +140,10 @@ fn run_blocking(command: &Command) -> Outcome {
         | Command::DeleteClip(_)
         | Command::ClearClipboardHistory
         | Command::IgnoreClipApp(_)
+        | Command::ShowQrCode(_)
+        | Command::CopyQrCode(_)
+        | Command::SaveQrCode(_)
+        | Command::ScanQrCodes(_)
         | Command::Complete(_) => Err(format!("{command:?} must be handled by the UI")),
         Command::System(command) => system::run_blocking(*command),
         Command::Window {
@@ -138,9 +153,35 @@ fn run_blocking(command: &Command) -> Outcome {
         Command::Window { target: None, .. } => {
             Err("No window to arrange: the UI fills in the target".into())
         }
+        Command::SetWindowFrame {
+            target,
+            x,
+            y,
+            width,
+            height,
+        } => wm::set_frame_from(*target, [x, y, width, height]),
+        Command::Run { line, admin } => run::start(line, *admin),
+        Command::ConnectWifi(network) => wifi::connect(network),
+        Command::OpenCard { kind, text } => open_card(*kind, text),
         Command::QuitApp(pid) => wm::quit_app(*pid),
         Command::ForceQuit(pid) => wm::force_quit(*pid),
     }
+}
+
+/// Writes a contact or event to a file of its type in the temp folder and
+/// opens it, so People, Outlook or Calendar offers to add it. Only these two
+/// types: opening a file of any other type could run it.
+fn open_card(kind: CardKind, text: &str) -> Outcome {
+    let name = match kind {
+        CardKind::Contact => "Contact.vcf",
+        CardKind::Event => "Event.ics",
+    };
+    let folder = std::env::temp_dir().join("Spotlight");
+    let path = folder.join(name);
+    std::fs::create_dir_all(&folder)
+        .and_then(|()| std::fs::write(&path, text))
+        .map_err(|err| format!("Couldn't write the file: {err}"))?;
+    shell_execute("open", &path.to_string_lossy())
 }
 
 /// `ShellExecute` with `verb`, blocking.
@@ -150,19 +191,28 @@ fn shell_execute(verb: &str, target: &str) -> Outcome {
 
 /// `ShellExecute` with `verb` and command-line `parameters` for a program, blocking.
 fn shell_execute_with(verb: &str, target: &str, parameters: &str) -> Outcome {
+    shell_execute_in(verb, target, parameters, "")
+}
+
+/// [`shell_execute_with`], started in folder `dir` (empty: ours).
+pub(crate) fn shell_execute_in(verb: &str, target: &str, parameters: &str, dir: &str) -> Outcome {
     let parameters = HSTRING::from(parameters);
+    let dir = HSTRING::from(dir);
+    let optional = |text: &HSTRING| {
+        if text.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(text.as_ptr())
+        }
+    };
     let code = unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         ShellExecuteW(
             None,
             &HSTRING::from(verb),
             &HSTRING::from(target),
-            if parameters.is_empty() {
-                PCWSTR::null()
-            } else {
-                PCWSTR(parameters.as_ptr())
-            },
-            PCWSTR::null(),
+            optional(&parameters),
+            optional(&dir),
             SW_SHOWNORMAL,
         )
         .0 as isize

@@ -174,7 +174,7 @@ GPUI gotcha: with `WindowOptions { show: false }`, GPUI applies the window size 
 
 ## 7. Key crates
 
-`gpui` (pinned, no `gpui-component`) · `windows` · `tokio` · `nucleo` · `rusqlite` · `fend-core` · `serde`/`serde_json` · `notify` · `tray-icon` · `pulldown-cmark` (markdown in Detail) · `image` · `tracing` · `directories` · later: `wasmtime`, `tantivy`.
+`gpui` (pinned, no `gpui-component`) · `windows` · `tokio` · `nucleo` · `rusqlite` · `fend-core` · `serde`/`serde_json` · `notify` · `tray-icon` · `pulldown-cmark` (markdown in Detail) · `image` · `qrcode` / `rqrr` (QR codes) · `tracing` · `directories` · later: `wasmtime`, `tantivy`.
 
 ---
 

@@ -13,8 +13,8 @@ use windows::{
         Globalization::GetUserDefaultLocaleName,
         Graphics::{
             Dwm::{
-                DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmGetWindowAttribute,
-                DwmSetWindowAttribute,
+                DWMWA_BORDER_COLOR, DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+                DwmGetWindowAttribute, DwmSetWindowAttribute,
             },
             Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
         },
@@ -112,6 +112,21 @@ pub fn round_corners(raw: isize) {
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &preference as *const _ as *const c_void,
             size_of::<i32>() as u32,
+        );
+    }
+}
+
+/// Sets the colour (`0xRRGGBB`) of the thin border Windows 11 draws around
+/// the window, along its rounded corners.
+pub fn set_border_color(raw: isize, rgb: u32) {
+    // COLORREF is 0x00BBGGRR.
+    let colorref = ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd(raw),
+            DWMWA_BORDER_COLOR,
+            &colorref as *const _ as *const c_void,
+            size_of::<u32>() as u32,
         );
     }
 }
@@ -286,6 +301,21 @@ pub fn hide(raw: isize) {
 }
 
 /// Brings an already visible window to the front.
+/// Brings our window to the front when Windows wouldn't let us (no hotkey
+/// or click of ours came just before): a no-op mouse input makes our
+/// process the last to send input, which allows it.
+pub fn take_foreground(raw: isize) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_MOUSE, SendInput};
+    unsafe {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            ..Default::default()
+        };
+        SendInput(&[input], size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd(raw));
+    }
+}
+
 pub fn focus(raw: isize) {
     unsafe {
         let _ = SetForegroundWindow(hwnd(raw));

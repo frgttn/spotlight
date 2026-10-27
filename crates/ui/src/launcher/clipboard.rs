@@ -11,7 +11,7 @@ use gpui::{
 };
 use image::{Frame, ImageFormat};
 use spotlight_core::{
-    clip::{ClipKind, IGNORED_APPS_SETTING, IgnoredApp},
+    clip::{ClipKind, IGNORED_APPS_SETTING, IgnoredApp, RichText},
     item::SearchItem,
     view::{Preview, PreviewBody},
 };
@@ -49,18 +49,38 @@ impl PreviewImage {
 }
 
 impl Launcher {
-    /// Puts entry `id` back on the clipboard; with `paste`, also pastes it
-    /// into the window that was active before the launcher opened. Hides the
-    /// launcher either way.
-    pub(super) fn restore_clip(&mut self, id: i64, paste: bool, cx: &mut Context<Self>) {
-        let clip = self
+    /// Puts entry `id` back on the clipboard, text with the formatting it
+    /// was copied with unless `plain`; with `paste`, also pastes it into the
+    /// window that was active before the launcher opened. Hides the launcher
+    /// either way.
+    pub(super) fn restore_clip(
+        &mut self,
+        id: i64,
+        paste: bool,
+        plain: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (clip, rich) = self
             .store
             .as_ref()
-            .and_then(|store| store.lock().ok()?.clip(id).ok().flatten());
-        let content = clip.as_ref().and_then(content_of);
-        let written = match &content {
-            Some(content) => clipboard::write(self.hwnd, content),
-            None => Err("This entry is gone".into()),
+            .and_then(|store| {
+                let store = store.lock().ok()?;
+                let clip = store.clip(id).ok().flatten()?;
+                let rich = if clip.rich && !plain {
+                    store.clip_rich(id).unwrap_or_default()
+                } else {
+                    RichText::default()
+                };
+                Some((clip, rich))
+            })
+            .unzip();
+        let rich = rich.unwrap_or_default();
+        let written = match clip.as_ref().map(|clip| (clip, content_of(clip))) {
+            Some((clip, _)) if clip.kind == ClipKind::Text && !rich.is_empty() => {
+                clipboard::write_rich(self.hwnd, &clip.content, &rich)
+            }
+            Some((_, Some(content))) => clipboard::write(self.hwnd, &content),
+            _ => Err("This entry is gone".into()),
         };
         if let Err(err) = written {
             eprintln!("[spotlight] could not restore clipboard entry {id}: {err}");
@@ -203,7 +223,7 @@ impl Launcher {
             .min_w_0()
             .h_full()
             .border_l_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::p().hairline))
             .flex()
             .flex_col();
         let Some((item, preview)) = item.and_then(|item| {
@@ -224,7 +244,7 @@ impl Launcher {
                 .font_family("Consolas")
                 .text_size(px(12.5))
                 .line_height(px(18.))
-                .text_color(rgba(theme::TEXT))
+                .text_color(rgba(theme::p().text))
                 .child(SharedString::from(text))
                 .into_any_element(),
             PreviewBody::Thumbnail(path) => {
@@ -256,7 +276,7 @@ impl Launcher {
                         div()
                             .flex_none()
                             .text_size(px(13.))
-                            .text_color(rgba(theme::TEXT))
+                            .text_color(rgba(theme::p().text))
                             .child(SharedString::from(item.title.clone())),
                     )
                     .into_any_element()
@@ -269,7 +289,7 @@ impl Launcher {
                         .into_any_element(),
                     None if matches!(self.preview_image, Some(PreviewImage::Failed(_))) => div()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child("The image file is missing")
                         .into_any_element(),
                     None => div().into_any_element(),
@@ -309,7 +329,7 @@ impl Launcher {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .truncate()
                                     .child(folder),
                             )
@@ -318,7 +338,7 @@ impl Launcher {
                         list.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgba(theme::TEXT_FAINT))
+                                .text_color(rgba(theme::p().text_faint))
                                 .child(format!("and {more} more")),
                         )
                     })
@@ -330,7 +350,7 @@ impl Launcher {
             .px_4()
             .py_2()
             .border_t_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::p().hairline))
             .flex()
             .flex_col()
             .gap_1()
@@ -343,14 +363,14 @@ impl Launcher {
                     .child(
                         div()
                             .flex_none()
-                            .text_color(rgba(theme::TEXT_FAINT))
+                            .text_color(rgba(theme::p().text_faint))
                             .child(label),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(rgba(theme::TEXT_MUTED))
+                            .text_color(rgba(theme::p().text_muted))
                             .child(value),
                     )
             }));

@@ -17,6 +17,7 @@ use std::{
 };
 
 use image::{ImageFormat, RgbaImage};
+use spotlight_core::clip::RichText;
 use windows::{
     Win32::{
         Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND},
@@ -71,6 +72,8 @@ pub struct Image {
 #[derive(Clone, Debug)]
 pub struct Copied {
     pub content: Content,
+    /// The formatting copied with text; empty for anything else.
+    pub rich: RichText,
     /// The app that copied it: its display name and program path. `None`
     /// when it can't be told, and when Spotlight itself wrote it.
     pub app: Option<(String, String)>,
@@ -78,6 +81,11 @@ pub struct Copied {
 
 /// Text longer than this (in UTF-16 units, ~4 MB) isn't kept.
 const MAX_TEXT: usize = 2 * 1024 * 1024;
+/// Formatting larger than this (bytes) isn't kept; the text still is.
+const MAX_FORMATTING: usize = 4 * 1024 * 1024;
+/// The clipboard formats formatting comes in.
+const HTML_FORMAT: PCWSTR = w!("HTML Format");
+const RTF_FORMAT: PCWSTR = w!("Rich Text Format");
 /// Neither are images larger than this many pixels (an 8K screenshot is 33 M).
 const MAX_PIXELS: u64 = 50_000_000;
 /// How long after a change the clipboard is read, for the app to finish
@@ -174,13 +182,17 @@ const PRIVATE_FORMATS: [PCWSTR; 2] = [
 /// or of a kind the history doesn't keep. The clipboard stays open only
 /// while the bytes are copied; images are converted after it's closed.
 fn read(window: HWND, apps: &mut AppNames) -> Option<Copied> {
-    let (raw, owner) = {
+    let (raw, rich, owner) = {
         let _open = Open::with_retries(window)?;
         if is_private() {
             return None;
         }
         let raw = read_files().or_else(read_text).or_else(read_image)?;
-        (raw, unsafe { GetClipboardOwner() }.ok())
+        let rich = match raw {
+            Raw::Content(Content::Text(_)) => read_rich(),
+            _ => RichText::default(),
+        };
+        (raw, rich, unsafe { GetClipboardOwner() }.ok())
     };
     let content = match raw {
         Raw::Content(content) => content,
@@ -206,7 +218,7 @@ fn read(window: HWND, apps: &mut AppNames) -> Option<Copied> {
     let app = owner
         .filter(|owner| !owner.is_invalid())
         .and_then(|owner| apps.of_window(owner));
-    Some(Copied { content, app })
+    Some(Copied { content, rich, app })
 }
 
 /// What was copied, as taken off the open clipboard.
@@ -265,6 +277,25 @@ fn read_text() -> Option<Raw> {
         (units.len() <= MAX_TEXT).then(|| String::from_utf16_lossy(&units))
     })??;
     (!text.trim().is_empty()).then_some(Raw::Content(Content::Text(text)))
+}
+
+/// The formatting that came with copied text, each kind if it isn't too large.
+fn read_rich() -> RichText {
+    let format = |name: PCWSTR| {
+        let format = unsafe { RegisterClipboardFormatW(name) };
+        if !available(format) {
+            return None;
+        }
+        with_data(format, |bytes| {
+            (bytes.len() <= MAX_FORMATTING).then(|| bytes.to_vec())
+        })
+        .flatten()
+        .filter(|bytes| bytes.iter().any(|&byte| byte != 0))
+    };
+    RichText {
+        html: format(HTML_FORMAT),
+        rtf: format(RTF_FORMAT),
+    }
 }
 
 /// The copied image: the PNG an app put on the clipboard (browsers,
@@ -366,6 +397,30 @@ fn dib_to_rgba(dib: &[u8]) -> Option<RgbaImage> {
     RgbaImage::from_raw(width, rows, rgba)
 }
 
+/// The image on the clipboard now, or the picture file when one file was
+/// copied in Explorer. `Ok(None)`: there's no image. Blocking: decodes it.
+pub fn image(owner: isize) -> Result<Option<RgbaImage>, String> {
+    let raw = {
+        let _open = Open::with_retries(HWND(owner as *mut c_void))
+            .ok_or("the clipboard is busy in another app")?;
+        read_image().or_else(read_files)
+    };
+    let unreadable = |err: image::ImageError| format!("unreadable image: {err}");
+    Ok(match raw {
+        Some(Raw::Png(png)) => Some(
+            image::load_from_memory_with_format(&png, ImageFormat::Png)
+                .map_err(unreadable)?
+                .into_rgba8(),
+        ),
+        Some(Raw::Dib(dib)) => Some(dib_to_rgba(&dib).ok_or("unreadable image")?),
+        Some(Raw::Content(Content::Files(paths))) => match paths.as_slice() {
+            [path] => image::open(path).ok().map(|image| image.into_rgba8()),
+            _ => None,
+        },
+        Some(Raw::Content(_)) | None => None,
+    })
+}
+
 /// Puts `content` on the clipboard, as copying it in the first place did.
 /// `owner` is a window of ours, which Windows records as the clipboard's owner.
 pub fn write(owner: isize, content: &Content) -> Result<(), String> {
@@ -410,6 +465,24 @@ pub fn write(owner: isize, content: &Content) -> Result<(), String> {
                 set_data(RegisterClipboardFormatW(w!("PNG")), &image.png)
             }
         }
+    }
+}
+
+/// Puts `text` on the clipboard with the formatting it was copied with, so
+/// apps that understand it paste it formatted and the others get the text.
+pub fn write_rich(owner: isize, text: &str, rich: &RichText) -> Result<(), String> {
+    let _open = Open::with_retries(HWND(owner as *mut c_void))
+        .ok_or("the clipboard is busy in another app")?;
+    unsafe {
+        EmptyClipboard().map_err(|err| err.to_string())?;
+        let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        set_data(CF_UNICODETEXT.0 as u32, as_bytes(&units))?;
+        for (name, bytes) in [(HTML_FORMAT, &rich.html), (RTF_FORMAT, &rich.rtf)] {
+            if let Some(bytes) = bytes {
+                set_data(RegisterClipboardFormatW(name), bytes)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -642,7 +715,7 @@ pub fn paste_into(window: isize, caret_back: usize) -> bool {
 
 /// Asks Windows to activate `window`. Only allowed while Spotlight is the
 /// foreground app. `false` when the window is gone.
-pub(crate) fn bring_to_front(window: isize) -> bool {
+pub fn bring_to_front(window: isize) -> bool {
     let target = HWND(window as *mut c_void);
     unsafe {
         if window == 0 || !IsWindow(Some(target)).as_bool() {

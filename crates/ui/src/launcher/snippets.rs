@@ -5,7 +5,9 @@
 
 use std::{fs, path::Path};
 
-use gpui::{Context, PathPromptOptions, Window};
+use std::time::{Duration, Instant};
+
+use gpui::{Context, Window};
 use spotlight_core::{
     clip::IgnoredApp,
     frecency, item_id,
@@ -13,28 +15,75 @@ use spotlight_core::{
 };
 use spotlight_platform_win::{
     clipboard::{self, Content},
-    expander, links,
+    expander::{self, Ask, Keyword},
+    links, win,
 };
 
-use super::{Launcher, views::Screen};
+use super::{
+    Launcher,
+    json_files::{export_message, import_message},
+    views::Screen,
+};
 
 /// The snippets provider's id, whose items these are.
 pub(super) const PROVIDER: &str = "snippets";
 /// What the export file is called unless the user changes it.
 const EXPORT_NAME: &str = "Snippets.json";
+/// How long a snippet's form gets to come up and take the keyboard before
+/// the keys typed after its keyword are sent to it.
+const FORM_SETTLE: Duration = Duration::from_millis(80);
 
 impl Launcher {
     /// Starts expanding snippet keywords typed in other apps. The self-test
     /// doesn't: it runs beside a normal instance, which already does.
-    pub fn start_expander(&mut self) {
-        match expander::spawn(self.hwnd) {
+    pub fn start_expander(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (asks_tx, asks_rx) = async_channel::unbounded();
+        match expander::spawn(self.hwnd, asks_tx) {
             Ok(service) => {
                 self.expander = Some(service);
                 self.set_excluded_snippet_apps(&self.excluded_snippet_apps());
                 self.sync_expander();
             }
-            Err(err) => eprintln!("[spotlight] snippet keywords won't expand: {err}"),
+            Err(err) => {
+                eprintln!("[spotlight] snippet keywords won't expand: {err}");
+                return;
+            }
         }
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(ask) = asks_rx.recv().await {
+                this.update_in(cx, |this, window, cx| {
+                    this.ask_snippet_arguments(ask, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A keyword whose snippet has arguments was typed in another app: shows
+    /// the snippet's form, which pastes it there (see [`Self::paste_snippet`]).
+    fn ask_snippet_arguments(&mut self, ask: Ask, window: &mut Window, cx: &mut Context<Self>) {
+        if !(self.visible && win::is_visible(self.hwnd)) {
+            self.show(Instant::now(), window, cx);
+        }
+        // Not opened by its hotkey, so Windows may not hand it the foreground.
+        win::take_foreground(self.hwnd);
+        self.previous_window = ask.window;
+        self.screens.clear();
+        self.push_view(
+            snippet::arguments_form(&ask.name, &ask.text, true),
+            window,
+            cx,
+        );
+        self.keyword_target = Some(ask.window);
+        let expander = self.expander.clone();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(FORM_SETTLE).await;
+            if let Some(expander) = expander {
+                expander.form_shown();
+            }
+        })
+        .detach();
     }
 
     /// Turns expanding keywords typed in other apps on or off (Settings).
@@ -82,8 +131,14 @@ impl Launcher {
         };
         expander.set_snippets(
             snippets
-                .into_iter()
-                .filter_map(|snippet| Some((snippet.keyword?, snippet.text)))
+                .iter()
+                .filter_map(|snippet| {
+                    Some(Keyword {
+                        keyword: snippet.keyword.clone()?,
+                        name: snippet.name.clone(),
+                        text: snippet::inline(&snippet.text, &snippets),
+                    })
+                })
                 .collect(),
         );
     }
@@ -191,8 +246,19 @@ impl Launcher {
 
     /// Fills in `text`'s placeholders, puts it on the clipboard and, with
     /// `paste`, pastes it into the window that was active before the
-    /// launcher, the caret at `{cursor}`.
+    /// launcher, the caret at `{cursor}`. A snippet whose keyword was typed
+    /// goes back to the expander, which puts the clipboard back after.
     pub(super) fn paste_snippet(&mut self, text: &str, paste: bool, cx: &mut Context<Self>) {
+        if let Some(target) = self.keyword_target.take()
+            && paste
+            && let Some(expander) = self.expander.clone()
+        {
+            // While the launcher still has the foreground to hand over.
+            clipboard::bring_to_front(target);
+            self.hide(cx);
+            expander.paste(target, text.to_owned());
+            return;
+        }
         let copied = snippet::needs_clipboard(text)
             .then(|| cx.read_from_clipboard().and_then(|item| item.text()))
             .flatten();
@@ -226,64 +292,46 @@ impl Launcher {
     /// Asks for a JSON file (as Raycast exports snippets) and adds the
     /// snippets in it that aren't there yet.
     pub(super) fn import_snippets(&mut self, cx: &mut Context<Self>) {
-        // Hidden first, so the dialog doesn't belong to a window that hides
-        // when it loses the focus.
-        self.hide(cx);
-        cx.spawn(async move |this, cx| {
-            let Ok(picked) = cx.update(|cx| {
-                cx.prompt_for_paths(PathPromptOptions {
-                    files: true,
-                    directories: false,
-                    multiple: false,
-                    prompt: Some("Import".into()),
-                })
-            }) else {
-                return;
-            };
-            let path = match picked.await {
-                Ok(Ok(Some(paths))) => paths.into_iter().next(),
-                Ok(Err(err)) => {
-                    eprintln!("[spotlight] the file dialog failed: {err}");
-                    None
-                }
-                _ => None,
-            };
-            let Some(path) = path else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                let message = this.import_snippets_from(&path);
-                this.show_hud(message.into(), cx);
-            })
-            .ok();
-        })
-        .detach();
+        self.import_json_file(
+            "Import Snippets",
+            |this, path, _| this.import_snippets_from(path),
+            cx,
+        );
     }
 
     /// Adds the new snippets in the JSON file at `path` and says how it went.
     /// Public for the self-test, which skips the dialog.
     pub fn import_snippets_from(&mut self, path: &Path) -> String {
-        let imported = fs::read_to_string(path)
-            .map_err(|err| format!("Couldn't read it: {err}"))
-            .and_then(|json| {
-                let store = self.store.as_ref().ok_or("There is no database")?;
-                let mut store = store.lock().map_err(|_| "The database is unavailable")?;
-                let existing = store.snippets().map_err(|err| err.to_string())?;
-                let imported = snippet::import(&json, &existing)?;
-                store
-                    .add_snippets(&imported.added, frecency::now())
-                    .map_err(|err| format!("Couldn't save them: {err}"))?;
-                Ok(imported)
-            });
+        match fs::read_to_string(path) {
+            Ok(json) => self.import_snippets_json(&json),
+            Err(err) => {
+                eprintln!("[spotlight] could not read {}: {err}", path.display());
+                format!("Couldn't read it: {err}")
+            }
+        }
+    }
+
+    /// Adds the new snippets in `json` (a file's, or a link's) and says how
+    /// it went.
+    pub(super) fn import_snippets_json(&mut self, json: &str) -> String {
+        let imported = (|| {
+            let store = self.store.as_ref().ok_or("There is no database")?;
+            let mut store = store.lock().map_err(|_| "The database is unavailable")?;
+            let existing = store.snippets().map_err(|err| err.to_string())?;
+            let imported = snippet::import(json, &existing)?;
+            store
+                .add_snippets(&imported.added, frecency::now())
+                .map_err(|err| format!("Couldn't save them: {err}"))?;
+            Ok::<_, String>(imported)
+        })();
         let imported = match imported {
             Ok(imported) => imported,
             Err(err) => {
-                eprintln!("[spotlight] could not import {}: {err}", path.display());
+                eprintln!("[spotlight] could not import snippets: {err}");
                 return err;
             }
         };
         self.sync_expander();
-        let added = imported.added.len();
         let skipped = imported.duplicates + imported.taken + imported.invalid;
         if skipped > 0 {
             eprintln!(
@@ -291,43 +339,17 @@ impl Launcher {
                 imported.duplicates, imported.taken, imported.invalid
             );
         }
-        match (added, skipped) {
-            (0, 0) => "No snippets in that file".into(),
-            (0, _) => "Nothing new to import".into(),
-            (1, 0) => "Imported 1 snippet".into(),
-            (added, 0) => format!("Imported {added} snippets"),
-            (added, skipped) => format!("Imported {added}, skipped {skipped}"),
-        }
+        import_message("snippet", imported.added.len(), skipped)
     }
 
     /// Asks where to save every snippet as JSON Raycast can import.
     pub(super) fn export_snippets(&mut self, cx: &mut Context<Self>) {
-        self.hide(cx);
-        let folder = links::downloads_folder();
-        cx.spawn(async move |this, cx| {
-            let Ok(picked) = cx.update(|cx| cx.prompt_for_new_path(&folder, Some(EXPORT_NAME)))
-            else {
-                return;
-            };
-            let path = match picked.await {
-                Ok(Ok(Some(path))) => path,
-                Ok(Err(err)) => {
-                    eprintln!("[spotlight] the file dialog failed: {err}");
-                    return;
-                }
-                _ => return,
-            };
-            this.update(cx, |this, cx| {
-                let message = match this.export_snippets_to(&path) {
-                    Ok(1) => "Exported 1 snippet".into(),
-                    Ok(count) => format!("Exported {count} snippets"),
-                    Err(err) => err,
-                };
-                this.show_hud(message.into(), cx);
-            })
-            .ok();
-        })
-        .detach();
+        self.export_json_file(
+            "Export Snippets",
+            EXPORT_NAME,
+            |this, path| export_message("snippet", this.export_snippets_to(path)),
+            cx,
+        );
     }
 
     /// Writes every snippet to `path` as JSON. Returns how many. Public for

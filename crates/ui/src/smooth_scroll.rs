@@ -15,8 +15,9 @@ use std::{
 };
 
 use gpui::{
-    Context, DispatchPhase, IntoElement, Pixels, ScrollDelta, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, Styled, UniformListScrollHandle, WeakEntity, canvas, point, px,
+    Context, DispatchPhase, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, Styled,
+    UniformListScrollHandle, WeakEntity, canvas, point, px,
 };
 
 /// Time constant of the ease-out: after this long, about 63% of the distance
@@ -145,6 +146,12 @@ pub struct SmoothScroll {
     row_height: f32,
     /// The list's vertical padding, on each side.
     padding: f32,
+    /// How much of the list's top is hidden above its parent's edge: rows
+    /// scrolled up stop below it.
+    top_inset: f32,
+    /// While the scroll thumb is dragged: where the pointer went down, and
+    /// how far down the list was then (0 to 1).
+    drag: Option<(f32, f32)>,
     scroller: Scroller,
 }
 
@@ -155,6 +162,8 @@ impl SmoothScroll {
             handle,
             row_height,
             padding,
+            top_inset: 0.,
+            drag: None,
             scroller: Scroller::new(base, true),
         }
     }
@@ -170,6 +179,10 @@ impl SmoothScroll {
     /// Turning it off finishes a running animation at once.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.scroller.set_enabled(enabled);
+    }
+
+    pub fn set_top_inset(&mut self, inset: f32) {
+        self.top_inset = inset;
     }
 
     /// Jumps to the top, for a new set of results.
@@ -190,14 +203,87 @@ impl SmoothScroll {
         let from = self.scroller.heading();
         let top = ix as f32 * self.row_height;
         let bottom = top + self.row_height;
-        let to = if top < -from {
-            -top
+        let to = if top < -from + self.top_inset {
+            -(top - self.top_inset)
         } else if bottom > -from + viewport {
             -(bottom - viewport)
         } else {
             return;
         };
         self.scroll_to(to, rows);
+    }
+
+    /// Whether GPUI has laid the list out yet, so its height is known.
+    pub fn is_laid_out(&self) -> bool {
+        self.scroller.height() > 0.
+    }
+
+    /// Where a scroll indicator's thumb goes for a list of `rows`, as
+    /// fractions of the visible height: its top and its length. None while
+    /// everything fits, or before the list is laid out.
+    pub fn thumb(&self, rows: usize) -> Option<(f32, f32)> {
+        let height = self.scroller.height();
+        let visible = height - self.top_inset;
+        let content = rows as f32 * self.row_height + 2. * self.padding;
+        let max = content - height;
+        if visible <= 0. || max <= 0.5 {
+            return None;
+        }
+        let length = (visible / (content - self.top_inset)).clamp(0.08, 1.);
+        let progress = (self.scroller.scrolled() / max).clamp(0., 1.);
+        Some((progress * (1. - length), length))
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    /// The pointer went down on the scroll track `at` this far down it (0 to
+    /// 1), at window height `y`: off the thumb, the thumb jumps there first;
+    /// then it follows the pointer.
+    pub fn grab(&mut self, at: f32, y: f32, rows: usize) {
+        let Some((top, length)) = self.thumb(rows) else {
+            return;
+        };
+        if !(top..=top + length).contains(&at) {
+            self.set_progress((at - length / 2.) / (1. - length).max(1e-3), rows);
+        }
+        self.drag = Some((y, self.progress(rows)));
+    }
+
+    /// The pointer moved to window height `y` while dragging the thumb along
+    /// a track `track` tall.
+    pub fn drag_to(&mut self, y: f32, track: f32, rows: usize) {
+        let (Some((from, progress)), Some((_, length))) = (self.drag, self.thumb(rows)) else {
+            return;
+        };
+        let travel = (track * (1. - length)).max(1.);
+        self.set_progress(progress + (y - from) / travel, rows);
+    }
+
+    pub fn release(&mut self) {
+        self.drag = None;
+    }
+
+    /// How far down the list is, 0 at the top and 1 at the bottom.
+    fn progress(&self, rows: usize) -> f32 {
+        let max = self.max_offset(rows);
+        if max <= 0. {
+            0.
+        } else {
+            (self.scroller.scrolled() / max).clamp(0., 1.)
+        }
+    }
+
+    /// Jumps (no animation: the pointer leads) to `progress` down the list.
+    fn set_progress(&mut self, progress: f32, rows: usize) {
+        self.scroller.target = None;
+        self.scroller
+            .set_offset(-(progress.clamp(0., 1.) * self.max_offset(rows)));
+    }
+
+    fn max_offset(&self, rows: usize) -> f32 {
+        (rows as f32 * self.row_height + 2. * self.padding - self.scroller.height()).max(0.)
     }
 
     /// Scrolls by `delta` (positive moves the content down, like GPUI's wheel delta).
@@ -228,6 +314,84 @@ impl SmoothScroll {
 /// When `scroll` returns `false` (smooth scrolling is off) the notch falls
 /// through to GPUI, as does precise scrolling. Place it absolutely over the
 /// element, in a parent that doesn't scroll.
+/// Lets the pointer drag a [`SmoothScroll`] list's thumb, or click its track
+/// to jump: place it absolutely over the track. `list` gives the view's
+/// list and its number of rows. Moves are followed anywhere in the window
+/// while the button is held.
+pub fn drag_track<T: 'static>(
+    view: WeakEntity<T>,
+    list: impl Fn(&mut T) -> (&mut SmoothScroll, usize) + 'static,
+) -> impl IntoElement {
+    let list = Rc::new(list);
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let height = f32::from(bounds.size.height);
+            let (down_view, down_list) = (view.clone(), list.clone());
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !bounds.contains(&event.position)
+                    || height <= 0.
+                {
+                    return;
+                }
+                let at = f32::from(event.position.y - bounds.origin.y) / height;
+                let y = f32::from(event.position.y);
+                down_view
+                    .update(cx, |this, cx| {
+                        let (scroll, rows) = down_list(this);
+                        scroll.grab(at, y, rows);
+                        cx.notify();
+                    })
+                    .ok();
+                cx.stop_propagation();
+            });
+            let (move_view, move_list) = (view.clone(), list.clone());
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+                let y = f32::from(event.position.y);
+                let held = event.pressed_button == Some(MouseButton::Left);
+                move_view
+                    .update(cx, |this, cx| {
+                        let (scroll, rows) = move_list(this);
+                        if !scroll.is_dragging() {
+                            return;
+                        }
+                        if held {
+                            scroll.drag_to(y, height, rows);
+                        } else {
+                            scroll.release();
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            });
+            let (up_view, up_list) = (view.clone(), list.clone());
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                    return;
+                }
+                up_view
+                    .update(cx, |this, cx| {
+                        let (scroll, _) = up_list(this);
+                        if scroll.is_dragging() {
+                            scroll.release();
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
 pub fn capture_wheel<T: 'static>(
     view: WeakEntity<T>,
     scroll: impl Fn(&mut T, Pixels, &mut Context<T>) -> bool + 'static,

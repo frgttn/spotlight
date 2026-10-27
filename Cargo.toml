@@ -7,7 +7,7 @@ default-members = ["crates/app", "crates/service"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 # Let chains (`if let … && …`) need 1.88.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,7 @@ spotlight-core = { path = "crates/core" }
 spotlight-files = { path = "crates/files" }
 spotlight-platform-win = { path = "crates/platform-win" }
 spotlight-providers = { path = "crates/providers" }
+spotlight-qr = { path = "crates/qr" }
 spotlight-search = { path = "crates/search" }
 spotlight-store = { path = "crates/store" }
 spotlight-ui = { path = "crates/ui" }
@@ -33,6 +34,9 @@ image = { version = "0.25", default-features = false }
 # File search matcher: SIMD Smith-Waterman with typos, no dependencies (taken from fff).
 neo_frizbee = "0.13.3"
 nucleo-matcher = "0.3.1"
+# QR codes: making them (no image or SVG output of its own) and reading them.
+qrcode = { version = "0.14.1", default-features = false }
+rqrr = { version = "0.11.0", default-features = false }
 # Markdown in detail views; no HTML output needed.
 pulldown-cmark = { version = "0.13", default-features = false }
 raw-window-handle = "0.6"

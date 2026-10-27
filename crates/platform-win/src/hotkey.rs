@@ -6,8 +6,14 @@
 //! framework runs its own message loop. The same thread changes the hotkey
 //! and records new ones, because a hotkey can only be unregistered by the
 //! thread that registered it, and a low-level hook runs on the thread that
-//! installed it. Win+V, which Windows keeps for itself, is taken with a
-//! low-level hook too (see [`Service::intercept_win_v`]).
+//! installed it.
+//!
+//! Windows keeps most Win+key combinations for itself, so `RegisterHotKey`
+//! refuses them. Such a combination is taken with a low-level keyboard hook
+//! instead, which sees keys before Windows does; so is Win+V for the
+//! clipboard history (see [`Service::intercept_win_v`]). The hook doesn't see
+//! keys while a window of an elevated app is in front, which a registered
+//! hotkey does.
 
 use std::{
     cell::{Cell, RefCell},
@@ -220,9 +226,8 @@ impl Service {
 
     /// Makes Win+V run the item `item_id` (its id arrives on `item_presses`,
     /// as for an item hotkey) instead of opening Windows' clipboard history,
-    /// or (`None`) gives Win+V back to Windows. Windows doesn't let apps
-    /// register Win+V, so a low-level keyboard hook takes it before Windows
-    /// sees it.
+    /// or (`None`) gives Win+V back to Windows. Fails while Win+V is the
+    /// hotkey of the launcher or of an item.
     pub fn intercept_win_v(&self, item_id: Option<&str>) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send(Request::InterceptWinV(item_id.map(str::to_owned), reply_tx));
@@ -280,7 +285,9 @@ pub fn spawn(
                     format!("could not register any of {tried:?}")
                 });
             let _ = ready_tx.send((GetCurrentThreadId(), registered));
-            WIN_V_PRESSES.with(|presses| *presses.borrow_mut() = Some(item_presses.clone()));
+            HOOK_PRESSES.with(|senders| {
+                *senders.borrow_mut() = Some((presses.clone(), item_presses.clone()))
+            });
 
             // The low-level hook is called from this loop, too.
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -308,7 +315,7 @@ pub fn spawn(
                 }
             }
             registrar.stop_recording();
-            registrar.release_win_v();
+            registrar.release_key_hook();
         })
         .map_err(|err| err.to_string())?;
 
@@ -327,51 +334,140 @@ pub fn spawn(
 /// The launcher hotkey alternates between ids 1 and 2; item hotkeys get ids above.
 const LAUNCHER_IDS: i32 = 2;
 
+const WIN_V: Hotkey = Hotkey {
+    ctrl: false,
+    alt: false,
+    shift: false,
+    win: true,
+    vk: b'V' as u16,
+};
+
+/// How a hotkey is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Binding {
+    /// With `RegisterHotKey`, under this id.
+    Registered(i32),
+    /// By the low-level hook (see `hooked_key`).
+    Hooked,
+}
+
+/// What a hotkey taken by the hook runs.
+#[derive(Clone)]
+enum Target {
+    Launcher,
+    Item(String),
+}
+
 /// State owned by the hotkey thread.
 #[derive(Default)]
 struct Registrar {
     current: Option<Hotkey>,
+    /// The launcher hotkey is taken by the hook rather than registered.
+    current_hooked: bool,
     /// Ids alternate so a new hotkey can be registered before the old one goes.
     id: i32,
     /// While recording the hotkey is unregistered and this hook is installed.
     hook: Option<HHOOK>,
-    /// Item id → (hotkey id, hotkey).
-    items: HashMap<String, (i32, Hotkey)>,
+    /// Item id → (binding, hotkey).
+    items: HashMap<String, (Binding, Hotkey)>,
     /// Last hotkey id handed to an item.
     last_item_id: i32,
-    /// Installed while Win+V runs an item (see `Service::intercept_win_v`).
-    win_v_hook: Option<HHOOK>,
+    /// The item Win+V runs (see `Service::intercept_win_v`).
+    win_v: Option<String>,
+    /// Installed while any hotkey is taken by the hook.
+    key_hook: Option<HHOOK>,
 }
 
 thread_local! {
     /// Where the hook sends what it records. The hook runs on the hotkey thread.
     static RECORDER: RefCell<Option<async_channel::Sender<Recorded>>> = const { RefCell::new(None) };
-    /// Where Win+V sends its item id, and which item; read by `win_v_key`.
-    static WIN_V_PRESSES: RefCell<Option<async_channel::Sender<String>>> = const { RefCell::new(None) };
-    static WIN_V_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
-    /// The V of a Win+V was swallowed: swallow its repeats and release too.
-    static V_SWALLOWED: Cell<bool> = const { Cell::new(false) };
+    /// Where `hooked_key` reports launcher and item presses.
+    static HOOK_PRESSES: RefCell<Option<(async_channel::Sender<Instant>, async_channel::Sender<String>)>> =
+        const { RefCell::new(None) };
+    /// The hotkeys `hooked_key` takes; rebuilt by `Registrar::update_hooked`.
+    static HOOKED: RefCell<Vec<(Hotkey, Target)>> = const { RefCell::new(Vec::new()) };
+    /// The key of a hotkey `hooked_key` took: its repeats and release are
+    /// swallowed too.
+    static SWALLOWED: Cell<Option<u16>> = const { Cell::new(None) };
+    /// Bits of `MODIFIER_KEYS` that the hooks saw go down and not up, and
+    /// the time of the last key event they saw (see `track_modifiers`).
+    static HELD: Cell<(u8, u32)> = const { Cell::new((0, 0)) };
 }
 
 impl Registrar {
     /// Registers `hotkey` in addition to the current one and makes it current.
     fn register(&mut self, hotkey: Hotkey) -> Result<(), SetError> {
+        if self.held_by_item(hotkey) {
+            return Err(SetError::InUse);
+        }
         let id = if self.id == 1 { 2 } else { 1 };
-        unsafe {
-            if RegisterHotKey(None, id, hotkey.modifiers(), hotkey.vk as u32).is_err() {
-                return Err(if GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED {
-                    SetError::InUse
-                } else {
-                    SetError::Other(windows::core::Error::from_win32().message())
-                });
+        let hooked = match register_hotkey(id, hotkey) {
+            Ok(()) => false,
+            Err(SetError::InUse) if hotkey.win => {
+                hookable(hotkey)?;
+                self.ensure_key_hook()?;
+                true
             }
-            if self.current.is_some() && self.hook.is_none() {
+            Err(err) => return Err(err),
+        };
+        if self.current.is_some() && self.hook.is_none() && !self.current_hooked {
+            unsafe {
                 let _ = UnregisterHotKey(None, self.id);
             }
         }
         self.current = Some(hotkey);
+        self.current_hooked = hooked;
         self.id = id;
+        self.update_hooked();
         Ok(())
+    }
+
+    /// Whether an item, or Win+V, already holds `hotkey`.
+    fn held_by_item(&self, hotkey: Hotkey) -> bool {
+        self.items.values().any(|&(_, held)| held == hotkey)
+            || (self.win_v.is_some() && hotkey == WIN_V)
+    }
+
+    fn ensure_key_hook(&mut self) -> Result<(), SetError> {
+        if self.key_hook.is_none() {
+            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hooked_key), None, 0) }
+                .map_err(|err| {
+                    SetError::Other(format!("could not install the keyboard hook: {err}"))
+                })?;
+            self.key_hook = Some(hook);
+        }
+        Ok(())
+    }
+
+    /// Hands `hooked_key` the hotkeys it takes now, and removes the hook
+    /// when there are none.
+    fn update_hooked(&mut self) {
+        let mut hooked = Vec::new();
+        if let (Some(hotkey), true) = (self.current, self.current_hooked) {
+            hooked.push((hotkey, Target::Launcher));
+        }
+        for (item, &(binding, hotkey)) in &self.items {
+            if binding == Binding::Hooked {
+                hooked.push((hotkey, Target::Item(item.clone())));
+            }
+        }
+        if let Some(item) = &self.win_v {
+            hooked.push((WIN_V, Target::Item(item.clone())));
+        }
+        let empty = hooked.is_empty();
+        HOOKED.with(|current| *current.borrow_mut() = hooked);
+        if empty {
+            self.release_key_hook();
+        }
+    }
+
+    fn release_key_hook(&mut self) {
+        if let Some(hook) = self.key_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+        SWALLOWED.set(None);
     }
 
     fn handle(&mut self, request: Request) {
@@ -382,7 +478,13 @@ impl Registrar {
                 } else {
                     self.register(hotkey)
                 };
-                self.resume();
+                // `register` has registered the new hotkey; only after a
+                // failure does recording leave nothing registered.
+                if result.is_ok() {
+                    self.stop_recording();
+                } else {
+                    self.resume();
+                }
                 let _ = reply.send(result);
             }
             Request::SetItem(item, hotkey, reply) => {
@@ -395,7 +497,9 @@ impl Registrar {
                 if self.hook.is_none() {
                     match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(record_key), None, 0) } {
                         Ok(hook) => {
-                            if self.current.is_some() {
+                            // A hooked launcher hotkey stays: the recording
+                            // hook, installed later, sees keys first.
+                            if self.current.is_some() && !self.current_hooked {
                                 unsafe {
                                     let _ = UnregisterHotKey(None, self.id);
                                 }
@@ -409,53 +513,42 @@ impl Registrar {
             Request::Resume => self.resume(),
             Request::InterceptWinV(item, reply) => {
                 let result = match item {
-                    Some(item) => {
-                        WIN_V_ITEM.with(|current| *current.borrow_mut() = Some(item));
-                        self.hold_win_v()
+                    Some(_) if self.current == Some(WIN_V) => {
+                        Err("Win+V already opens Spotlight".to_owned())
                     }
+                    Some(_) if self.items.values().any(|&(_, held)| held == WIN_V) => {
+                        Err("Win+V is already the hotkey of a command".to_owned())
+                    }
+                    Some(item) => self
+                        .ensure_key_hook()
+                        .map_err(|err| err.to_string())
+                        .map(|()| {
+                            self.win_v = Some(item);
+                        }),
                     None => {
-                        self.release_win_v();
+                        self.win_v = None;
                         Ok(())
                     }
                 };
+                self.update_hooked();
                 let _ = reply.send(result);
             }
         }
     }
 
-    fn hold_win_v(&mut self) -> Result<(), String> {
-        if self.win_v_hook.is_none() {
-            let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(win_v_key), None, 0) }
-                .map_err(|err| format!("could not take Win+V: {err}"))?;
-            self.win_v_hook = Some(hook);
-        }
-        Ok(())
-    }
-
-    fn release_win_v(&mut self) {
-        if let Some(hook) = self.win_v_hook.take() {
-            unsafe {
-                let _ = UnhookWindowsHookEx(hook);
-            }
-        }
-        WIN_V_ITEM.with(|current| *current.borrow_mut() = None);
-        V_SWALLOWED.set(false);
-    }
-
     fn item_for(&self, id: i32) -> Option<&str> {
         self.items
             .iter()
-            .find(|(_, (item_id, _))| *item_id == id)
+            .find(|(_, (binding, _))| *binding == Binding::Registered(id))
             .map(|(item, _)| item.as_str())
     }
 
     fn set_item(&mut self, item: String, hotkey: Option<Hotkey>) -> Result<(), SetError> {
         let previous = self.items.get(&item).copied();
         let Some(hotkey) = hotkey else {
-            if let Some((id, _)) = self.items.remove(&item) {
-                unsafe {
-                    let _ = UnregisterHotKey(None, id);
-                }
+            if let Some((binding, _)) = self.items.remove(&item) {
+                unregister(binding);
+                self.update_hooked();
             }
             return Ok(());
         };
@@ -463,25 +556,29 @@ impl Registrar {
             return Ok(());
         }
         // While recording the launcher hotkey isn't registered, so Windows
-        // wouldn't object to taking it; it would then be lost on resume.
-        if self.current == Some(hotkey) {
+        // wouldn't object to taking it; it would then be lost on resume. And
+        // Windows doesn't know about hotkeys the hook takes.
+        if self.current == Some(hotkey) || self.held_by_item(hotkey) {
             return Err(SetError::InUse);
         }
         let id = self.last_item_id.max(LAUNCHER_IDS) + 1;
-        unsafe {
-            if RegisterHotKey(None, id, hotkey.modifiers(), hotkey.vk as u32).is_err() {
-                return Err(if GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED {
-                    SetError::InUse
-                } else {
-                    SetError::Other(windows::core::Error::from_win32().message())
-                });
+        let binding = match register_hotkey(id, hotkey) {
+            Ok(()) => {
+                self.last_item_id = id;
+                Binding::Registered(id)
             }
-            if let Some((old_id, _)) = previous {
-                let _ = UnregisterHotKey(None, old_id);
+            Err(SetError::InUse) if hotkey.win => {
+                hookable(hotkey)?;
+                self.ensure_key_hook()?;
+                Binding::Hooked
             }
+            Err(err) => return Err(err),
+        };
+        if let Some((old, _)) = previous {
+            unregister(old);
         }
-        self.last_item_id = id;
-        self.items.insert(item, (id, hotkey));
+        self.items.insert(item, (binding, hotkey));
+        self.update_hooked();
         Ok(())
     }
 
@@ -491,7 +588,7 @@ impl Registrar {
             return;
         }
         self.stop_recording();
-        if let Some(hotkey) = self.current {
+        if let (Some(hotkey), false) = (self.current, self.current_hooked) {
             unsafe {
                 if RegisterHotKey(None, self.id, hotkey.modifiers(), hotkey.vk as u32).is_err() {
                     eprintln!("[hotkey] could not re-register {hotkey}");
@@ -511,23 +608,68 @@ impl Registrar {
     }
 }
 
+fn register_hotkey(id: i32, hotkey: Hotkey) -> Result<(), SetError> {
+    unsafe {
+        if RegisterHotKey(None, id, hotkey.modifiers(), hotkey.vk as u32).is_err() {
+            return Err(if GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED {
+                SetError::InUse
+            } else {
+                SetError::Other(windows::core::Error::from_win32().message())
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Lets go of an item hotkey. One the hook takes goes with the next
+/// `update_hooked`.
+fn unregister(binding: Binding) {
+    if let Binding::Registered(id) = binding {
+        unsafe {
+            let _ = UnregisterHotKey(None, id);
+        }
+    }
+}
+
+/// Whether the hook can take `hotkey` from Windows. L with Win held locks
+/// the PC whatever the other modifiers and hooks say.
+fn hookable(hotkey: Hotkey) -> Result<(), SetError> {
+    if hotkey.win && hotkey.vk == u16::from(b'L') {
+        return Err(SetError::Other(
+            "Windows keeps Win+L for locking the PC".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The hotkey `vk` makes with the modifiers `held` (see `track_modifiers`).
+fn hotkey_with(held: u8, vk: u16) -> Hotkey {
+    let any = |bits: u8| held & bits != 0;
+    Hotkey {
+        ctrl: any(0b11),
+        alt: any(0b1100),
+        shift: any(0b11_0000),
+        win: any(0b1100_0000),
+        vk,
+    }
+}
+
 /// Low-level keyboard hook used while recording. Modifier keys pass through so
 /// their state stays current; any other key press is reported and swallowed.
 unsafe extern "system" fn record_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        // Every event, so the modifiers stay current between presses.
+        let held = if code == HC_ACTION as i32 {
+            track_modifiers(event, key_down)
+        } else {
+            0
+        };
         if code == HC_ACTION as i32 && key_down {
-            let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let vk = event.vkCode as u16;
             if !is_modifier(vk) {
-                let pressed = |key: VIRTUAL_KEY| GetAsyncKeyState(key.0 as i32) < 0;
-                let hotkey = Hotkey {
-                    ctrl: pressed(VK_CONTROL),
-                    alt: pressed(VK_MENU),
-                    shift: pressed(VK_SHIFT),
-                    win: pressed(VK_LWIN) || pressed(VK_RWIN),
-                    vk,
-                };
+                let hotkey = hotkey_with(held, vk);
                 let recorded = if hotkey.ctrl || hotkey.alt || hotkey.shift || hotkey.win {
                     Recorded::Hotkey(hotkey)
                 } else if vk == VK_ESCAPE.0 {
@@ -542,6 +684,9 @@ unsafe extern "system" fn record_key(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         .is_some_and(|recorder| recorder.try_send(recorded).is_ok())
                 });
                 if sent {
+                    if hotkey.win {
+                        mask_start_menu();
+                    }
                     return LRESULT(1);
                 }
             }
@@ -550,37 +695,101 @@ unsafe extern "system" fn record_key(code: i32, wparam: WPARAM, lparam: LPARAM) 
     }
 }
 
-/// Low-level hook while Win+V runs an item: swallows the V of Win+V (so
-/// Windows' clipboard history doesn't open) and reports the item. Every other
-/// key passes.
-unsafe extern "system" fn win_v_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+/// Modifier keys, left and right apart, as low-level hooks report them.
+const MODIFIER_KEYS: [VIRTUAL_KEY; 8] = [
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LWIN,
+    VK_RWIN,
+];
+
+/// After this long without a key event `HELD` is read from Windows again: a
+/// held key repeats, so a pause means nothing is held, and a release the hook
+/// didn't see (on the lock screen, in an elevated window) is forgotten.
+const HELD_STALE_MS: u32 = 2000;
+
+/// Bits of `MODIFIER_KEYS` held now, as Windows reports them.
+fn modifiers_from_windows() -> u8 {
+    MODIFIER_KEYS
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| unsafe { GetAsyncKeyState(key.0 as i32) } < 0)
+        .fold(0, |held, (bit, _)| held | 1 << bit)
+}
+
+/// Follows the modifiers through the hooks' own events and returns those
+/// held now. `GetAsyncKeyState` lags here: it often still says Win is up
+/// when V arrives, which handed the first Win+V to Windows and made the
+/// recorder miss the first Win+W. Both hooks run on the hotkey thread and
+/// may see the same event; applying it twice changes nothing.
+fn track_modifiers(event: &KBDLLHOOKSTRUCT, key_down: bool) -> u8 {
+    let (mut held, last) = HELD.get();
+    if event.time.wrapping_sub(last) > HELD_STALE_MS {
+        held = modifiers_from_windows();
+    }
+    // Some keyboards and injected input send the side-neutral codes.
+    let vk = match VIRTUAL_KEY(event.vkCode as u16) {
+        VK_CONTROL => VK_LCONTROL,
+        VK_MENU => VK_LMENU,
+        VK_SHIFT => VK_LSHIFT,
+        vk => vk,
+    };
+    if let Some(bit) = MODIFIER_KEYS.iter().position(|&key| key == vk) {
+        if key_down {
+            held |= 1 << bit;
+        } else {
+            held &= !(1 << bit);
+        }
+    }
+    HELD.set((held, event.time));
+    held
+}
+
+/// Low-level hook while hotkeys are taken from Windows (see
+/// `Registrar::update_hooked`): swallows the key of such a hotkey, so Windows
+/// doesn't act on it, and reports the press. Every other key passes.
+unsafe extern "system" fn hooked_key(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let event = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        if code == HC_ACTION as i32
-            && event.vkCode == u32::from(b'V')
-            && event.flags & LLKHF_INJECTED != LLKHF_INJECTED
-        {
-            let key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            if !key_down {
-                if V_SWALLOWED.replace(false) {
-                    return LRESULT(1);
+        let key_down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        // Injected modifiers (a paste's Ctrl) count: they change what's held.
+        let held = if code == HC_ACTION as i32 {
+            track_modifiers(event, key_down)
+        } else {
+            0
+        };
+        if code == HC_ACTION as i32 && event.flags & LLKHF_INJECTED != LLKHF_INJECTED {
+            let vk = event.vkCode as u16;
+            if SWALLOWED.get() == Some(vk) {
+                // Auto-repeat while held is already handled, like MOD_NOREPEAT.
+                if !key_down {
+                    SWALLOWED.set(None);
                 }
-            } else if V_SWALLOWED.get() {
-                // Auto-repeat while held: already handled.
                 return LRESULT(1);
-            } else {
-                let pressed = |key: VIRTUAL_KEY| GetAsyncKeyState(key.0 as i32) < 0;
-                let win_only = (pressed(VK_LWIN) || pressed(VK_RWIN))
-                    && !pressed(VK_CONTROL)
-                    && !pressed(VK_MENU)
-                    && !pressed(VK_SHIFT);
-                if win_only {
-                    V_SWALLOWED.set(true);
-                    mask_start_menu();
-                    let item = WIN_V_ITEM.with(|item| item.borrow().clone());
-                    WIN_V_PRESSES.with(|presses| {
-                        if let (Some(presses), Some(item)) = (presses.borrow().as_ref(), item) {
-                            let _ = presses.try_send(item);
+            }
+            if key_down && !is_modifier(vk) {
+                let pressed_at = Instant::now();
+                let hotkey = hotkey_with(held, vk);
+                let target = HOOKED.with(|hooked| {
+                    let hooked = hooked.borrow();
+                    let found = hooked.iter().find(|(held, _)| *held == hotkey);
+                    found.map(|(_, target)| target.clone())
+                });
+                if let Some(target) = target {
+                    SWALLOWED.set(Some(vk));
+                    if hotkey.win {
+                        mask_start_menu();
+                    }
+                    HOOK_PRESSES.with(|senders| {
+                        if let Some((presses, item_presses)) = senders.borrow().as_ref() {
+                            match target {
+                                Target::Launcher => drop(presses.try_send(pressed_at)),
+                                Target::Item(item) => drop(item_presses.try_send(item)),
+                            }
                         }
                     });
                     return LRESULT(1);
@@ -591,7 +800,7 @@ unsafe extern "system" fn win_v_key(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 }
 
-/// Taps a key no layout uses, so that releasing Win after a swallowed V
+/// Taps a key no layout uses, so that releasing Win after a swallowed key
 /// doesn't count as Win pressed alone, which opens the Start menu.
 fn mask_start_menu() {
     const VK_NONE: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
@@ -725,6 +934,35 @@ mod tests {
         assert_eq!(Hotkey::parse("Ctrl+NoSuchKey"), None);
         assert_eq!(Hotkey::parse("Hyper+Space"), None);
         assert_eq!(Hotkey::parse("Ctrl+F25"), None);
+    }
+
+    #[test]
+    fn the_hook_takes_any_win_combination_but_win_l() {
+        assert!(hookable(Hotkey::parse("Win+V").unwrap()).is_ok());
+        assert!(hookable(Hotkey::parse("Win+Shift+K").unwrap()).is_ok());
+        assert!(hookable(Hotkey::parse("Win+L").unwrap()).is_err());
+        assert!(hookable(Hotkey::parse("Win+Shift+L").unwrap()).is_err());
+    }
+
+    #[test]
+    fn modifiers_follow_the_hook_events() {
+        let event = |key: VIRTUAL_KEY, time: u32| KBDLLHOOKSTRUCT {
+            vkCode: u32::from(key.0),
+            time,
+            ..Default::default()
+        };
+        HELD.set((0, 100));
+        let held = track_modifiers(&event(VK_LWIN, 200), true);
+        assert_eq!(hotkey_with(held, u16::from(b'W')).to_string(), "Win+W");
+        // A side-neutral Shift counts as the left one.
+        let held = track_modifiers(&event(VK_SHIFT, 300), true);
+        assert_eq!(
+            hotkey_with(held, u16::from(b'W')).to_string(),
+            "Shift+Win+W"
+        );
+        track_modifiers(&event(VK_SHIFT, 400), false);
+        let held = track_modifiers(&event(VK_LWIN, 500), false);
+        assert_eq!(held, 0);
     }
 
     #[test]

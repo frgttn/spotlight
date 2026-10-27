@@ -10,13 +10,19 @@ use std::{
     collections::HashMap,
     ffi::c_void,
     mem::size_of,
-    sync::{LazyLock, Mutex},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicI32, Ordering},
+    },
 };
 
 use spotlight_core::window::{self, Rect, WindowCommand};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, RECT, WPARAM},
+        Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_SUCCESS, GetLastError, HWND, LPARAM, RECT,
+            WPARAM,
+        },
         Graphics::{
             Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
             Gdi::{
@@ -24,6 +30,7 @@ use windows::{
                 MONITORINFO, MonitorFromWindow,
             },
         },
+        Storage::Packaging::Appx::GetApplicationUserModelId,
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -46,7 +53,7 @@ use windows::{
             SetWindowPos, ShowWindow, SwitchToThisWindow, WM_CLOSE, WS_EX_TOPMOST,
         },
     },
-    core::BOOL,
+    core::{BOOL, PWSTR},
 };
 
 use crate::{
@@ -84,6 +91,17 @@ pub struct ProcessInfo {
 
 /// Where windows were before the first window command moved them, for Restore.
 static SAVED: LazyLock<Mutex<HashMap<isize, Saved>>> = LazyLock::new(Default::default);
+/// Pixels between windows placed by layouts (Settings).
+static GAP: AtomicI32 = AtomicI32::new(0);
+/// Whether running a half again cycles through thirds (Settings).
+static CYCLE: AtomicBool = AtomicBool::new(true);
+
+/// How layouts place windows from now on: `gap` pixels apart (and from the
+/// screen's edges), and whether running a half again cycles through thirds.
+pub fn set_layout_options(gap: i32, cycle: bool) {
+    GAP.store(gap.clamp(0, window::MAX_GAP), Ordering::Relaxed);
+    CYCLE.store(cycle, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy)]
 struct Saved {
@@ -100,6 +118,58 @@ const SHELL_CLASSES: &[&str] = &[
 ];
 /// Store apps' windows belong to this process; the app is a child window's.
 const FRAME_HOST: &str = "applicationframehost.exe";
+
+/// A running app, as root search matches it to an installed one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningApp {
+    /// The process to quit: the one with windows, if any.
+    pub pid: u32,
+    pub exe: Option<String>,
+    /// A packaged app's AUMID (`Microsoft.WindowsCalculator_8wekyb3d8bbwe!App`).
+    pub aumid: Option<String>,
+}
+
+/// The apps running in this session that have windows, one per program
+/// (or packaged app): its process with windows.
+pub fn running_apps() -> Vec<RunningApp> {
+    let mut apps: Vec<RunningApp> = Vec::new();
+    for raw in win::app_windows() {
+        let pid = app_pid(raw);
+        if pid == 0 || apps.iter().any(|app| app.pid == pid) {
+            continue;
+        }
+        let app = RunningApp {
+            pid,
+            exe: process_path(pid),
+            aumid: process_aumid(pid),
+        };
+        let same = |known: &RunningApp| match (&app.aumid, &known.aumid) {
+            (Some(aumid), Some(other)) => aumid == other,
+            (None, None) => app.exe.is_some() && known.exe == app.exe,
+            _ => false,
+        };
+        if !apps.iter().any(same) {
+            apps.push(app);
+        }
+    }
+    apps
+}
+
+/// The AUMID of a packaged app's process; `None` for other programs.
+fn process_aumid(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 256];
+        let mut len = buffer.len() as u32;
+        let result = GetApplicationUserModelId(process, &mut len, Some(PWSTR(buffer.as_mut_ptr())));
+        let _ = CloseHandle(process);
+        if result != ERROR_SUCCESS || len == 0 {
+            return None;
+        }
+        let units = &buffer[..(len as usize).saturating_sub(1)];
+        Some(String::from_utf16_lossy(units))
+    }
+}
 
 /// Every app window except Spotlight's, front to back.
 pub fn windows() -> Vec<WindowInfo> {
@@ -184,7 +254,15 @@ pub fn run(target: isize, command: WindowCommand) -> Outcome {
         return Err("No app window is active".into());
     }
     if command.moves() {
-        remember(target);
+        let maximized = unsafe { IsZoomed(window).as_bool() };
+        // A maximized window placed somewhere else starts from where it was
+        // before it was maximized, which Windows keeps.
+        if maximized && command.places() {
+            unsafe {
+                let _ = ShowWindow(window, SW_RESTORE);
+            }
+        }
+        remember(target, maximized);
     }
     match command {
         WindowCommand::Focus => focus(target),
@@ -199,6 +277,7 @@ pub fn run(target: isize, command: WindowCommand) -> Outcome {
             }
             Ok(None)
         }
+        WindowCommand::MinimizeDisplay => minimize_display(target),
         WindowCommand::Maximize => {
             unsafe {
                 let _ = ShowWindow(window, SW_MAXIMIZE);
@@ -229,17 +308,55 @@ pub fn run(target: isize, command: WindowCommand) -> Outcome {
             Ok(None)
         }
         command => {
-            let current = if unsafe { IsZoomed(window).as_bool() } {
-                normal_frame(target)
-            } else {
-                frame(target)
+            let (current, work) = (frame(target), work_area(target));
+            let gap = GAP.load(Ordering::Relaxed);
+            let command = match command {
+                WindowCommand::Area(part) if CYCLE.load(Ordering::Relaxed) => {
+                    WindowCommand::Area(window::cycled(part, current, work, gap))
+                }
+                command => command,
             };
-            match window::place(command, current, work_area(target)) {
+            match window::place(command, current, work, gap) {
                 Some(rect) => set_frame(target, rect).map(|()| None),
                 None => Ok(None),
             }
         }
     }
+}
+
+/// Moves and resizes `target` to the numbers given (see
+/// [`window::frame_from`]); Restore puts it back.
+pub fn set_frame_from(target: isize, numbers: [&String; 4]) -> Outcome {
+    let window = hwnd(target);
+    if target == 0 || !unsafe { IsWindow(Some(window)).as_bool() } {
+        return Err("That window is gone".into());
+    }
+    let maximized = unsafe { IsZoomed(window).as_bool() };
+    if maximized {
+        unsafe {
+            let _ = ShowWindow(window, SW_RESTORE);
+        }
+    }
+    remember(target, maximized);
+    let rect = window::frame_from(
+        frame(target),
+        work_area(target),
+        numbers.map(String::as_str),
+    )?;
+    set_frame(target, rect).map(|()| None)
+}
+
+/// Where `target` is now: its frame relative to its display's work area.
+pub fn position(target: isize) -> Option<Rect> {
+    if target == 0 || !unsafe { IsWindow(Some(hwnd(target))).as_bool() } {
+        return None;
+    }
+    let (frame, work) = (frame(target), work_area(target));
+    Some(Rect {
+        x: frame.x - work.x,
+        y: frame.y - work.y,
+        ..frame
+    })
 }
 
 /// Asks every window of process `pid` to close.
@@ -298,6 +415,27 @@ fn focus(target: isize) -> Outcome {
     Ok(None)
 }
 
+/// Minimizes every app window on `target`'s display, `target` too.
+fn minimize_display(target: isize) -> Outcome {
+    let display = unsafe { MonitorFromWindow(hwnd(target), MONITOR_DEFAULTTONEAREST) };
+    let own = unsafe { GetCurrentProcessId() };
+    let mut minimized = 0;
+    for raw in win::app_windows() {
+        let window = hwnd(raw);
+        unsafe {
+            if thread_pid(raw) == own
+                || IsIconic(window).as_bool()
+                || MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) != display
+            {
+                continue;
+            }
+            let _ = ShowWindow(window, SW_MINIMIZE);
+        }
+        minimized += 1;
+    }
+    Ok((minimized == 0).then(|| "No windows on this display".into()))
+}
+
 fn toggle_topmost(target: isize) -> Outcome {
     let window = hwnd(target);
     let topmost = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
@@ -343,22 +481,18 @@ fn cycle(target: isize, step: i32) -> Outcome {
     focus(siblings[next])
 }
 
-fn remember(target: isize) {
+/// Keeps where `target` is (unless it's already kept): its frame now, and
+/// whether it was `maximized` before the command (it may have just been
+/// restored to its own place).
+fn remember(target: isize, maximized: bool) {
     let mut saved = SAVED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Forget windows that are gone, so handles reused later don't match.
     saved.retain(|&raw, _| unsafe { IsWindow(Some(hwnd(raw))).as_bool() });
-    saved.entry(target).or_insert_with(|| {
-        let maximized = unsafe { IsZoomed(hwnd(target)).as_bool() };
-        Saved {
-            frame: if maximized {
-                normal_frame(target)
-            } else {
-                frame(target)
-            },
-            maximized,
-        }
+    saved.entry(target).or_insert_with(|| Saved {
+        frame: frame(target),
+        maximized,
     });
 }
 
@@ -440,14 +574,6 @@ fn frame(target: isize) -> Rect {
         Ok(()) => from_rect(rect),
         Err(_) => outer_rect(target),
     }
-}
-
-/// Where a maximized window goes when restored: half the work area,
-/// centered (Windows keeps its own restore position, but in coordinates
-/// that differ from the screen's when the taskbar is on the left or top).
-fn normal_frame(target: isize) -> Rect {
-    let work = work_area(target);
-    window::place(WindowCommand::ReasonableSize, work, work).unwrap_or(work)
 }
 
 fn outer_rect(target: isize) -> Rect {
@@ -663,7 +789,7 @@ mod tests {
             .3;
 
         run(raw, left).unwrap();
-        assert_eq!(frame(raw), window::place(left, start, work).unwrap());
+        assert_eq!(frame(raw), window::place(left, start, work, 0).unwrap());
         run(raw, WindowCommand::Center).unwrap();
         let centered = frame(raw);
         assert_eq!(centered.x - work.x, work.right() - centered.right());
@@ -678,6 +804,18 @@ mod tests {
         assert!(unsafe { IsZoomed(window).as_bool() });
         run(raw, WindowCommand::Restore).unwrap();
         assert!(!unsafe { IsZoomed(window).as_bool() });
+        assert_eq!(frame(raw), start);
+
+        // After Maximize, Center starts from the window's own size.
+        run(raw, WindowCommand::Maximize).unwrap();
+        run(raw, WindowCommand::Center).unwrap();
+        let centered = frame(raw);
+        assert!(!unsafe { IsZoomed(window).as_bool() });
+        assert_eq!(
+            (centered.width, centered.height),
+            (start.width, start.height)
+        );
+        run(raw, WindowCommand::Restore).unwrap();
         assert_eq!(frame(raw), start);
 
         let on = run(raw, WindowCommand::ToggleAlwaysOnTop).unwrap().unwrap();

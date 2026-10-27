@@ -11,8 +11,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, ScrollHandle, ScrollStrategy,
-    SharedString, Window, div, prelude::*, px, rgba, uniform_list,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, RenderImage, ScrollHandle,
+    ScrollStrategy, SharedString, Window, div, img, prelude::*, px, rgba, uniform_list,
 };
 use spotlight_core::view::{DetailView, FieldKind, FieldValue, FormView, ListView, LiveRows, View};
 
@@ -189,7 +189,7 @@ impl Launcher {
                 .items
                 .iter()
                 .filter(|item| !self.icons.contains_key(&item.id))
-                .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
                 .collect(),
             _ => Vec::new(),
         };
@@ -206,6 +206,8 @@ impl Launcher {
 
     /// Back to the screen below (root search at the bottom).
     pub(super) fn pop_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A typed keyword's form was left: its snippet won't be pasted.
+        self.keyword_target = None;
         if let Some(Screen::List {
             view,
             origin: Some((provider, _)),
@@ -320,7 +322,7 @@ impl Launcher {
                     .items
                     .iter()
                     .filter(|item| !this.icons.contains_key(&item.id))
-                    .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+                    .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
                     .collect();
                 this.prefix_rows = rows.items;
                 let query = this.query(cx);
@@ -363,7 +365,7 @@ impl Launcher {
             .items
             .iter()
             .filter(|item| !self.icons.contains_key(&item.id))
-            .filter_map(|item| Some((item.id.clone(), super::shell_name(&item.icon)?)))
+            .filter_map(|item| Some((item.id.clone(), super::icon_source(&item.icon)?)))
             .collect();
         let Some(Screen::List { view, .. }) = self.screens.last_mut() else {
             return;
@@ -479,7 +481,7 @@ impl Launcher {
                     .position(|row| self.item(row).id == keep)
             })
             .unwrap_or_else(|| previous.min(self.results.len().saturating_sub(1)));
-        self.scroll.reveal(self.selected, self.results.len());
+        self.reveal_selected();
         cx.notify();
     }
 
@@ -681,14 +683,19 @@ impl Launcher {
 
     /// Lists and grids: the rows; details and forms: their own body.
     pub(super) fn render_screen_body(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let qr = match self.screens.last()? {
+            Screen::Detail { view, .. } => view.qr.clone(),
+            _ => None,
+        };
+        let qr = qr.and_then(|text| self.qr_image(&text, window.scale_factor()));
         match self.screens.last()? {
             Screen::List { grid: true, .. } => Some(self.render_grid(cx)),
             Screen::List { grid: false, .. } => None,
-            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, cx)),
+            Screen::Detail { view, scroll } => Some(render_detail(view, scroll, qr, cx)),
             Screen::Form(form) => Some(self.render_form(form, window, cx)),
         }
     }
@@ -741,9 +748,9 @@ impl Launcher {
                     .justify_center()
                     .gap_2()
                     .rounded(px(8.))
-                    .when(selected, |tile| tile.bg(rgba(0xffffff1f)))
+                    .when(selected, |tile| tile.bg(rgba(theme::p().selected)))
                     .when(!selected, |tile| {
-                        tile.hover(|style| style.bg(rgba(0xffffff0f)))
+                        tile.hover(|style| style.bg(rgba(theme::p().hover)))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.selected = ix;
@@ -790,11 +797,11 @@ impl Launcher {
                             .rounded(px(6.))
                             .border_1()
                             .border_color(rgba(if focused {
-                                theme::ACCENT
+                                theme::p().accent
                             } else {
-                                theme::SURFACE_BORDER
+                                theme::p().surface_border
                             }))
-                            .bg(rgba(theme::SURFACE))
+                            .bg(rgba(theme::p().surface))
                             .child(div().flex_1().child(input.clone()))
                             .into_any_element(),
                         (FieldInput::Checkbox { on, focus }, _) => {
@@ -816,11 +823,11 @@ impl Launcher {
                                         .rounded(px(4.))
                                         .border_1()
                                         .border_color(rgba(if focused {
-                                            theme::ACCENT
+                                            theme::p().accent
                                         } else {
-                                            theme::SURFACE_BORDER
+                                            theme::p().surface_border
                                         }))
-                                        .when(on, |check| check.bg(rgba(theme::ACCENT)))
+                                        .when(on, |check| check.bg(rgba(theme::p().accent)))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -843,7 +850,7 @@ impl Launcher {
                                 .rounded(px(8.))
                                 .border_1()
                                 .border_color(rgba(if focused {
-                                    theme::ACCENT
+                                    theme::p().accent
                                 } else {
                                     0x00000000
                                 }))
@@ -863,12 +870,12 @@ impl Launcher {
                                         .text_size(px(12.))
                                         .cursor_pointer()
                                         .when(chosen, |chip| {
-                                            chip.border_color(rgba(theme::ACCENT))
-                                                .bg(rgba(theme::ACCENT_SOFT))
+                                            chip.border_color(rgba(theme::p().accent))
+                                                .bg(rgba(theme::p().accent_soft))
                                         })
                                         .when(!chosen, |chip| {
-                                            chip.border_color(rgba(theme::SURFACE_BORDER))
-                                                .text_color(rgba(theme::TEXT_MUTED))
+                                            chip.border_color(rgba(theme::p().surface_border))
+                                                .text_color(rgba(theme::p().text_muted))
                                         })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.choose_option(ix, option, window, cx)
@@ -891,7 +898,7 @@ impl Launcher {
                                 .when(area, |label| label.pt(px(8.)))
                                 .w(px(110.))
                                 .text_size(px(13.))
-                                .text_color(rgba(theme::TEXT_MUTED))
+                                .text_color(rgba(theme::p().text_muted))
                                 .child(SharedString::from(field.label.clone())),
                         )
                         .child(control)
@@ -909,7 +916,7 @@ impl Launcher {
                     div()
                         .pl(px(122.))
                         .text_size(px(12.))
-                        .text_color(rgba(theme::ERROR))
+                        .text_color(rgba(theme::p().error))
                         .child(error),
                 )
             })
@@ -920,7 +927,7 @@ impl Launcher {
                     .items_center()
                     .gap_1()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child("Tab moves between fields;")
                     .child(keycaps(form.submit_keys()))
                     .child(SharedString::from(form.view.submit_title.to_lowercase()))
@@ -964,7 +971,13 @@ impl Launcher {
 /// change the choice (elsewhere Space types a space).
 pub(super) const CHOICE_CONTEXT: &str = "FormChoice";
 
-fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher>) -> AnyElement {
+/// `qr`: the image of the view's QR code and its size, drawn above the text.
+fn render_detail(
+    view: &DetailView,
+    scroll: &Scroller,
+    qr: Option<(Arc<RenderImage>, f32)>,
+    cx: &mut Context<Launcher>,
+) -> AnyElement {
     let text = div()
         .id("detail")
         .size_full()
@@ -973,6 +986,17 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
         .px_5()
         .py_4()
         .text_size(px(14.))
+        .when_some(qr, |text, (image, size)| {
+            text.child(
+                div().flex().justify_center().pb_4().child(
+                    img(image)
+                        .size(px(size))
+                        .flex_none()
+                        .rounded(px(6.))
+                        .overflow_hidden(),
+                ),
+            )
+        })
         .child(markdown::render(&view.markdown));
     // Wheel notches are animated instead; everything else falls through to GPUI.
     let wheel = capture_wheel(cx.entity().downgrade(), |this: &mut Launcher, delta, cx| {
@@ -1002,13 +1026,16 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
         .when(!view.metadata.is_empty(), |body| {
             body.child(
                 div()
+                    .id("detail-metadata")
                     .flex_none()
                     .w(px(220.))
                     .h_full()
+                    // A contact read from a QR code can have more facts than fit.
+                    .overflow_y_scroll()
                     .px_4()
                     .py_4()
                     .border_l_1()
-                    .border_color(rgba(theme::HAIRLINE))
+                    .border_color(rgba(theme::p().hairline))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -1020,13 +1047,13 @@ fn render_detail(view: &DetailView, scroll: &Scroller, cx: &mut Context<Launcher
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgba(theme::TEXT_FAINT))
+                                    .text_color(rgba(theme::p().text_faint))
                                     .child(SharedString::from(label.clone())),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgba(theme::TEXT))
+                                    .text_color(rgba(theme::p().text))
                                     .child(SharedString::from(value.clone())),
                             )
                     })),

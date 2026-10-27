@@ -71,6 +71,54 @@ const fn area(x: f32, y: f32, width: f32, height: f32) -> Area {
 
 const THIRD: f32 = 1. / 3.;
 
+/// `settings` key: pixels left between windows placed by layouts, and
+/// between them and the screen's edges (`"0"` by default).
+pub const GAP_SETTING: &str = "window_gap";
+/// `settings` key: whether running a half again goes on to two thirds, then
+/// one third (`"false"` turns it off; on by default).
+pub const CYCLE_SETTING: &str = "window_cycle";
+/// The largest gap Settings offers.
+pub const MAX_GAP: i32 = 64;
+/// The gaps Settings offers, in pixels.
+pub const GAPS: &[i32] = &[0, 4, 8, 12, 16, 24];
+
+/// What the halves go on to when run again on a window already there:
+/// two thirds, then one third, then the half again.
+fn cycle_of(part: Area) -> Option<[Area; 3]> {
+    let (x, y, w, h) = (part.x, part.y, part.width, part.height);
+    let two = 2. * THIRD;
+    Some(match (x, y, w, h) {
+        (0., 0., 0.5, 1.) => [part, area(0., 0., two, 1.), area(0., 0., THIRD, 1.)],
+        (0.5, 0., 0.5, 1.) => [part, area(THIRD, 0., two, 1.), area(two, 0., THIRD, 1.)],
+        (0., 0., 1., 0.5) => [part, area(0., 0., 1., two), area(0., 0., 1., THIRD)],
+        (0., 0.5, 1., 0.5) => [part, area(0., THIRD, 1., two), area(0., two, 1., THIRD)],
+        _ => return None,
+    })
+}
+
+/// The part a layout should take this time: the next in its cycle (see
+/// [`cycle_of`]) when the window is already at one of its steps, otherwise
+/// the layout's own.
+pub fn cycled(part: Area, window: Rect, work: Rect, gap: i32) -> Area {
+    let Some(steps) = cycle_of(part) else {
+        return part;
+    };
+    // Some apps round their size a little (to whole lines of text).
+    let near = |a: i32, b: i32| (a - b).abs() <= 8;
+    let at = |step: Area| {
+        place(WindowCommand::Area(step), window, work, gap).is_some_and(|rect| {
+            near(rect.x, window.x)
+                && near(rect.y, window.y)
+                && near(rect.right(), window.right())
+                && near(rect.bottom(), window.bottom())
+        })
+    };
+    match steps.iter().position(|&step| at(step)) {
+        Some(ix) => steps[(ix + 1) % steps.len()],
+        None => part,
+    }
+}
+
 /// Something done to one window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WindowCommand {
@@ -97,6 +145,8 @@ pub enum WindowCommand {
     NextDisplay,
     PreviousDisplay,
     Minimize,
+    /// Minimizes every app window on the display this one is on.
+    MinimizeDisplay,
     ToggleAlwaysOnTop,
     /// The app's next (or previous) window, cycling through all of them.
     FocusNextAppWindow,
@@ -105,9 +155,27 @@ pub enum WindowCommand {
     Focus,
     /// Asks it to close, as its × button would.
     Close,
+    /// Asks where to move it, in a form with its position now; the UI
+    /// shows the form, which runs [`crate::item::Command::SetWindowFrame`].
+    AskPosition,
+    /// Asks what size to make it, the same way.
+    AskSize,
 }
 
 impl WindowCommand {
+    /// Whether it puts the window in a place worked out from where it is
+    /// (a layout, a size, a nudge), as opposed to maximizing it, moving it
+    /// to another display or doing something else to it.
+    pub fn places(&self) -> bool {
+        self.moves()
+            && !matches!(
+                self,
+                WindowCommand::Maximize
+                    | WindowCommand::NextDisplay
+                    | WindowCommand::PreviousDisplay
+            )
+    }
+
     /// Whether it moves or resizes the window, so the place it had before
     /// is worth remembering for [`WindowCommand::Restore`].
     pub fn moves(&self) -> bool {
@@ -115,11 +183,14 @@ impl WindowCommand {
             self,
             WindowCommand::Restore
                 | WindowCommand::Minimize
+                | WindowCommand::MinimizeDisplay
                 | WindowCommand::ToggleAlwaysOnTop
                 | WindowCommand::FocusNextAppWindow
                 | WindowCommand::FocusPreviousAppWindow
                 | WindowCommand::Focus
                 | WindowCommand::Close
+                | WindowCommand::AskPosition
+                | WindowCommand::AskSize
         )
     }
 }
@@ -383,6 +454,24 @@ pub const LAYOUTS: &[(&str, &str, &[&str], WindowCommand)] = {
         ),
         ("minimize", "Minimize", &["hide"], WindowCommand::Minimize),
         (
+            "move-window",
+            "Move Window…",
+            &["position", "coordinates"],
+            WindowCommand::AskPosition,
+        ),
+        (
+            "resize-window",
+            "Resize Window…",
+            &["size", "width", "height"],
+            WindowCommand::AskSize,
+        ),
+        (
+            "minimize-display",
+            "Minimize All on This Display",
+            &["hide", "desktop", "monitor", "screen"],
+            WindowCommand::MinimizeDisplay,
+        ),
+        (
             "toggle-always-on-top",
             "Toggle Always on Top",
             &["pin", "topmost"],
@@ -413,7 +502,7 @@ const SMALLEST: f32 = 0.25;
 /// Where `command` puts a window that is at `window` on a screen whose work
 /// area is `work`. `None` for commands that don't place windows by
 /// themselves (Restore, display moves, focus…).
-pub fn place(command: WindowCommand, window: Rect, work: Rect) -> Option<Rect> {
+pub fn place(command: WindowCommand, window: Rect, work: Rect, gap: i32) -> Option<Rect> {
     let scale = |share: f32, length: i32| (share * length as f32).round() as i32;
     let rect = match command {
         WindowCommand::Area(part) => {
@@ -422,6 +511,13 @@ pub fn place(command: WindowCommand, window: Rect, work: Rect) -> Option<Rect> {
             let top = work.y + scale(part.y, work.height);
             let right = work.x + scale(part.x + part.width, work.width);
             let bottom = work.y + scale(part.y + part.height, work.height);
+            // `gap` at the screen's edges, half of it either side of an
+            // edge shared with a neighbour, so neighbours are `gap` apart.
+            let inset = |edge: i32, outer: i32| if edge == outer { gap } else { gap / 2 };
+            let left = left + inset(left, work.x);
+            let top = top + inset(top, work.y);
+            let right = right - inset(right, work.right());
+            let bottom = bottom - inset(bottom, work.bottom());
             Rect::new(left, top, right - left, bottom - top)
         }
         WindowCommand::Maximize => work,
@@ -497,6 +593,32 @@ pub fn place(command: WindowCommand, window: Rect, work: Rect) -> Option<Rect> {
     Some(rect)
 }
 
+/// Where a window goes when given numbers: `x` and `y` (from the top left
+/// of `work`) and a `width` and `height`, each `None` to keep what it is.
+/// `Err` says which one isn't a number of pixels.
+pub fn frame_from(
+    window: Rect,
+    work: Rect,
+    [x, y, width, height]: [&str; 4],
+) -> Result<Rect, String> {
+    let number = |text: &str, name: &str, positive: bool| -> Result<Option<i32>, String> {
+        let text = text.trim().trim_end_matches("px").trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        match text.parse::<i32>() {
+            Ok(value) if !positive || value > 0 => Ok(Some(value)),
+            _ => Err(format!("{name} must be a whole number of pixels")),
+        }
+    };
+    Ok(Rect {
+        x: number(x, "X", false)?.map_or(window.x, |x| work.x + x),
+        y: number(y, "Y", false)?.map_or(window.y, |y| work.y + y),
+        width: number(width, "Width", true)?.unwrap_or(window.width),
+        height: number(height, "Height", true)?.unwrap_or(window.height),
+    })
+}
+
 /// Where a window at `window` in work area `from` goes on a display whose
 /// work area is `to`: the same place and size relative to the work area.
 pub fn move_between(window: Rect, from: Rect, to: Rect) -> Rect {
@@ -546,7 +668,7 @@ mod tests {
     #[test]
     fn places_areas() {
         let window = Rect::new(100, 100, 800, 600);
-        let at = |id| place(layout(id), window, WORK).unwrap();
+        let at = |id| place(layout(id), window, WORK, 0).unwrap();
         assert_eq!(at("left-half"), Rect::new(0, 0, 960, 1032));
         assert_eq!(at("right-half"), Rect::new(960, 0, 960, 1032));
         assert_eq!(at("bottom-right-quarter"), Rect::new(960, 516, 960, 516));
@@ -555,18 +677,73 @@ mod tests {
         assert_eq!(at("center-two-thirds"), Rect::new(320, 0, 1280, 1032));
         // Thirds of an odd width still meet edge to edge.
         let odd = Rect::new(-1000, 0, 1001, 700);
-        let first = place(layout("first-third"), window, odd).unwrap();
-        let center = place(layout("center-third"), window, odd).unwrap();
-        let last = place(layout("last-third"), window, odd).unwrap();
+        let first = place(layout("first-third"), window, odd, 0).unwrap();
+        let center = place(layout("center-third"), window, odd, 0).unwrap();
+        let last = place(layout("last-third"), window, odd, 0).unwrap();
         assert_eq!(first.right(), center.x);
         assert_eq!(center.right(), last.x);
         assert_eq!(last.right(), odd.right());
     }
 
     #[test]
+    fn takes_numbers() {
+        let window = Rect::new(100, 100, 800, 600);
+        let work = Rect::new(1920, 40, 1920, 1000);
+        assert_eq!(
+            frame_from(window, work, ["10", " 20px ", "", ""]),
+            Ok(Rect::new(1930, 60, 800, 600))
+        );
+        assert_eq!(
+            frame_from(window, work, ["", "", "1024", "768"]),
+            Ok(Rect::new(100, 100, 1024, 768))
+        );
+        assert!(frame_from(window, work, ["", "", "0", ""]).is_err());
+        assert!(frame_from(window, work, ["left", "", "", ""]).is_err());
+    }
+
+    #[test]
+    fn leaves_gaps() {
+        let window = Rect::new(100, 100, 800, 600);
+        let at = |id| place(layout(id), window, WORK, 10).unwrap();
+        assert_eq!(at("left-half"), Rect::new(10, 10, 945, 1012));
+        assert_eq!(at("right-half"), Rect::new(965, 10, 945, 1012));
+        // Neighbours end up `gap` apart, the edges `gap` from the screen's.
+        assert_eq!(at("right-half").x - at("left-half").right(), 10);
+        assert_eq!(at("top-left-quarter"), Rect::new(10, 10, 945, 501));
+        // Only layouts: the rest don't change.
+        assert_eq!(place(layout("maximize"), window, WORK, 10), Some(WORK));
+    }
+
+    #[test]
+    fn halves_cycle_through_thirds() {
+        let Some(WindowCommand::Area(left)) = Some(layout("left-half")) else {
+            panic!("not an area");
+        };
+        let mut window = Rect::new(100, 100, 800, 600);
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            let part = cycled(left, window, WORK, 0);
+            window = place(WindowCommand::Area(part), window, WORK, 0).unwrap();
+            widths.push(window.width);
+        }
+        assert_eq!(widths, [960, 1280, 640, 960]);
+        // A little off (an app rounding its size) still counts as there.
+        let near = Rect {
+            width: 955,
+            ..place(WindowCommand::Area(left), window, WORK, 0).unwrap()
+        };
+        assert_ne!(cycled(left, near, WORK, 0), left);
+        // Layouts without a cycle stay as they are.
+        let Some(WindowCommand::Area(quarter)) = Some(layout("top-left-quarter")) else {
+            panic!("not an area");
+        };
+        assert_eq!(cycled(quarter, window, WORK, 0), quarter);
+    }
+
+    #[test]
     fn places_the_rest() {
         let window = Rect::new(100, 100, 800, 600);
-        let at = |id| place(layout(id), window, WORK).unwrap();
+        let at = |id| place(layout(id), window, WORK, 0).unwrap();
         assert_eq!(at("maximize"), WORK);
         assert_eq!(at("almost-maximize"), Rect::new(96, 51, 1728, 929));
         assert_eq!(at("reasonable-size"), Rect::new(448, 206, 1024, 619));
@@ -576,12 +753,12 @@ mod tests {
         assert_eq!(at("move-bottom"), Rect::new(100, 432, 800, 600));
         let larger = at("make-larger");
         assert_eq!((larger.width, larger.height), (992, 704));
-        let smaller = place(layout("make-smaller"), Rect::new(0, 0, 500, 300), WORK).unwrap();
+        let smaller = place(layout("make-smaller"), Rect::new(0, 0, 500, 300), WORK, 0).unwrap();
         assert_eq!((smaller.width, smaller.height), (480, 258));
-        assert_eq!(place(layout("restore"), window, WORK), None);
+        assert_eq!(place(layout("restore"), window, WORK, 0), None);
         // A window larger than the screen is shrunk to fit when centered.
         let huge = Rect::new(-50, -50, 3000, 2000);
-        assert_eq!(place(WindowCommand::Center, huge, WORK), Some(WORK));
+        assert_eq!(place(WindowCommand::Center, huge, WORK, 0), Some(WORK));
     }
 
     #[test]

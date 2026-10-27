@@ -2,8 +2,9 @@
 //! typed out by its keyword in any app.
 //!
 //! Placeholders, as in Raycast (see [`crate::placeholder`]): `{clipboard}`,
-//! `{cursor}`, `{date}`, `{time}`, `{datetime}`, `{day}`, `{uuid}` and
-//! `{argument …}`. Anything else in braces is pasted as it is.
+//! `{cursor}`, `{selection}`, `{date}`, `{time}`, `{datetime}`, `{day}` (with
+//! `format` and `offset`), `{uuid}`, `{snippet name="…"}` and `{argument …}`.
+//! Anything else in braces is pasted as it is.
 //!
 //! They move to and from Raycast as JSON: an array of
 //! `{"name", "text", "keyword"}` objects, the keyword left out when there's none.
@@ -11,8 +12,12 @@
 use serde_json::{Map, Value, json};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::placeholder::{self, Placeholder};
 pub use crate::placeholder::{Argument, Moment, arguments, field_id, with_field_ids};
+use crate::{
+    item::Command,
+    placeholder::{self, Placeholder},
+    view::{Field, FieldKind, FormView, View},
+};
 
 /// A saved snippet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +178,53 @@ pub fn export(snippets: &[Snippet]) -> String {
     serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into())
 }
 
+/// How deep `{snippet}` placeholders are followed into each other.
+const MAX_NESTING: usize = 5;
+
+/// `text` with each `{snippet name="…"}` replaced by the text of the snippet
+/// of that name (its own `{snippet}`s too). Names match as typed, else
+/// ignoring case. A snippet that isn't there, or that would include itself,
+/// stays as typed.
+pub fn inline(text: &str, snippets: &[Snippet]) -> String {
+    inline_from(text, snippets, &mut Vec::new())
+}
+
+fn inline_from<'a>(text: &str, snippets: &'a [Snippet], within: &mut Vec<&'a str>) -> String {
+    placeholder::replace(text, |placeholder| {
+        let Placeholder::Snippet(name) = placeholder else {
+            return None;
+        };
+        let snippet = snippets
+            .iter()
+            .find(|snippet| snippet.name == *name)
+            .or_else(|| {
+                snippets
+                    .iter()
+                    .find(|snippet| snippet.name.to_lowercase() == name.to_lowercase())
+            })?;
+        if within.len() >= MAX_NESTING || within.contains(&snippet.name.as_str()) {
+            return None;
+        }
+        within.push(&snippet.name);
+        let text = inline_from(&snippet.text, snippets, within);
+        within.pop();
+        Some(text)
+    })
+}
+
+/// Whether `text` contains `{selection}`, which the launcher reads from the
+/// app it came from before pasting.
+pub fn has_selection(text: &str) -> bool {
+    placeholder::contains(text, |placeholder| *placeholder == Placeholder::Selection)
+}
+
+/// `text` with `{selection}` replaced by `selection`.
+pub fn fill_selection(text: &str, selection: &str) -> String {
+    placeholder::replace(text, |placeholder| {
+        (*placeholder == Placeholder::Selection).then(|| selection.to_owned())
+    })
+}
+
 /// What the placeholders of a snippet are filled with.
 #[derive(Clone, Copy, Debug)]
 pub struct Inputs<'a> {
@@ -217,9 +269,9 @@ pub fn expand(text: &str, inputs: &Inputs) -> Expansion {
             }
             Placeholder::Clipboard => Some(inputs.clipboard.unwrap_or_default().to_owned()),
             Placeholder::Cursor => Some(String::new()),
-            // The launcher isn't open when a keyword is typed, so there's
-            // no app to read a selection from.
-            Placeholder::Selection => None,
+            // The launcher fills it in before (see `fill_selection`); a
+            // keyword typed in an app has nothing selected.
+            Placeholder::Selection => Some(String::new()),
             moment => moment.moment(inputs.moment),
         };
         let Some(value) = value else {
@@ -234,6 +286,51 @@ pub fn expand(text: &str, inputs: &Inputs) -> Expansion {
     }
     out.push_str(&text[last..]);
     Expansion { text: out, cursor }
+}
+
+/// A form with a field per argument of `text` (the snippet called `name`);
+/// submitting pastes it (or copies it) with them.
+pub fn arguments_form(name: &str, text: &str, paste: bool) -> View {
+    let fields = arguments(text)
+        .iter()
+        .enumerate()
+        .map(|(ix, argument)| {
+            let kind = if argument.is_free_text() {
+                FieldKind::Text {
+                    placeholder: argument.name.clone(),
+                    default: argument.default.clone(),
+                    required: argument.fallback().is_empty(),
+                }
+            } else {
+                FieldKind::Dropdown {
+                    default: argument
+                        .options
+                        .iter()
+                        .position(|option| *option == argument.default)
+                        .unwrap_or(0),
+                    options: argument
+                        .options
+                        .iter()
+                        .map(|option| (option.clone(), option.clone()))
+                        .collect(),
+                }
+            };
+            Field {
+                id: field_id(ix),
+                label: argument.name.clone(),
+                kind,
+            }
+        })
+        .collect();
+    View::Form(FormView {
+        title: name.to_owned(),
+        fields,
+        submit_title: if paste { "Paste" } else { "Copy" }.into(),
+        submit: Command::PasteSnippet {
+            text: with_field_ids(text),
+            paste,
+        },
+    })
 }
 
 /// Whether `text` contains `{clipboard}`, so the clipboard has to be read
@@ -296,9 +393,14 @@ mod tests {
 
     fn moment() -> Moment {
         Moment {
-            date: "2026-10-23".into(),
-            time: "14:05".into(),
-            day: "Friday".into(),
+            now: crate::datetime::LocalTime {
+                year: 2026,
+                month: 10,
+                day: 23,
+                hour: 14,
+                minute: 5,
+                second: 0,
+            },
             uuid: "u".into(),
         }
     }
@@ -324,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             expansion.text,
-            "Friday, 2026-10-23 14:05 (2026-10-23 14:05) #u: copied {selection} {unknown}"
+            "Friday, 2026-10-23 14:05 (2026-10-23 14:05) #u: copied  {unknown}"
         );
         assert_eq!(expansion.cursor, None);
         assert_eq!(expansion.moves_back(), 0);
@@ -357,6 +459,34 @@ mod tests {
         // are one press each.
         let expansion = expand_with("Привет, {cursor}!\r\n👍🏽", None, &[]);
         assert_eq!(expansion.moves_back(), 3);
+    }
+
+    #[test]
+    fn includes_other_snippets() {
+        let snippets = [
+            snippet("Sign", "— Ann{snippet name=\"Title\"}", None),
+            snippet("Title", ", Docs team", None),
+            snippet("Loop", "x{snippet name=\"Loop\"}", None),
+        ];
+        assert_eq!(
+            inline(
+                "Thanks!\n{snippet name=\"sign\"} {snippet name=\"None\"}",
+                &snippets
+            ),
+            "Thanks!\n— Ann, Docs team {snippet name=\"None\"}"
+        );
+        assert_eq!(
+            inline("{snippet name=\"Loop\"}", &snippets),
+            "x{snippet name=\"Loop\"}"
+        );
+    }
+
+    #[test]
+    fn fills_the_selection() {
+        let text = "<b>{selection}</b>{cursor}";
+        assert!(has_selection(text));
+        assert!(!has_selection("{clipboard}"));
+        assert_eq!(fill_selection(text, "bold"), "<b>bold</b>{cursor}");
     }
 
     #[test]

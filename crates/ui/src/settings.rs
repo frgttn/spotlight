@@ -8,6 +8,7 @@
 //! top bars are the drag area and carry their own close button.
 
 use std::{
+    cell::Cell,
     ops::Range,
     rc::Rc,
     sync::{Arc, OnceLock},
@@ -15,10 +16,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, Image, ImageFormat, KeyBinding, PathPromptOptions, Pixels, ScrollHandle,
-    SharedString, Stateful, Subscription, Task, Window, WindowControlArea, actions, div, img,
-    prelude::*, px, rgba,
+    AnyElement, App, Bounds, ClickEvent, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, Image, ImageFormat, KeyBinding, MouseDownEvent, PathPromptOptions,
+    Pixels, ScrollHandle, SharedString, Stateful, Subscription, Task, Window, WindowControlArea,
+    actions, canvas, deferred, div, img, prelude::*, px, rgba,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use spotlight_core::{
@@ -26,6 +27,7 @@ use spotlight_core::{
     file_search::{self, Config as FileSearchConfig, Status as FileSearchStatus},
     item::Command,
     web::{self, SearchEngine},
+    window::GAPS,
 };
 use spotlight_platform_win::{
     autostart, commands,
@@ -34,7 +36,7 @@ use spotlight_platform_win::{
 };
 
 use crate::{
-    launcher::{ExtensionItem, Shortcut, Source, WindowMode, icon_font},
+    launcher::{ExtensionItem, HomeSection, Shortcut, Source, WindowMode, icon_font},
     smooth_scroll::{Scroller, capture_wheel},
     text_input::{self, TextInput},
     theme,
@@ -68,6 +70,11 @@ pub struct LauncherState {
     pub ignored_apps: Vec<IgnoredApp>,
     /// Apps where snippet keywords don't expand.
     pub excluded_apps: Vec<IgnoredApp>,
+    /// The web search engine, which a quicklink's "Use as Web Search" in
+    /// the launcher changes too, and its name.
+    pub search_engine: (SearchEngine, String),
+    /// Commands that open from links without asking: item id and title.
+    pub trusted_links: Vec<(String, String)>,
 }
 
 /// Reads the launcher's current state; `None` while the launcher can't be
@@ -88,6 +95,15 @@ pub enum SettingsEvent {
     SmoothScrollingChanged(bool),
     /// The launcher opens in this mode from now on.
     WindowModeChanged(WindowMode),
+    /// Compact mode shows the favorites and runs them with Ctrl+1 to Ctrl+8
+    /// (or no longer does).
+    CompactFavoritesChanged(bool),
+    /// Root search ranks often-used items first (or no longer does).
+    RankByUsageChanged(bool),
+    /// Root search no longer lists these kinds before anything is typed.
+    HiddenSectionsChanged(Vec<HomeSection>),
+    /// The theme choice is now this one; apply it, redraw and save it.
+    ThemeChanged(theme::Choice),
     /// The web search engine is now this one; switch to it and save it.
     SearchEngineChanged(SearchEngine),
     /// The clipboard history now keeps this much; trim it and save it.
@@ -100,8 +116,16 @@ pub enum SettingsEvent {
     SelectionCopyChanged(bool),
     /// Snippet keywords typed in other apps expand (or no longer do).
     SnippetExpansionChanged(bool),
+    /// Layouts now leave `gap` pixels between windows, and running a half
+    /// again cycles through thirds (or doesn't).
+    WindowLayoutChanged {
+        gap: i32,
+        cycle: bool,
+    },
     /// The apps where snippet keywords don't expand are now these; save them.
     ExcludedAppsChanged(Vec<IgnoredApp>),
+    /// What a root search starts with to run a command; save it.
+    RunPrefixChanged(String),
     /// What File Search indexes changed; save it and index again.
     FileSearchChanged(FileSearchConfig),
     /// Rebuild the file index from scratch.
@@ -123,6 +147,8 @@ pub enum SettingsEvent {
         item_id: String,
         hotkey: Option<Hotkey>,
     },
+    /// This command asks again before it opens from a link.
+    LinkDistrusted(String),
 }
 
 pub struct Settings {
@@ -145,7 +171,16 @@ pub struct Settings {
     shortcut_message: Option<(String, SharedString, bool)>,
     smooth_scrolling: bool,
     window_mode: WindowMode,
+    compact_favorites: bool,
+    rank_by_usage: bool,
+    hidden_sections: Vec<HomeSection>,
+    /// The theme dropdown whose menu is open.
+    theme_menu: Option<theme::Appearance>,
+    /// Where each theme dropdown's button was last laid out (dark, light).
+    theme_buttons: [Rc<Cell<Bounds<Pixels>>>; 2],
     search_engine: SearchEngine,
+    /// The engine's name: a quicklink engine's is only known to the launcher.
+    engine_name: String,
     /// The custom search URL field: shown while a custom engine is in use
     /// or being set up.
     custom_engine: Option<Entity<TextInput>>,
@@ -158,7 +193,12 @@ pub struct Settings {
     win_v: bool,
     selection_copy: bool,
     snippet_expansion: bool,
+    /// Pixels layouts leave between windows, and whether halves cycle.
+    window_gap: i32,
+    window_cycle: bool,
     excluded_apps: Vec<IgnoredApp>,
+    /// Commands that open from links without asking: item id and title.
+    trusted_links: Vec<(String, String)>,
     /// The apps with windows open, to add to `excluded_apps`; `Some` while
     /// the list is shown.
     app_choices: Option<Vec<IgnoredApp>>,
@@ -168,6 +208,9 @@ pub struct Settings {
     exclusion_input: Entity<TextInput>,
     /// The file prefix of root search, saved as it is typed.
     prefix_input: Entity<TextInput>,
+    /// Run's prefix, saved as it is typed.
+    run_prefix_input: Entity<TextInput>,
+    run_prefix: String,
     /// Redraws the File Search page while indexing, for its count.
     status_refresh: Option<Task<()>>,
     /// The index service's installer or remover is running (behind its UAC
@@ -191,7 +234,7 @@ pub struct Settings {
     relayout: bool,
     focus: FocusHandle,
     recorder: FocusHandle,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 5],
 }
 
 impl EventEmitter<SettingsEvent> for Settings {}
@@ -203,11 +246,16 @@ impl Settings {
         hotkey: Option<Hotkey>,
         smooth_scrolling: bool,
         window_mode: WindowMode,
+        compact_favorites: bool,
+        rank_by_usage: bool,
+        hidden_sections: Vec<HomeSection>,
         search_engine: SearchEngine,
         clipboard_retention: Retention,
         win_v: bool,
         selection_copy: bool,
         snippet_expansion: bool,
+        (window_gap, window_cycle): (i32, bool),
+        run_prefix: String,
         file_search: FileSearchConfig,
         file_status: FileStatusReader,
         version: &'static str,
@@ -233,6 +281,11 @@ impl Settings {
             input.set_text(prefix, cx);
             input
         });
+        let run_prefix_input = cx.new(|cx| {
+            let mut input = TextInput::new("Off", cx);
+            input.set_text(run_prefix.clone(), cx);
+            input
+        });
         let subscriptions = [
             cx.on_blur(&recorder, window, |this, _, cx| this.stop_recording(cx)),
             cx.observe_window_activation(window, |this, window, cx| {
@@ -249,6 +302,17 @@ impl Settings {
                 &search,
                 window,
                 |this, _, _: &text_input::Changed, _, cx| this.search_changed(cx),
+            ),
+            cx.subscribe_in(
+                &run_prefix_input,
+                window,
+                |this, input, _: &text_input::Changed, _, cx| {
+                    let prefix = input.read(cx).text().trim().to_owned();
+                    if prefix != this.run_prefix {
+                        this.run_prefix = prefix.clone();
+                        cx.emit(SettingsEvent::RunPrefixChanged(prefix));
+                    }
+                },
             ),
             // Only root search reads it, so nothing is indexed again.
             cx.subscribe_in(
@@ -270,7 +334,14 @@ impl Settings {
             sources,
             ignored_apps,
             excluded_apps,
+            search_engine: (_, engine_name),
+            trusted_links,
         } = launcher(cx).unwrap_or_default();
+        let engine_name = if engine_name.is_empty() {
+            search_engine.name()
+        } else {
+            engine_name
+        };
         Self {
             hotkeys,
             hotkey,
@@ -284,11 +355,17 @@ impl Settings {
             shortcut_message: None,
             smooth_scrolling,
             window_mode,
+            compact_favorites,
+            rank_by_usage,
+            hidden_sections,
+            theme_menu: None,
+            theme_buttons: Default::default(),
             custom_engine: match &search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
-                SearchEngine::Preset(_) => None,
+                SearchEngine::Preset(_) | SearchEngine::Quicklink(_) => None,
             },
             search_engine,
+            engine_name,
             engine_message: None,
             sources,
             clipboard_retention,
@@ -296,12 +373,17 @@ impl Settings {
             win_v,
             selection_copy,
             snippet_expansion,
+            window_gap,
+            window_cycle,
             excluded_apps,
+            trusted_links,
             app_choices: None,
             file_search,
             file_status,
             exclusion_input: cx.new(|cx| TextInput::new("Folder name or path", cx)),
             prefix_input,
+            run_prefix_input,
+            run_prefix,
             status_refresh: None,
             service_busy: false,
             service_message: None,
@@ -335,6 +417,12 @@ impl Settings {
         self.sources = state.sources;
         self.ignored_apps = state.ignored_apps;
         self.excluded_apps = state.excluded_apps;
+        self.trusted_links = state.trusted_links;
+        let (engine, name) = state.search_engine;
+        if engine != self.search_engine && self.custom_engine.is_none() {
+            self.search_engine = engine;
+        }
+        self.engine_name = name;
         cx.notify();
     }
 
@@ -477,7 +565,9 @@ impl Settings {
             return self.add_exclusion(cx);
         }
         // Saved as typed: Enter just leaves the field.
-        if self.prefix_input.focus_handle(cx).is_focused(window) {
+        if self.prefix_input.focus_handle(cx).is_focused(window)
+            || self.run_prefix_input.focus_handle(cx).is_focused(window)
+        {
             window.focus(&self.focus);
             return;
         }
@@ -595,6 +685,14 @@ impl Settings {
         });
         let custom = chip("engine-custom", "Custom…", custom_selected)
             .on_click(cx.listener(|this, _, window, cx| this.edit_custom_engine(window, cx)));
+        // Chosen in the launcher; picking anything else here replaces it.
+        let quicklink = (matches!(self.search_engine, SearchEngine::Quicklink(_))
+            && !custom_selected)
+            .then(|| chip("engine-quicklink", self.engine_name.clone(), true));
+        let hint = div()
+            .text_size(px(11.))
+            .text_color(rgba(theme::p().text_faint))
+            .child("A quicklink with {query} can search too: Ctrl+K on it in the launcher, then Use as Web Search.");
         let field = self.custom_engine.as_ref().map(|input| {
             div()
                 .flex()
@@ -608,15 +706,15 @@ impl Settings {
                         .items_center()
                         .rounded(px(6.))
                         .border_1()
-                        .border_color(rgba(theme::SURFACE_BORDER))
-                        .bg(rgba(theme::SURFACE))
+                        .border_color(rgba(theme::p().surface_border))
+                        .bg(rgba(theme::p().surface))
                         .text_size(px(13.))
                         .child(input.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child("A results page URL with {query} where the search text goes. Enter saves."),
                 )
         });
@@ -624,9 +722,9 @@ impl Settings {
             div()
                 .text_size(px(12.))
                 .text_color(rgba(if is_error {
-                    theme::ERROR
+                    theme::p().error
                 } else {
-                    theme::SUCCESS
+                    theme::p().success
                 }))
                 .child(text)
         });
@@ -642,10 +740,12 @@ impl Settings {
                     .flex_wrap()
                     .gap_1p5()
                     .children(presets)
+                    .children(quicklink)
                     .child(custom),
             )
             .children(field)
             .children(message)
+            .when(self.custom_engine.is_none(), |row| row.child(hint))
     }
 
     fn toggle_smooth_scrolling(&mut self, cx: &mut Context<Self>) {
@@ -653,6 +753,36 @@ impl Settings {
         self.nav_scroll.set_enabled(self.smooth_scrolling);
         self.page_scroll.set_enabled(self.smooth_scrolling);
         cx.emit(SettingsEvent::SmoothScrollingChanged(self.smooth_scrolling));
+        cx.notify();
+    }
+
+    fn toggle_compact_favorites(&mut self, cx: &mut Context<Self>) {
+        self.compact_favorites = !self.compact_favorites;
+        cx.emit(SettingsEvent::CompactFavoritesChanged(
+            self.compact_favorites,
+        ));
+        cx.notify();
+    }
+
+    fn toggle_rank_by_usage(&mut self, cx: &mut Context<Self>) {
+        self.rank_by_usage = !self.rank_by_usage;
+        cx.emit(SettingsEvent::RankByUsageChanged(self.rank_by_usage));
+        cx.notify();
+    }
+
+    fn toggle_section(&mut self, section: HomeSection, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .hidden_sections
+            .iter()
+            .position(|hidden| *hidden == section)
+        {
+            self.hidden_sections.remove(ix);
+        } else {
+            self.hidden_sections.push(section);
+        }
+        cx.emit(SettingsEvent::HiddenSectionsChanged(
+            self.hidden_sections.clone(),
+        ));
         cx.notify();
     }
 
@@ -682,8 +812,8 @@ impl Settings {
                 .h(px(if mode == WindowMode::Compact { 9. } else { 50. }))
                 .rounded(px(3.))
                 .border_1()
-                .border_color(rgba(theme::SURFACE_BORDER))
-                .bg(rgba(theme::PANEL))
+                .border_color(rgba(theme::p().surface_border))
+                .bg(rgba(theme::p().panel))
                 .flex()
                 .flex_col()
                 .child(
@@ -692,19 +822,19 @@ impl Settings {
                             .w(px(24.))
                             .h(px(2.))
                             .rounded_full()
-                            .bg(rgba(theme::TEXT_FAINT)),
+                            .bg(rgba(theme::p().text_faint)),
                     ),
                 )
                 .when(mode == WindowMode::Expanded, |window| {
                     window
-                        .child(div().h(px(1.)).bg(rgba(theme::HAIRLINE)))
+                        .child(div().h(px(1.)).bg(rgba(theme::p().hairline)))
                         .children([40., 52., 34.].map(|width| {
                             div().h(px(8.)).px(px(4.)).flex().items_center().child(
                                 div()
                                     .w(px(width))
                                     .h(px(2.))
                                     .rounded_full()
-                                    .bg(rgba(theme::SURFACE_HOVER)),
+                                    .bg(rgba(theme::p().surface_hover)),
                             )
                         }))
                 });
@@ -726,16 +856,16 @@ impl Settings {
                         .rounded(px(8.))
                         .border_2()
                         .border_color(rgba(if selected {
-                            theme::ACCENT
+                            theme::p().accent
                         } else {
-                            theme::SURFACE_BORDER
+                            theme::p().surface_border
                         }))
                         .bg(rgba(if selected {
-                            theme::ACCENT_SOFT
+                            theme::p().accent_soft
                         } else {
-                            theme::SURFACE
+                            theme::p().surface
                         }))
-                        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                        .hover(|style| style.bg(rgba(theme::p().surface_hover)))
                         .child(window),
                 )
                 .child(
@@ -744,16 +874,253 @@ impl Settings {
                         .rounded(px(5.))
                         .text_size(px(12.))
                         .line_height(px(20.))
-                        .when(selected, |label| label.bg(rgba(theme::SURFACE_HOVER)))
+                        .when(selected, |label| label.bg(rgba(theme::p().surface_hover)))
                         .text_color(rgba(if selected {
-                            theme::TEXT
+                            theme::p().text
                         } else {
-                            theme::TEXT_MUTED
+                            theme::p().text_muted
                         }))
                         .child(label),
                 )
         });
         div().flex_none().flex().gap_3().children(choices)
+    }
+
+    fn set_theme_choice(&mut self, choice: theme::Choice, cx: &mut Context<Self>) {
+        if choice != theme::choice() {
+            // The event's handler applies it and redraws every window.
+            cx.emit(SettingsEvent::ThemeChanged(choice));
+            cx.notify();
+        }
+    }
+
+    /// System, Light and Dark side by side, each a small picture of the
+    /// window in the theme it would use.
+    fn theme_mode_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = theme::choice();
+        let sample = |theme: &'static theme::Theme, width: f32| {
+            let palette = &theme.palette;
+            div()
+                .w(px(width))
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap(px(5.))
+                .p(px(7.))
+                .bg(rgba(palette.panel))
+                .child(
+                    div()
+                        .w(px(28.))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(rgba(palette.text_faint)),
+                )
+                .child(div().h(px(6.)).rounded(px(2.)).bg(rgba(palette.selected)))
+                .child(
+                    div()
+                        .w(px(34.))
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(rgba(palette.accent)),
+                )
+        };
+        let choices = theme::Mode::ALL.map(|mode| {
+            let selected = mode == current.mode;
+            let light = theme::theme(current.light).unwrap_or(&theme::THEMES[1]);
+            let dark = theme::theme(current.dark).unwrap_or(&theme::THEMES[0]);
+            let preview = div()
+                .w(px(92.))
+                .h(px(50.))
+                .rounded(px(4.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgba(theme::p().surface_border))
+                .flex()
+                .map(|preview| match mode {
+                    theme::Mode::Light => preview.child(sample(light, 92.)),
+                    theme::Mode::Dark => preview.child(sample(dark, 92.)),
+                    theme::Mode::System => {
+                        preview.child(sample(light, 46.)).child(sample(dark, 46.))
+                    }
+                });
+            div()
+                .id(("theme-mode", mode as usize))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_1p5()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_theme_choice(
+                        theme::Choice {
+                            mode,
+                            ..theme::choice()
+                        },
+                        cx,
+                    )
+                }))
+                .child(
+                    div()
+                        .w(px(112.))
+                        .h(px(76.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.))
+                        .border_2()
+                        .border_color(rgba(if selected {
+                            theme::p().accent
+                        } else {
+                            theme::p().surface_border
+                        }))
+                        .bg(rgba(if selected {
+                            theme::p().accent_soft
+                        } else {
+                            theme::p().surface
+                        }))
+                        .hover(|style| style.bg(rgba(theme::p().surface_hover)))
+                        .child(preview),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .rounded(px(5.))
+                        .text_size(px(12.))
+                        .line_height(px(20.))
+                        .when(selected, |label| label.bg(rgba(theme::p().surface_hover)))
+                        .text_color(rgba(if selected {
+                            theme::p().text
+                        } else {
+                            theme::p().text_muted
+                        }))
+                        .child(mode.title()),
+                )
+        });
+        div().flex_none().flex().gap_3().children(choices)
+    }
+
+    /// A dropdown of the themes of `appearance`: the one in use on a button,
+    /// the rest in a menu under it.
+    fn theme_dropdown(
+        &self,
+        appearance: theme::Appearance,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (key, slot) = match appearance {
+            theme::Appearance::Dark => ("theme-dark", 0),
+            theme::Appearance::Light => ("theme-light", 1),
+        };
+        let open = self.theme_menu == Some(appearance);
+        let used_id = theme::choice().theme_for(appearance);
+        let used = theme::theme(used_id).unwrap_or(&theme::THEMES[0]);
+        let button_bounds = self.theme_buttons[slot].clone();
+        let button = div()
+            .id(key)
+            .h(px(30.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(rgba(if open {
+                theme::p().accent
+            } else {
+                theme::p().surface_border
+            }))
+            .bg(rgba(theme::p().surface))
+            .hover(|style| style.bg(rgba(theme::p().surface_hover)))
+            .text_size(px(13.))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.theme_menu = (this.theme_menu != Some(appearance)).then_some(appearance);
+                cx.notify();
+            }))
+            .child(
+                canvas(
+                    move |bounds, _, _| button_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(theme_swatch(used))
+            .child(used.name)
+            .child(
+                div()
+                    .font_family(icon_font())
+                    .text_size(px(10.))
+                    .text_color(rgba(theme::p().text_faint))
+                    .child("\u{E70D}"),
+            );
+        let menu = div()
+            .absolute()
+            .top(px(34.))
+            .right_0()
+            .w(px(240.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgba(theme::p().surface_border))
+            .bg(rgba(theme::p().panel))
+            .shadow_md()
+            .occlude()
+            .on_mouse_down_out({
+                let button_bounds = self.theme_buttons[slot].clone();
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    // A click on the button toggles the menu itself.
+                    if !button_bounds.get().contains(&event.position) {
+                        this.theme_menu = None;
+                        cx.notify();
+                    }
+                })
+            })
+            .children(
+                theme::themes_for(appearance)
+                    .enumerate()
+                    .map(|(ix, theme)| {
+                        let selected = theme.id == used_id;
+                        let id = theme.id;
+                        div()
+                            .id((key, ix + 1))
+                            .h(px(28.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(5.))
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .when(selected, |item| item.bg(rgba(theme::p().surface_hover)))
+                            .hover(|style| style.bg(rgba(theme::p().surface_hover)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.theme_menu = None;
+                                this.set_theme_choice(theme::choice().with_theme(id), cx);
+                                cx.notify();
+                            }))
+                            .child(theme_swatch(theme))
+                            .child(div().flex_1().child(theme.name))
+                            .when(selected, |item| {
+                                item.child(
+                                    div()
+                                        .font_family(icon_font())
+                                        .text_size(px(11.))
+                                        .text_color(rgba(theme::p().accent))
+                                        .child("\u{E73E}"),
+                                )
+                            })
+                    }),
+            );
+        div()
+            .relative()
+            .flex_none()
+            .child(button)
+            .when(open, |dropdown| {
+                dropdown.child(deferred(menu).with_priority(1))
+            })
     }
 
     fn toggle_source(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -823,7 +1190,7 @@ impl Settings {
                 .px_4()
                 .pb_3()
                 .text_size(px(12.))
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("None. To add one, press Ctrl+K on an entry copied from it and choose Ignore Copies from….")
                 .into_any_element();
         }
@@ -896,7 +1263,7 @@ impl Settings {
                 .px_4()
                 .pb_3()
                 .text_size(px(12.))
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("None.")
                 .into_any_element()
         } else {
@@ -922,7 +1289,7 @@ impl Settings {
             let body: AnyElement = if apps.is_empty() {
                 div()
                     .text_size(px(12.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child("No other apps have a window open.")
                     .into_any_element()
             } else {
@@ -947,7 +1314,7 @@ impl Settings {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_MUTED))
+                        .text_color(rgba(theme::p().text_muted))
                         .child("Apps with a window open; click one to add it."),
                 )
                 .child(body)
@@ -973,6 +1340,60 @@ impl Settings {
             )
             .children(choices)
             .child(excluded)
+    }
+
+    /// The gap between windows layouts leave, and whether halves cycle.
+    fn windows_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let gaps = GAPS.iter().enumerate().map(|(ix, &gap)| {
+            let label = if gap == 0 {
+                "None".to_owned()
+            } else {
+                format!("{gap} px")
+            };
+            chip(("window-gap", ix), label, self.window_gap == gap).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.window_gap = gap;
+                    this.window_layout_changed(cx);
+                },
+            ))
+        });
+        card()
+            .child(row(
+                "Gap between windows",
+                "Space layouts leave between windows and around the screen's edges.",
+            ))
+            .child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(gaps),
+            )
+            .child(divider())
+            .child(
+                row(
+                    "Cycle through thirds",
+                    "Running Left Half (or another half) again makes it two thirds, then one third.",
+                )
+                .child(switch(
+                    "window-cycle",
+                    self.window_cycle,
+                    cx.listener(|this, _, _, cx| {
+                        this.window_cycle = !this.window_cycle;
+                        this.window_layout_changed(cx);
+                    }),
+                )),
+            )
+    }
+
+    fn window_layout_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(SettingsEvent::WindowLayoutChanged {
+            gap: self.window_gap,
+            cycle: self.window_cycle,
+        });
+        cx.notify();
     }
 
     fn change_file_search(
@@ -1161,9 +1582,9 @@ impl Settings {
                 .pb_3()
                 .text_size(px(12.))
                 .text_color(rgba(if is_error {
-                    theme::ERROR
+                    theme::p().error
                 } else {
-                    theme::SUCCESS
+                    theme::p().success
                 }))
                 .child(text)
         });
@@ -1243,7 +1664,7 @@ impl Settings {
         let rules = if self.file_search.exclusions.is_empty() {
             div()
                 .text_size(px(12.))
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("Nothing is left out.")
                 .into_any_element()
         } else {
@@ -1266,9 +1687,9 @@ impl Settings {
                                 .gap_1()
                                 .rounded_full()
                                 .border_1()
-                                .border_color(rgba(theme::SURFACE_BORDER))
+                                .border_color(rgba(theme::p().surface_border))
                                 .text_size(px(12.))
-                                .text_color(rgba(theme::TEXT_MUTED))
+                                .text_color(rgba(theme::p().text_muted))
                                 .child(rule.clone())
                                 .child(remove_button(
                                     ("remove-exclusion", ix),
@@ -1348,8 +1769,8 @@ impl Settings {
                                     .items_center()
                                     .rounded(px(6.))
                                     .border_1()
-                                    .border_color(rgba(theme::SURFACE_BORDER))
-                                    .bg(rgba(theme::SURFACE))
+                                    .border_color(rgba(theme::p().surface_border))
+                                    .bg(rgba(theme::p().surface))
                                     .text_size(px(13.))
                                     .child(self.exclusion_input.clone()),
                             )
@@ -1366,21 +1787,7 @@ impl Settings {
                     "In root search",
                     "Start a search with this to find files right there; Tab goes on in Search Files. Empty turns it off.",
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(64.))
-                        .h(px(30.))
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(rgba(theme::SURFACE_BORDER))
-                        .bg(rgba(theme::SURFACE))
-                        .text_size(px(13.))
-                        .child(self.prefix_input.clone()),
-                ),
+                .child(prefix_field(self.prefix_input.clone())),
             )
             .child(divider())
             .child(self.service_row(cx))
@@ -1498,7 +1905,7 @@ impl Settings {
             // Back to what is in use: a custom engine keeps its field.
             self.custom_engine = match &self.search_engine {
                 SearchEngine::Custom(template) => Some(custom_engine_input(template, cx)),
-                SearchEngine::Preset(_) => None,
+                SearchEngine::Preset(_) | SearchEngine::Quicklink(_) => None,
             };
             self.engine_message = None;
             window.focus(&self.focus);
@@ -1515,7 +1922,7 @@ impl Settings {
         let recording = self.recording.is_some() && self.recording_for.is_none();
         let content: gpui::AnyElement = if recording {
             div()
-                .text_color(rgba(theme::ACCENT))
+                .text_color(rgba(theme::p().accent))
                 .child("Press a shortcut…")
                 .into_any_element()
         } else if let Some(hotkey) = self.hotkey {
@@ -1531,7 +1938,7 @@ impl Settings {
                 .into_any_element()
         } else {
             div()
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .child("Record shortcut")
                 .into_any_element()
         };
@@ -1550,12 +1957,12 @@ impl Settings {
             .border_1()
             .cursor_pointer()
             .when(recording, |el| {
-                el.border_color(rgba(theme::ACCENT))
-                    .bg(rgba(theme::ACCENT_SOFT))
+                el.border_color(rgba(theme::p().accent))
+                    .bg(rgba(theme::p().accent_soft))
             })
             .when(!recording, |el| {
-                el.border_color(rgba(theme::SURFACE_BORDER))
-                    .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+                el.border_color(rgba(theme::p().surface_border))
+                    .hover(|style| style.bg(rgba(theme::p().surface_hover)))
             })
             .child(content)
     }
@@ -1569,7 +1976,7 @@ impl Settings {
                 .px_4()
                 .py_3()
                 .text_size(px(12.))
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .child(
                     "None yet. In the launcher, select an app or command, press Ctrl+K and \
                      choose Set Alias… or Set Hotkey….",
@@ -1604,9 +2011,9 @@ impl Settings {
                     .pb_2()
                     .text_size(px(12.))
                     .text_color(rgba(if *is_error {
-                        theme::ERROR
+                        theme::p().error
                     } else {
-                        theme::SUCCESS
+                        theme::p().success
                     }))
                     .child(text.clone())
             });
@@ -1615,7 +2022,7 @@ impl Settings {
                 .min_w_0()
                 .truncate()
                 .text_size(px(12.))
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child(SharedString::from(subtitle.to_owned()))
         });
         div()
@@ -1666,8 +2073,8 @@ impl Settings {
                 .items_center()
                 .rounded(px(6.))
                 .border_1()
-                .border_color(rgba(theme::ACCENT))
-                .bg(rgba(theme::ACCENT_SOFT))
+                .border_color(rgba(theme::p().accent))
+                .bg(rgba(theme::p().accent_soft))
                 .text_size(px(13.))
                 .child(input.clone())
                 .into_any_element();
@@ -1681,7 +2088,7 @@ impl Settings {
                 .into_any_element(),
             None => div()
                 .flex_1()
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("Add alias")
                 .into_any_element(),
         };
@@ -1711,7 +2118,7 @@ impl Settings {
         let label: AnyElement = if recording {
             div()
                 .flex_1()
-                .text_color(rgba(theme::ACCENT))
+                .text_color(rgba(theme::p().accent))
                 .child("Press keys…")
                 .into_any_element()
         } else if let Some(hotkey) = shortcut.hotkey {
@@ -1729,7 +2136,7 @@ impl Settings {
         } else {
             div()
                 .flex_1()
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("Record hotkey")
                 .into_any_element()
         };
@@ -1738,8 +2145,8 @@ impl Settings {
         cell(("hotkey", ix))
             .w(px(170.))
             .when(recording, |cell| {
-                cell.border_color(rgba(theme::ACCENT))
-                    .bg(rgba(theme::ACCENT_SOFT))
+                cell.border_color(rgba(theme::p().accent))
+                    .bg(rgba(theme::p().accent_soft))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.start_recording(Some(item_id.clone()), window, cx)
@@ -1869,6 +2276,9 @@ impl Page {
                 "Launcher hotkey",
                 "Appearance",
                 "Smooth scrolling",
+                "Search",
+                "Rank by usage",
+                "Frecency",
             ],
             Page::Extensions => &["Search sources", "Enabled"],
             Page::Shortcuts => &["Aliases", "Hotkeys"],
@@ -2028,8 +2438,8 @@ impl Settings {
             .flex()
             .flex_col()
             .border_r_1()
-            .border_color(rgba(theme::HAIRLINE))
-            .bg(rgba(0x00000030))
+            .border_color(rgba(theme::p().hairline))
+            .bg(rgba(theme::p().sidebar))
             .child(
                 div()
                     .id("sidebar-drag")
@@ -2040,7 +2450,7 @@ impl Settings {
                     .flex()
                     .items_center()
                     .text_size(px(13.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .child("Settings"),
             )
             .child(
@@ -2055,15 +2465,15 @@ impl Settings {
                     .gap_2()
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(rgba(theme::SURFACE_BORDER))
-                    .bg(rgba(theme::SURFACE))
+                    .border_color(rgba(theme::p().surface_border))
+                    .bg(rgba(theme::p().surface))
                     .text_size(px(13.))
                     .child(
                         div()
                             .flex_none()
                             .font_family(icon_font())
                             .text_size(px(12.))
-                            .text_color(rgba(theme::TEXT_FAINT))
+                            .text_color(rgba(theme::p().text_faint))
                             .child("\u{E721}"),
                     )
                     .child(div().flex_1().min_w_0().child(self.search.clone())),
@@ -2107,7 +2517,7 @@ impl Settings {
                         .px_2()
                         .py_2()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child("No matching settings."),
                 )
             })
@@ -2127,9 +2537,9 @@ impl Settings {
             .rounded(px(8.))
             .text_size(px(14.))
             .cursor_pointer()
-            .when(selected, |item| item.bg(rgba(theme::SURFACE_HOVER)))
+            .when(selected, |item| item.bg(rgba(theme::p().surface_hover)))
             .when(!selected, |item| {
-                item.hover(|style| style.bg(rgba(theme::SURFACE)))
+                item.hover(|style| style.bg(rgba(theme::p().surface)))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
             .child(badge(glyph, color, 24.))
@@ -2222,9 +2632,9 @@ impl Settings {
                 .pb_3()
                 .text_size(px(12.))
                 .text_color(rgba(if is_error {
-                    theme::ERROR
+                    theme::p().error
                 } else {
-                    theme::SUCCESS
+                    theme::p().success
                 }))
                 .child(text)
         });
@@ -2249,11 +2659,41 @@ impl Settings {
             card()
                 .child(
                     row(
+                        "Theme",
+                        "System follows Windows' light or dark setting as it changes.",
+                    )
+                    .py_3()
+                    .child(self.theme_mode_control(cx)),
+                )
+                .children([theme::Appearance::Dark, theme::Appearance::Light].map(|appearance| {
+                    div().child(divider()).child(
+                        row(
+                            format!("{} Theme", appearance.title()),
+                            format!("Used whenever the {} look is on.", appearance.title().to_lowercase()),
+                        )
+                        .child(self.theme_dropdown(appearance, cx)),
+                    )
+                }))
+                .child(divider())
+                .child(
+                    row(
                         "Window Mode",
                         "Compact shows only the search field until you type or press ↓.",
                     )
                     .py_3()
                     .child(self.window_mode_control(cx)),
+                )
+                .child(divider())
+                .child(
+                    row(
+                        "Favorites in Compact Mode",
+                        "Show favorites beside the search field; Ctrl+1 to Ctrl+8 open them.",
+                    )
+                    .child(switch(
+                        "compact-favorites",
+                        self.compact_favorites,
+                        cx.listener(|this, _, _, cx| this.toggle_compact_favorites(cx)),
+                    )),
                 )
                 .child(divider())
                 .child(
@@ -2267,6 +2707,35 @@ impl Settings {
                         cx.listener(|this, _, _, cx| this.toggle_smooth_scrolling(cx)),
                     )),
                 )
+                .into_any_element(),
+            section_title("Search"),
+            card()
+                .child(
+                    row(
+                        "Rank by Usage",
+                        "List apps and commands you open often first. Turned off, usage is still remembered.",
+                    )
+                    .child(switch(
+                        "rank-by-usage",
+                        self.rank_by_usage,
+                        cx.listener(|this, _, _, cx| this.toggle_rank_by_usage(cx)),
+                    )),
+                )
+                .into_any_element(),
+            section_title("Before You Type"),
+            hint("Root search lists these below Favorites and Suggestions. Hidden ones are still found when you type."),
+            card()
+                .children(HomeSection::ALL.into_iter().enumerate().map(|(ix, section)| {
+                    div()
+                        .when(ix > 0, |row| row.child(divider()))
+                        .child(
+                            row(section.title(), section_description(section)).child(switch(
+                                ("home-section", ix),
+                                !self.hidden_sections.contains(&section),
+                                cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)),
+                            )),
+                        )
+                }))
                 .into_any_element(),
         ]
     }
@@ -2292,7 +2761,7 @@ impl Settings {
                         .gap_3()
                         .cursor_pointer()
                         .map(|row| card_row_corners(row, ix, count))
-                        .hover(|style| style.bg(rgba(theme::SURFACE)))
+                        .hover(|style| style.bg(rgba(theme::p().surface)))
                         .on_click(cx.listener(move |this, _, _, cx| this.go(page, cx)))
                         .child(badge(glyph, color, 26.))
                         .child(text_block(source.name, source.description))
@@ -2328,7 +2797,72 @@ impl Settings {
     fn shortcuts_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let hint_text = self
             .shortcuts_hint("Aliases and hotkeys of apps and commands. Click one to change it.");
-        vec![hint(hint_text), self.shortcut_list(cx)]
+        vec![
+            hint(hint_text),
+            self.shortcut_list(cx),
+            div()
+                .pt_3()
+                .px_1()
+                .text_size(px(13.))
+                .text_color(rgba(theme::p().text_muted))
+                .child("Open from Links Without Asking")
+                .into_any_element(),
+            self.trusted_link_list(cx),
+        ]
+    }
+
+    /// The commands `spotlight://` links run without waiting for Enter, each
+    /// with a button that makes it ask again.
+    fn trusted_link_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.trusted_links.is_empty() {
+            return card()
+                .px_4()
+                .py_3()
+                .text_size(px(12.))
+                .text_color(rgba(theme::p().text_muted))
+                .child(
+                    "None. When a link opens a command, press Ctrl+Enter (Always Open Command) \
+                     to stop it asking.",
+                )
+                .into_any_element();
+        }
+        card()
+            .px_4()
+            .py_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(
+                self.trusted_links
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (id, title))| {
+                        let id = id.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(13.))
+                                    .truncate()
+                                    .child(title.clone()),
+                            )
+                            .child(remove_button(
+                                ("distrust", ix),
+                                cx.listener(move |this, _, _, cx| this.distrust_link(&id, cx)),
+                            ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn distrust_link(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.trusted_links.retain(|(trusted, _)| trusted != id);
+        cx.emit(SettingsEvent::LinkDistrusted(id.to_owned()));
+        cx.notify();
     }
 
     /// The extension's items with their alias and hotkey cells, like
@@ -2383,13 +2917,13 @@ impl Settings {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgba(theme::TEXT_MUTED))
+                        .text_color(rgba(theme::p().text_muted))
                         .child(format!("{} · {}", items_heading(id), shown.len())),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child(self.shortcuts_hint("Click an alias or hotkey to change it.")),
                 )
                 .into_any_element(),
@@ -2469,14 +3003,14 @@ impl Settings {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgba(theme::TEXT_MUTED))
+                        .text_color(rgba(theme::p().text_muted))
                         .child(self.version),
                 )
                 .child(
                     div()
                         .pt_1()
                         .text_size(px(12.))
-                        .text_color(rgba(theme::TEXT_FAINT))
+                        .text_color(rgba(theme::p().text_faint))
                         .child("Open source under MIT or Apache-2.0."),
                 )
                 .into_any_element(),
@@ -2507,7 +3041,7 @@ impl Settings {
                     row("Data Folder", self.data_path.clone())
                         .id("data-folder")
                         .cursor_pointer()
-                        .hover(|style| style.bg(rgba(theme::SURFACE)))
+                        .hover(|style| style.bg(rgba(theme::p().surface)))
                         .on_click({
                             let path = self.data_path.to_string();
                             move |_, _, _| show_in_explorer(&path)
@@ -2517,7 +3051,7 @@ impl Settings {
                                 .flex_none()
                                 .font_family(icon_font())
                                 .text_size(px(11.))
-                                .text_color(rgba(theme::TEXT_FAINT))
+                                .text_color(rgba(theme::p().text_faint))
                                 .child("\u{E8A7}"),
                         ),
                     0,
@@ -2555,7 +3089,7 @@ impl Settings {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgba(theme::TEXT_MUTED))
+                        .text_color(rgba(theme::p().text_muted))
                         .child(if source.enabled {
                             source.description
                         } else {
@@ -2578,6 +3112,22 @@ impl Settings {
                 section_title("Expansion"),
                 self.snippets_card(cx).into_any_element(),
             ]),
+            "run" => body.extend([
+                section_title("Prefix"),
+                card()
+                    .child(
+                        row(
+                            "In root search",
+                            "Start a search with this to run what follows, as in Win+R. Empty turns it off; command names (gpedit) still get a Run row.",
+                        )
+                        .child(prefix_field(self.run_prefix_input.clone())),
+                    )
+                    .into_any_element(),
+            ]),
+            "windows" => body.extend([
+                section_title("Layouts"),
+                self.windows_card(cx).into_any_element(),
+            ]),
             "web" => body.extend([
                 section_title("Search Engine"),
                 card()
@@ -2598,7 +3148,7 @@ impl Settings {
                     .flex()
                     .justify_center()
                     .text_size(px(12.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .child(if source.enabled {
                         "This extension has no other settings."
                     } else {
@@ -2640,8 +3190,8 @@ impl Render for Settings {
             .on_action(cx.listener(Self::save))
             .size_full()
             .flex()
-            .bg(rgba(theme::BACKGROUND_TINT))
-            .text_color(rgba(theme::TEXT))
+            .bg(rgba(theme::p().background))
+            .text_color(rgba(theme::p().text))
             .text_size(px(14.))
             .child(self.sidebar(cx))
             .child(
@@ -2751,7 +3301,7 @@ fn link_row(
         .items_center()
         .gap_3()
         .cursor_pointer()
-        .hover(|style| style.bg(rgba(theme::SURFACE)))
+        .hover(|style| style.bg(rgba(theme::p().surface)))
         .on_click(move |_, _, _| open_url(url))
         .child(
             div()
@@ -2759,7 +3309,7 @@ fn link_row(
                 .w(px(18.))
                 .font_family(icon_font())
                 .text_size(px(15.))
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .child(SharedString::from(glyph.to_string())),
         )
         .child(div().flex_1().child(title))
@@ -2768,7 +3318,7 @@ fn link_row(
                 .flex_none()
                 .font_family(icon_font())
                 .text_size(px(11.))
-                .text_color(rgba(theme::TEXT_FAINT))
+                .text_color(rgba(theme::p().text_faint))
                 .child("\u{E8A7}"),
         )
 }
@@ -2783,20 +3333,33 @@ fn button(id: &'static str, label: &'static str) -> Stateful<gpui::Div> {
         .flex()
         .items_center()
         .rounded(px(7.))
-        .bg(rgba(theme::SURFACE_HOVER))
+        .bg(rgba(theme::p().surface_hover))
         .text_size(px(13.))
         .cursor_pointer()
-        .hover(|style| style.bg(rgba(0xffffff26)))
+        .hover(|style| style.bg(rgba(theme::p().control_hover)))
         .child(label)
 }
 
 /// A heading between the cards of a page.
+/// What a root search section lists, under its switch.
+fn section_description(section: HomeSection) -> &'static str {
+    match section {
+        HomeSection::Commands => "Built-in commands: Clipboard History, Run, Search Files…",
+        HomeSection::Applications => "Installed apps.",
+        HomeSection::Quicklinks => "Your saved quicklinks.",
+        HomeSection::Snippets => "Your saved snippets.",
+        HomeSection::Games => "Games from Steam and other launchers.",
+        HomeSection::SystemSettings => "Pages of Windows Settings.",
+        HomeSection::ControlPanel => "Control Panel applets.",
+    }
+}
+
 fn section_title(text: &'static str) -> AnyElement {
     div()
         .pt_3()
         .px_1()
         .text_size(px(13.))
-        .text_color(rgba(theme::TEXT_MUTED))
+        .text_color(rgba(theme::p().text_muted))
         .child(text)
         .into_any_element()
 }
@@ -2806,7 +3369,7 @@ fn hint(text: &'static str) -> AnyElement {
     div()
         .px_1()
         .text_size(px(12.))
-        .text_color(rgba(theme::TEXT_FAINT))
+        .text_color(rgba(theme::p().text_faint))
         .child(text)
         .into_any_element()
 }
@@ -2844,7 +3407,7 @@ fn item_icon(item: &ExtensionItem) -> AnyElement {
         .flex_none()
         .size(px(20.))
         .rounded(px(5.))
-        .bg(rgba(theme::SURFACE_HOVER))
+        .bg(rgba(theme::p().surface_hover))
         .flex()
         .items_center()
         .justify_center()
@@ -2877,7 +3440,7 @@ fn badge(glyph: char, color: u32, size: f32) -> impl IntoElement {
         .justify_center()
         .font_family(icon_font())
         .text_size(px(size * 0.55))
-        .text_color(rgba(0xffffffff))
+        .text_color(rgba(theme::p().on_accent))
         .child(SharedString::from(glyph.to_string()))
 }
 
@@ -2895,20 +3458,38 @@ fn icon_button(id: &'static str, glyph: char, enabled: bool) -> Stateful<gpui::D
         .text_size(px(11.))
         .when(enabled, |button| {
             button
-                .text_color(rgba(theme::TEXT_MUTED))
+                .text_color(rgba(theme::p().text_muted))
                 .cursor_pointer()
                 .hover(|style| {
                     style
-                        .bg(rgba(theme::SURFACE_HOVER))
-                        .text_color(rgba(theme::TEXT))
+                        .bg(rgba(theme::p().surface_hover))
+                        .text_color(rgba(theme::p().text))
                 })
         })
-        .when(!enabled, |button| button.text_color(rgba(theme::HAIRLINE)))
+        .when(!enabled, |button| {
+            button.text_color(rgba(theme::p().hairline))
+        })
         .child(SharedString::from(glyph.to_string()))
 }
 
 /// Corner radius of a card.
 const CARD_RADIUS: f32 = 10.;
+
+/// A theme in miniature: its window colour with its accent on it.
+fn theme_swatch(theme: &theme::Theme) -> impl IntoElement {
+    let palette = &theme.palette;
+    div()
+        .flex_none()
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
+        .border_1()
+        .border_color(rgba(theme::p().surface_border))
+        .bg(rgba(palette.panel))
+        .child(div().size(px(8.)).rounded_full().bg(rgba(palette.accent)))
+}
 
 fn card() -> gpui::Div {
     div()
@@ -2916,8 +3497,8 @@ fn card() -> gpui::Div {
         .flex_col()
         .rounded(px(CARD_RADIUS))
         .border_1()
-        .border_color(rgba(theme::SURFACE_BORDER))
-        .bg(rgba(theme::SURFACE))
+        .border_color(rgba(theme::p().surface_border))
+        .bg(rgba(theme::p().surface))
 }
 
 /// Rounds the outer corners of row `ix` of `count` in a card, so a hover fill
@@ -2936,10 +3517,27 @@ fn card_row_corners<E: Styled>(row: E, ix: usize, count: usize) -> E {
 /// A line between the rows of a card, edge to edge like Raycast's, so a
 /// row's hover fill meets it without a notch at either end.
 fn divider() -> impl IntoElement {
-    div().flex_none().h(px(1.)).bg(rgba(theme::HAIRLINE))
+    div().flex_none().h(px(1.)).bg(rgba(theme::p().hairline))
 }
 
 /// A settings row: title and description on the left, the control on the right.
+/// A short text field at the end of a row: a prefix.
+fn prefix_field(input: Entity<TextInput>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .w(px(64.))
+        .h(px(30.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgba(theme::p().surface_border))
+        .bg(rgba(theme::p().surface))
+        .text_size(px(13.))
+        .child(input)
+}
+
 fn row(title: impl Into<SharedString>, description: impl Into<SharedString>) -> gpui::Div {
     div()
         .min_h(px(54.))
@@ -2966,7 +3564,7 @@ fn text_block(title: impl Into<SharedString>, description: impl Into<SharedStrin
             block.child(
                 div()
                     .text_size(px(12.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .child(description),
             )
         })
@@ -2981,9 +3579,9 @@ fn keycap(label: String) -> impl IntoElement {
         .items_center()
         .justify_center()
         .rounded(px(5.))
-        .bg(rgba(theme::SURFACE_HOVER))
+        .bg(rgba(theme::p().surface_hover))
         .border_b_1()
-        .border_color(rgba(0x00000066))
+        .border_color(rgba(theme::p().keycap_border))
         .text_size(px(12.))
         .child(label)
 }
@@ -3003,8 +3601,8 @@ fn switch(
         .p(px(3.))
         .rounded_full()
         .flex()
-        .when(on, |el| el.bg(rgba(theme::ACCENT)).justify_end())
-        .when(!on, |el| el.bg(rgba(theme::SURFACE_HOVER)))
+        .when(on, |el| el.bg(rgba(theme::p().accent)).justify_end())
+        .when(!on, |el| el.bg(rgba(theme::p().surface_hover)))
         .child(div().size(px(16.)).rounded_full().bg(rgba(0xffffffff)))
 }
 
@@ -3029,7 +3627,7 @@ fn app_row(app: &IgnoredApp) -> gpui::Div {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgba(theme::TEXT_FAINT))
+                    .text_color(rgba(theme::p().text_faint))
                     .truncate()
                     .child(app.path.clone()),
             ),
@@ -3053,14 +3651,14 @@ fn chip(
         .text_size(px(12.))
         .cursor_pointer()
         .when(selected, |chip| {
-            chip.border_color(rgba(theme::ACCENT))
-                .bg(rgba(theme::ACCENT_SOFT))
-                .text_color(rgba(theme::TEXT))
+            chip.border_color(rgba(theme::p().accent))
+                .bg(rgba(theme::p().accent_soft))
+                .text_color(rgba(theme::p().text))
         })
         .when(!selected, |chip| {
-            chip.border_color(rgba(theme::SURFACE_BORDER))
-                .text_color(rgba(theme::TEXT_MUTED))
-                .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+            chip.border_color(rgba(theme::p().surface_border))
+                .text_color(rgba(theme::p().text_muted))
+                .hover(|style| style.bg(rgba(theme::p().surface_hover)))
         })
         .child(label.into())
 }
@@ -3079,10 +3677,10 @@ fn cell(id: impl Into<ElementId>) -> Stateful<gpui::Div> {
         .gap_1()
         .rounded(px(6.))
         .border_1()
-        .border_color(rgba(theme::SURFACE_BORDER))
+        .border_color(rgba(theme::p().surface_border))
         .text_size(px(13.))
         .cursor_pointer()
-        .hover(|style| style.bg(rgba(theme::SURFACE_HOVER)))
+        .hover(|style| style.bg(rgba(theme::p().surface_hover)))
 }
 
 fn remove_button(
@@ -3098,11 +3696,11 @@ fn remove_button(
         .items_center()
         .justify_center()
         .text_size(px(11.))
-        .text_color(rgba(theme::TEXT_FAINT))
+        .text_color(rgba(theme::p().text_faint))
         .hover(|style| {
             style
-                .bg(rgba(theme::SURFACE_HOVER))
-                .text_color(rgba(theme::TEXT))
+                .bg(rgba(theme::p().surface_hover))
+                .text_color(rgba(theme::p().text))
         })
         .on_click(on_click)
         .child("✕")

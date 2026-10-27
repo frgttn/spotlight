@@ -239,7 +239,7 @@ fn render_block(block: Block) -> AnyElement {
             .child(styled(inline))
             .into_any_element(),
         Block::Paragraph(inline) => div()
-            .text_color(rgba(theme::TEXT))
+            .text_color(rgba(theme::p().text))
             .child(styled(inline))
             .into_any_element(),
         Block::Item(depth, bullet, inline) => div()
@@ -250,7 +250,7 @@ fn render_block(block: Block) -> AnyElement {
                 div()
                     .flex_none()
                     .min_w(px(14.))
-                    .text_color(rgba(theme::TEXT_MUTED))
+                    .text_color(rgba(theme::p().text_muted))
                     .child(bullet),
             )
             .child(div().flex_1().min_w_0().child(styled(inline)))
@@ -258,15 +258,15 @@ fn render_block(block: Block) -> AnyElement {
         Block::Quote(inline) => div()
             .pl_3()
             .border_l_2()
-            .border_color(rgba(theme::SURFACE_BORDER))
-            .text_color(rgba(theme::TEXT_MUTED))
+            .border_color(rgba(theme::p().surface_border))
+            .text_color(rgba(theme::p().text_muted))
             .child(styled(inline))
             .into_any_element(),
         Block::Code(text) => div()
             .px_3()
             .py_2()
             .rounded(px(6.))
-            .bg(rgba(theme::SURFACE))
+            .bg(rgba(theme::p().surface))
             .font_family(MONOSPACE)
             .text_size(px(12.))
             .child(text)
@@ -274,7 +274,7 @@ fn render_block(block: Block) -> AnyElement {
         Block::Rule => div()
             .my_1()
             .h(px(1.))
-            .bg(rgba(theme::HAIRLINE))
+            .bg(rgba(theme::p().hairline))
             .into_any_element(),
     }
 }
@@ -297,11 +297,11 @@ fn styled(inline: Inline) -> StyledText {
                     ..Default::default()
                 },
                 Span::Code => HighlightStyle {
-                    background_color: Some(rgba(theme::SURFACE_HOVER).into()),
+                    background_color: Some(rgba(theme::p().surface_hover).into()),
                     ..Default::default()
                 },
                 Span::Link => HighlightStyle {
-                    color: Some(rgba(theme::ACCENT).into()),
+                    color: Some(rgba(theme::p().accent).into()),
                     ..Default::default()
                 },
             };

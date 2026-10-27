@@ -87,6 +87,11 @@ impl Rates {
         state.per_usd.get(&code.to_ascii_uppercase()).copied()
     }
 
+    /// When the rates held were fetched; `None` if they never were.
+    pub fn fetched(&self) -> Option<SystemTime> {
+        self.state.read().ok()?.fetched
+    }
+
     pub fn knows(&self, code: &str) -> bool {
         self.per_usd(code).is_some()
     }

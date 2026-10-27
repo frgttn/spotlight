@@ -10,8 +10,8 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
-# PNG for clipboard images.
-image = { workspace = true, features = ["png"] }
+# PNG for clipboard images; the rest for sites' icons (GPUI builds them anyway).
+image = { workspace = true, features = ["png", "ico", "bmp", "jpeg", "gif", "webp"] }
 spotlight-core.workspace = true
 # `Listed`, what a folder listing gives the file index.
 spotlight-files.workspace = true
@@ -21,7 +21,9 @@ workspace = true
 features = [
     "Devices_Radios",
     "Foundation_Collections",
+    "Storage_Streams",
     "Web_Http",
+    "Web_Http_Headers",
     "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Globalization",
@@ -29,11 +31,14 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
     "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",

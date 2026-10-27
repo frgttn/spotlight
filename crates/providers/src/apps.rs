@@ -1,7 +1,7 @@
 //! Installed apps, Win32 and MSIX alike, from the shell's `AppsFolder`.
 
 use spotlight_core::{
-    item::{Command, Icon, SearchItem},
+    item::{Command, Icon, SearchItem, shortcut},
     item_id,
     provider::Provider,
     view::{DetailView, ListView, View},
@@ -74,11 +74,13 @@ fn item(app: apps::AppEntry) -> SearchItem {
         }
         item = item
             .action("Show in Explorer", Command::ShowInFolder(path.clone()))
-            .action("Copy Path", Command::Copy(path));
+            .action("Copy Path", Command::Copy(path))
+            .shortcut(shortcut::COPY_TERTIARY);
     }
     let item = item.action("Uninstall…", Command::OpenUrl(INSTALLED_APPS.to_owned()));
     let details = details(&item, &app.launch_id);
     item.action("Show Details", Command::PushView(Box::new(details)))
+        .shortcut(shortcut::INFO)
 }
 
 /// What there is to know about an app, with the same actions as its row.
@@ -113,6 +115,7 @@ fn details(item: &SearchItem, launch_id: &str) -> View {
     metadata.push(("App ID".to_owned(), launch_id.to_owned()));
     View::Detail(DetailView {
         title: item.title.clone(),
+        qr: None,
         markdown: markdown.to_owned(),
         metadata,
         actions: item.actions.clone(),
