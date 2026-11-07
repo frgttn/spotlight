@@ -14,3 +14,41 @@ image = { workspace = true, features = ["png"] }
 loupe-core.workspace = true
 loupe-files.workspace = true
 raw-window-handle.workspace = true
+
+# AppKit, for the launcher's window. The same crates (and the same way of
+# picking features) as tray-icon, so nothing new comes in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
+version = "0.3"
+default-features = false
+features = [
+    "std",
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+    "NSApplication",
+    "NSEvent",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
+]
+
+# The window's layer, for its rounded corners and border.
+[target.'cfg(target_os = "macos")'.dependencies.objc2-quartz-core]
+version = "0.3"
+default-features = false
+features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer"]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-core-graphics]
+version = "0.3"
+default-features = false
+features = ["std", "CGColor"]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.3"
+default-features = false
+features = ["std", "objc2-core-foundation", "NSArray", "NSGeometry"]

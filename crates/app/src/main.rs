@@ -299,6 +299,7 @@ fn main() {
     let hotkey_label = hotkey_label(hotkey);
 
     Application::new().run(move |cx: &mut App| {
+        win::hide_from_dock();
         text_input::bind_keys(cx);
         launcher::bind_keys(cx);
         settings::bind_keys(cx);

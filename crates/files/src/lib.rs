@@ -29,3 +29,18 @@ pub use search::{Hit, SearchOptions};
 
 #[cfg(test)]
 mod tests;
+
+/// A test path under a made-up home folder: `C:\Users\me` on Windows,
+/// `/Users/me` elsewhere, then `rel`'s parts (written with `\`, as on
+/// Windows), joined with the OS's own separator.
+#[cfg(test)]
+fn at(rel: &str) -> std::path::PathBuf {
+    let home = if cfg!(windows) {
+        r"C:\Users\me"
+    } else {
+        "/Users/me"
+    };
+    rel.split('\\')
+        .filter(|part| !part.is_empty())
+        .fold(std::path::PathBuf::from(home), |path, part| path.join(part))
+}

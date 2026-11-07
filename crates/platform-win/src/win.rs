@@ -333,6 +333,10 @@ pub fn show_without_focus_near_bottom(raw: isize, logical_size: (f32, f32)) {
     }
 }
 
+/// Keeps the app out of the Dock on macOS. On Windows the launcher has no
+/// taskbar button anyway (its window is a tool window), so nothing to do.
+pub fn hide_from_dock() {}
+
 /// Lets a GUI-subsystem process print to the console it was started from, if
 /// any. Output that is redirected (to a file or a pipe) already works without it.
 pub fn attach_parent_console() {

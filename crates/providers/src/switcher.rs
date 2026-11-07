@@ -187,7 +187,11 @@ mod tests {
             hwnd: 0x1234,
             title: "README.md - Visual Studio Code".into(),
             pid: 42,
-            exe: Some(r"C:\Apps\Code\Code.exe".into()),
+            exe: Some(if cfg!(windows) {
+                r"C:\Apps\Code\Code.exe".into()
+            } else {
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Code.exe".into()
+            }),
             app: "Visual Studio Code".into(),
             minimized: true,
         });

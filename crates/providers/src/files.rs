@@ -1072,6 +1072,24 @@ mod tests {
 
     use super::*;
 
+    /// Indexes `dir` besides the profile. The profile's folders are left out
+    /// when `dir` isn't in it (on macOS, where temp is under `/var/folders`):
+    /// with no index service there, walking all of it would take long.
+    fn test_config(dir: &Path) -> Config {
+        let mut config = Config {
+            folders: vec![dir.to_path_buf()],
+            ..Config::default()
+        };
+        if let Some(profile) = profile()
+            && !dir.starts_with(&profile)
+        {
+            config
+                .exclusions
+                .push(profile.to_string_lossy().into_owned());
+        }
+        config
+    }
+
     /// Polls `check` for up to five seconds.
     fn eventually(check: impl Fn() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1087,18 +1105,13 @@ mod tests {
     /// Indexes a folder of its own (besides the profile), then follows a
     /// file being created, renamed, moved into a new folder and deleted.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "no file watcher on macOS yet")]
     fn follows_changes_on_disk() {
         let dir = std::env::temp_dir().join(format!("loupe-files-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("zqx-before.txt"), "x").unwrap();
-        let files = Files::new(
-            Config {
-                folders: vec![dir.clone()],
-                ..Config::default()
-            },
-            None,
-        );
+        let files = Files::new(test_config(&dir), None);
         files.start();
         assert!(eventually(|| matches!(
             files.status(),
@@ -1180,13 +1193,7 @@ mod tests {
         fs::write(dir.join("zqo-report-old.txt"), "x").unwrap();
         thread::sleep(Duration::from_millis(20));
         fs::write(dir.join("zqo-report-new.txt"), "x").unwrap();
-        let files = Files::new(
-            Config {
-                folders: vec![dir.clone()],
-                ..Config::default()
-            },
-            None,
-        );
+        let files = Files::new(test_config(&dir), None);
         files.start();
         assert!(eventually(|| matches!(
             files.status(),
@@ -1215,6 +1222,7 @@ mod tests {
     /// Exclude from Index takes a folder out now and for good; a renamed
     /// file keeps how often it was opened.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "no file watcher on macOS yet")]
     fn excluded_folders_and_renamed_files() {
         let dir = std::env::temp_dir().join(format!("loupe-exclude-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1223,13 +1231,7 @@ mod tests {
         fs::write(drafts.join("zqe-a.txt"), "x").unwrap();
         fs::write(dir.join("zqe-keep.txt"), "x").unwrap();
         fs::write(dir.join("zqe-other.txt"), "x").unwrap();
-        let files = Files::new(
-            Config {
-                folders: vec![dir.clone()],
-                ..Config::default()
-            },
-            None,
-        );
+        let files = Files::new(test_config(&dir), None);
         files.start();
         assert!(eventually(|| matches!(
             files.status(),

@@ -553,7 +553,7 @@ mod tests {
 
     fn sample() -> (Index, [EntryId; 4]) {
         let mut builder = Builder::default();
-        let root = builder.root(Path::new(r"C:\Users\me"));
+        let root = builder.root(crate::at(r"").as_path());
         let docs = builder.add(root, dir("Documents"));
         let report = builder.add(docs, file("Report.PDF"));
         let notes = builder.add(root, file("notes.txt"));
@@ -565,9 +565,9 @@ mod tests {
         let (index, [root, docs, report, _]) = sample();
         assert_eq!(
             index.path(report),
-            Path::new(r"C:\Users\me\Documents\Report.PDF")
+            crate::at(r"Documents\Report.PDF").as_path()
         );
-        assert_eq!(index.path(root), Path::new(r"C:\Users\me"));
+        assert_eq!(index.path(root), crate::at(r"").as_path());
         assert_eq!(index.parent(report), Some(docs));
         assert_eq!(index.parent(root), None);
         assert_eq!(index.extension(report), "pdf");
@@ -591,7 +591,7 @@ mod tests {
         index.rename(docs, archive, "Old documents");
         assert_eq!(
             index.path(report),
-            Path::new(r"C:\Users\me\Archive\Old documents\Report.PDF")
+            crate::at(r"Archive\Old documents\Report.PDF").as_path()
         );
         index.rename(notes, docs, "notes.md");
         assert_eq!(index.extension(notes), "md");
@@ -613,7 +613,7 @@ mod tests {
         let report = remap[report as usize];
         assert_eq!(
             compacted.path(report),
-            Path::new(r"C:\Users\me\Archive\Documents\Report.PDF")
+            crate::at(r"Archive\Documents\Report.PDF").as_path()
         );
         assert_eq!(
             compacted.modified(report),

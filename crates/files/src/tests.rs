@@ -49,7 +49,7 @@ const TREE: &[(&str, i64)] = &[
 
 fn build() -> (Index, EntryId) {
     let mut builder = Builder::default();
-    let root = builder.root(Path::new(r"C:\Users\me"));
+    let root = builder.root(crate::at(r"").as_path());
     let mut folders: Vec<(String, EntryId)> = Vec::new();
     for (path, age) in TREE {
         let dir = path.ends_with('/');
@@ -329,7 +329,7 @@ fn empty_query_finds_nothing() {
 #[test]
 fn deep_inside_a_hidden_folder_is_hidden() {
     let mut builder = Builder::default();
-    let root = builder.root(Path::new(r"C:\Users\me"));
+    let root = builder.root(crate::at(r"").as_path());
     let app_data = builder.add(
         root,
         Meta {
@@ -371,7 +371,7 @@ fn deep_inside_a_hidden_folder_is_hidden() {
 #[test]
 fn dot_names_count_as_hidden() {
     let mut builder = Builder::default();
-    let root = builder.root(Path::new(r"C:\Users\me"));
+    let root = builder.root(crate::at(r"").as_path());
     let vscode = builder.add(
         root,
         Meta {
@@ -451,7 +451,7 @@ fn rename_over_an_existing_name_replaces_it() {
     assert_eq!(index.child(docs, "report final.pdf"), Some(draft));
     assert_eq!(index.child(docs, "report-draft.pdf"), None);
     assert_eq!(
-        index.resolve(Path::new(r"C:\Users\me\Documents\Report final.pdf")),
+        index.resolve(crate::at(r"Documents\Report final.pdf").as_path()),
         Some(draft)
     );
 }

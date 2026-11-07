@@ -17,8 +17,12 @@ use std::{
     time::Duration,
 };
 
-use loupe_core::{deeplink, update::Status};
-use loupe_platform::{autostart, index_service, protocol};
+#[cfg(windows)]
+use loupe_core::deeplink;
+use loupe_core::update::Status;
+use loupe_platform::autostart;
+#[cfg(windows)]
+use loupe_platform::{index_service, protocol};
 use velopack::{UpdateCheck, UpdateInfo, UpdateManager, VelopackApp, sources::GithubSource};
 
 /// The first check, after start has settled.
@@ -28,15 +32,17 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// Handles the installer's calls (`--veloapp-install` and the like), which
 /// exit when done, and applies an update downloaded earlier. Runs first in
 /// `main`, before anything else starts.
+///
+/// Velopack has install and uninstall hooks only on Windows. On macOS
+/// there is no uninstaller to call one (the app is dragged to the Trash),
+/// so start at login is turned on at the first run instead.
 pub fn run_installer_hooks() {
-    VelopackApp::build()
+    let app = VelopackApp::build();
+    #[cfg(windows)]
+    let app = app
         // Like Raycast, Loupe starts at login once installed; the tray
         // and Settings turn it off.
-        .on_after_install_fast_callback(|_| {
-            if let Err(err) = autostart::set_enabled(true) {
-                eprintln!("[update] could not turn on start at login: {err}");
-            }
-        })
+        .on_after_install_fast_callback(|_| turn_on_autostart())
         // The installer removes the program; what Loupe registered
         // outside it goes too. The data in %APPDATA% stays, as with most
         // apps, in case Loupe is installed again.
@@ -57,8 +63,17 @@ pub fn run_installer_hooks() {
             {
                 eprintln!("[update] could not remove the index service: {err}");
             }
-        })
-        .run();
+        });
+    #[cfg(not(windows))]
+    let app = app.on_first_run(|_| turn_on_autostart());
+    let mut app = app;
+    app.run();
+}
+
+fn turn_on_autostart() {
+    if let Err(err) = autostart::set_enabled(true) {
+        eprintln!("[update] could not turn on start at login: {err}");
+    }
 }
 
 /// Checks for, downloads and applies updates. Shared between the checking

@@ -296,10 +296,18 @@ mod tests {
     #[test]
     fn finds_commands_by_name() {
         let run = provider();
-        let found = run.fallbacks("notepad");
-        assert_eq!(titles(&found), ["Run notepad.exe"]);
-        assert_eq!(titles(&run.fallbacks("NOTEPAD.exe")), ["Run notepad.exe"]);
-        assert!(run.fallbacks("notepad x").is_empty());
+        // A command every system has in its PATH.
+        let (name, title) = if cfg!(windows) {
+            ("notepad", "Run notepad.exe")
+        } else {
+            ("ls", "Run ls")
+        };
+        let found = run.fallbacks(name);
+        assert_eq!(titles(&found), [title]);
+        if cfg!(windows) {
+            assert_eq!(titles(&run.fallbacks("NOTEPAD.exe")), [title]);
+        }
+        assert!(run.fallbacks(&format!("{name} x")).is_empty());
         assert!(run.fallbacks("no-such-command-here").is_empty());
         assert!(run.answers("notepad").is_empty());
         // The prefix turned off: `>` is just text.

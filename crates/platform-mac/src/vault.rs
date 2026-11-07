@@ -1,7 +1,9 @@
 //! macOS counterpart of `loupe_platform_win::vault`, with its signatures.
-//! A stub for now: nothing here is implemented on macOS yet.
+//! A stub for now: there is no key in the Keychain yet, so files are never
+//! unlocked and [`write_file`] and [`read_file`] work with plain files, as on
+//! Windows before [`unlock_files`].
 
-use std::{io, path::Path};
+use std::{fs, io, path::Path};
 
 use crate::UNSUPPORTED;
 
@@ -18,13 +20,13 @@ pub fn database_key() -> crate::Result<(Key, bool)> {
 pub fn unlock_files(_database_key: &Key) {}
 
 /// Writes `bytes` to `path`, sealed once [`unlock_files`] ran.
-pub fn write_file(_path: &Path, _bytes: &[u8]) -> io::Result<()> {
-    Err(io::Error::other(UNSUPPORTED))
+pub fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fs::write(path, bytes)
 }
 
 /// Reads a file [`write_file`] wrote, sealed or not.
-pub fn read_file(_path: &Path) -> io::Result<Vec<u8>> {
-    Err(io::Error::other(UNSUPPORTED))
+pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path)
 }
 
 /// Seals the files in `dir` that are still plain (written before
